@@ -1,0 +1,14 @@
+{
+  "name": "future-predict",
+  "private": true,
+  "packageManager": "pnpm@10.12.1",
+  "scripts": {
+    "install:all": "pnpm install",
+    "web": "pnpm --dir apps/web dev",
+    "lint": "pnpm --dir apps/web lint",
+    "format": "pnpm --dir apps/web format",
+    "test": "pnpm --dir apps/web test",
+    "check": "pnpm --dir apps/web check"
+  }
+}
+
