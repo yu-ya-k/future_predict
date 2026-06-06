@@ -11,6 +11,8 @@ from api.config import Settings
 from api.research.schemas import (
     Citation,
     CostEvent,
+    HumanReviewAction,
+    HumanReviewDecision,
     ResearchAttempt,
     ResearchRunOptions,
     ResearchRunRecord,
@@ -157,6 +159,16 @@ class ResearchRepository:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS human_review_decisions (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
+                    decision_no INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    comment TEXT,
+                    reviewer_id TEXT,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS research_history (
                     id TEXT PRIMARY KEY,
                     run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
@@ -167,6 +179,12 @@ class ResearchRepository:
                 CREATE UNIQUE INDEX IF NOT EXISTS research_cost_events_response_dedupe
                 ON research_cost_events(run_id, step, response_id)
                 WHERE response_id IS NOT NULL AND response_id != '';
+
+                CREATE UNIQUE INDEX IF NOT EXISTS human_review_decisions_run_decision_no_unique
+                ON human_review_decisions(run_id, decision_no);
+
+                CREATE INDEX IF NOT EXISTS human_review_decisions_run_order
+                ON human_review_decisions(run_id, decision_no, created_at);
                 """
             )
 
@@ -297,6 +315,20 @@ class ResearchRepository:
                     RunStatus.COLLECTING.value,
                     cutoff.isoformat(),
                 ),
+            ).fetchall()
+
+        return [self._row_to_run(row) for row in rows]
+
+    def list_human_review_runs(self) -> list[ResearchRunRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM research_runs
+                WHERE status = ?
+                  AND needs_human_review = 1
+                ORDER BY updated_at ASC
+                """,
+                (RunStatus.NEEDS_HUMAN_REVIEW.value,),
             ).fetchall()
 
         return [self._row_to_run(row) for row in rows]
@@ -545,6 +577,131 @@ class ResearchRepository:
 
         return [
             CostEvent.model_validate({**dict(row), "created_at": _parse_dt(row["created_at"])})
+            for row in rows
+        ]
+
+    def claim_human_review_decision(
+        self,
+        run_id: UUID,
+        *,
+        action: HumanReviewAction,
+        comment: str | None,
+        reviewer_id: str | None,
+    ) -> tuple[ResearchRunRecord, HumanReviewDecision] | None:
+        updated_at = utc_now().isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE research_runs
+                SET status = ?,
+                    needs_human_review = 0,
+                    done_reason = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status = ?
+                  AND needs_human_review = 1
+                """,
+                (
+                    RunStatus.REVIEWING.value,
+                    updated_at,
+                    str(run_id),
+                    RunStatus.NEEDS_HUMAN_REVIEW.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+
+            decision = self._insert_human_decision(
+                connection,
+                run_id,
+                action=action,
+                comment=comment,
+                reviewer_id=reviewer_id,
+            )
+            row = connection.execute(
+                "SELECT * FROM research_runs WHERE id = ?",
+                (str(run_id),),
+            ).fetchone()
+
+        if row is None:
+            raise KeyError(str(run_id))
+        return self._row_to_run(row), decision
+
+    def _insert_human_decision(
+        self,
+        connection: sqlite3.Connection,
+        run_id: UUID,
+        *,
+        action: HumanReviewAction,
+        comment: str | None,
+        reviewer_id: str | None,
+    ) -> HumanReviewDecision:
+        row = connection.execute(
+            """
+            SELECT COALESCE(MAX(decision_no), 0) + 1 AS next_decision_no
+            FROM human_review_decisions
+            WHERE run_id = ?
+            """,
+            (str(run_id),),
+        ).fetchone()
+        decision_no = int(row["next_decision_no"])
+        created_at = utc_now()
+        connection.execute(
+            """
+            INSERT INTO human_review_decisions (
+                id, run_id, decision_no, action, comment, reviewer_id, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid4()),
+                str(run_id),
+                decision_no,
+                action.value,
+                comment,
+                reviewer_id,
+                created_at.isoformat(),
+            ),
+        )
+        self.append_history(
+            connection,
+            run_id,
+            {
+                "step": "human_review_decision",
+                "decision_no": decision_no,
+                "action": action.value,
+                "comment": comment,
+                "reviewer_id": reviewer_id,
+            },
+        )
+        return HumanReviewDecision(
+            decision_no=decision_no,
+            action=action,
+            comment=comment,
+            reviewer_id=reviewer_id,
+            created_at=created_at,
+        )
+
+    def get_human_decisions(self, run_id: UUID) -> list[HumanReviewDecision]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT decision_no, action, comment, reviewer_id, created_at
+                FROM human_review_decisions
+                WHERE run_id = ?
+                ORDER BY decision_no ASC, created_at ASC
+                """,
+                (str(run_id),),
+            ).fetchall()
+
+        return [
+            HumanReviewDecision(
+                decision_no=row["decision_no"],
+                action=HumanReviewAction(row["action"]),
+                comment=row["comment"],
+                reviewer_id=row["reviewer_id"],
+                created_at=_parse_dt(row["created_at"]),
+            )
             for row in rows
         ]
 

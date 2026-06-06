@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 
 from api.research.dependencies import get_research_orchestrator
 from api.research.schemas import (
@@ -13,6 +13,10 @@ from api.research.schemas import (
     CostEvent,
     CreateResearchRunRequest,
     CreateResearchRunResponse,
+    HumanReviewDecision,
+    HumanReviewPayload,
+    HumanReviewQueueItem,
+    HumanReviewResumeAPIRequest,
     HumanReviewResumeRequest,
     HumanReviewResumeResponse,
     ReportResponse,
@@ -28,6 +32,21 @@ router = APIRouter(prefix="/research-runs", tags=["research-runs"])
 OrchestratorDependency = Annotated[ResearchOrchestrator, Depends(get_research_orchestrator)]
 
 
+def require_reviewer_id(
+    x_reviewer_id: Annotated[str | None, Header(alias="X-Reviewer-Id")] = None,
+) -> str:
+    reviewer_id = (x_reviewer_id or "").strip()
+    if not reviewer_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Reviewer identity is required.",
+        )
+    return reviewer_id
+
+
+ReviewerIdentityDependency = Annotated[str, Depends(require_reviewer_id)]
+
+
 @router.post("", response_model=CreateResearchRunResponse, status_code=status.HTTP_202_ACCEPTED)
 def create_research_run(
     request: CreateResearchRunRequest,
@@ -40,6 +59,14 @@ def create_research_run(
         status=run.status,
         created_at=run.created_at,
     )
+
+
+@router.get("/human-reviews", response_model=list[HumanReviewQueueItem])
+def list_human_reviews(
+    orchestrator: OrchestratorDependency,
+    _reviewer_id: ReviewerIdentityDependency,
+) -> list[HumanReviewQueueItem]:
+    return orchestrator.list_human_reviews()
 
 
 @router.get("/{run_id}", response_model=ResearchRunStatusResponse)
@@ -103,6 +130,7 @@ def get_audit(
         citations=orchestrator.repository.get_citations(run.id),
         tool_calls=orchestrator.repository.get_tool_calls(run.id),
         cost_events=orchestrator.repository.get_cost_events(run.id),
+        human_decisions=orchestrator.repository.get_human_decisions(run.id),
         history=orchestrator.repository.get_history(run.id),
     )
 
@@ -152,6 +180,32 @@ def get_cost_events(
     return orchestrator.repository.get_cost_events(run.id)
 
 
+@router.get("/{run_id}/human-review", response_model=HumanReviewPayload)
+def get_human_review_payload(
+    run_id: UUID,
+    orchestrator: OrchestratorDependency,
+    _reviewer_id: ReviewerIdentityDependency,
+) -> HumanReviewPayload:
+    _get_run_or_404(orchestrator, run_id)
+    try:
+        return orchestrator.get_human_review_payload(run_id)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        ) from error
+
+
+@router.get("/{run_id}/human-decisions", response_model=list[HumanReviewDecision])
+def get_human_decisions(
+    run_id: UUID,
+    orchestrator: OrchestratorDependency,
+    _reviewer_id: ReviewerIdentityDependency,
+) -> list[HumanReviewDecision]:
+    run = _get_run_or_404(orchestrator, run_id)
+    return orchestrator.repository.get_human_decisions(run.id)
+
+
 @router.post("/{run_id}/cancel", response_model=CancelResponse)
 def cancel_run(
     run_id: UUID,
@@ -165,12 +219,20 @@ def cancel_run(
 @router.post("/{run_id}/resume", response_model=HumanReviewResumeResponse)
 def resume_run(
     run_id: UUID,
-    request: HumanReviewResumeRequest,
+    request: HumanReviewResumeAPIRequest,
     orchestrator: OrchestratorDependency,
+    reviewer_id: ReviewerIdentityDependency,
 ) -> HumanReviewResumeResponse:
     _get_run_or_404(orchestrator, run_id)
     try:
-        run = orchestrator.resume_run(run_id, request)
+        run = orchestrator.resume_run(
+            run_id,
+            HumanReviewResumeRequest(
+                action=request.action,
+                comment=request.comment,
+            ),
+            reviewer_id=reviewer_id,
+        )
     except ValueError as error:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

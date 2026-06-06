@@ -71,6 +71,15 @@ class RunProgress(BaseModel):
     estimated_cost_usd: float = 0.0
 
 
+class HumanReviewAuditSummary(BaseModel):
+    deep_research_runs: int
+    llm_fix_runs: int
+    total_reviews: int
+    no_progress_count: int
+    total_tool_calls: int = 0
+    estimated_cost_usd: float = 0.0
+
+
 class ResearchRunStatusResponse(BaseModel):
     run_id: UUID
     status: RunStatus
@@ -169,6 +178,7 @@ class AuditResponse(BaseModel):
     citations: list[Citation]
     tool_calls: list[ToolCallSummary]
     cost_events: list[CostEvent]
+    human_decisions: list[HumanReviewDecision]
     history: list[dict[str, Any]]
 
 
@@ -180,6 +190,14 @@ class CancelResponse(BaseModel):
 class HumanReviewResumeRequest(BaseModel):
     action: HumanReviewAction
     comment: str | None = Field(default=None, max_length=10000)
+    reviewer_id: str | None = Field(default=None, max_length=255)
+
+
+class HumanReviewResumeAPIRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: HumanReviewAction
+    comment: str | None = Field(default=None, max_length=10000)
 
 
 class HumanReviewResumeResponse(BaseModel):
@@ -187,6 +205,36 @@ class HumanReviewResumeResponse(BaseModel):
     status: RunStatus
     done_reason: str | None
     needs_human_review: bool
+
+
+class HumanReviewQueueItem(BaseModel):
+    run_id: UUID
+    status: RunStatus
+    done_reason: str | None
+    latest_verdict: Verdict | None
+    latest_score: int | None
+    latest_rationale: str | None
+    audit_summary: HumanReviewAuditSummary
+    created_at: datetime
+    updated_at: datetime
+
+
+class HumanReviewPayload(BaseModel):
+    run_id: UUID
+    reason: str
+    latest_report: str
+    latest_review: ReviewRecord | None
+    allowed_actions: list[HumanReviewAction]
+    audit_summary: HumanReviewAuditSummary
+    warnings: list[str]
+
+
+class HumanReviewDecision(BaseModel):
+    decision_no: int
+    action: HumanReviewAction
+    comment: str | None = None
+    reviewer_id: str | None = None
+    created_at: datetime
 
 
 class ResearchRunRecord(BaseModel):

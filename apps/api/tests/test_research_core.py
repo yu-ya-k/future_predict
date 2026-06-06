@@ -5,10 +5,13 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
 
 from api.config import Settings
 from api.research.artifacts import ArtifactStore
 from api.research.azure_responses import AzureResponsesClient
+from api.research.graph import build_phase_3_graph, build_phase_4_graph
 from api.research.poller import ResearchPoller
 from api.research.progress import compute_no_progress_count
 from api.research.repository import ResearchRepository
@@ -798,6 +801,124 @@ def test_human_resume_approve_finalizes_report(tmp_path: Path) -> None:
     assert resumed.final_report == "調査レポート本文"
 
 
+def test_human_review_queue_and_payload_include_latest_context(tmp_path: Path) -> None:
+    fake = FakeAzure(verdict=Verdict.HUMAN_REVIEW)
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    needs_human = orchestrator.collect_deep_research(run.id)
+
+    queue = orchestrator.list_human_reviews()
+    payload = orchestrator.get_human_review_payload(needs_human.id)
+
+    assert [item.run_id for item in queue] == [needs_human.id]
+    assert queue[0].latest_verdict == Verdict.HUMAN_REVIEW
+    assert queue[0].audit_summary.total_reviews == 1
+    assert payload.reason == "review_route_human_review"
+    assert payload.latest_report == "調査レポート本文"
+    assert payload.latest_review is not None
+    assert payload.latest_review.verdict == Verdict.HUMAN_REVIEW
+    assert HumanReviewAction.APPROVE in payload.allowed_actions
+
+
+def test_human_review_payload_rejects_non_waiting_run(tmp_path: Path) -> None:
+    orchestrator = make_orchestrator(tmp_path, FakeAzure())
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    completed = orchestrator.collect_deep_research(run.id)
+
+    with pytest.raises(ValueError, match="not waiting for human review"):
+        orchestrator.get_human_review_payload(completed.id)
+
+
+def test_human_resume_records_decision_for_audit(tmp_path: Path) -> None:
+    fake = FakeAzure(verdict=Verdict.HUMAN_REVIEW)
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    needs_human = orchestrator.collect_deep_research(run.id)
+    orchestrator.resume_run(
+        needs_human.id,
+        HumanReviewResumeRequest(
+            action=HumanReviewAction.APPROVE,
+            comment="承認します。",
+        ),
+        reviewer_id="reviewer-1",
+    )
+
+    decisions = orchestrator.repository.get_human_decisions(run.id)
+
+    assert len(decisions) == 1
+    assert decisions[0].decision_no == 1
+    assert decisions[0].action == HumanReviewAction.APPROVE
+    assert decisions[0].comment == "承認します。"
+    assert decisions[0].reviewer_id == "reviewer-1"
+
+
+@pytest.mark.parametrize(
+    ("action", "limit_fields", "blocked_reason"),
+    [
+        (
+            HumanReviewAction.REQUEST_DEEP_RESEARCH,
+            {"estimated_cost_usd": 20.0, "max_cost_usd": 20.0},
+            "max_cost_usd_reached",
+        ),
+        (
+            HumanReviewAction.REQUEST_LLM_FIX,
+            {"total_reviews": 5, "max_total_iterations": 5},
+            "max_total_iterations_reached",
+        ),
+        (
+            HumanReviewAction.REQUEST_DEEP_RESEARCH,
+            {"deep_research_runs": 2, "max_deep_research_runs": 2},
+            "max_deep_research_runs_reached",
+        ),
+        (
+            HumanReviewAction.REQUEST_LLM_FIX,
+            {"llm_fix_runs": 3, "max_llm_fix_runs": 3},
+            "max_llm_fix_runs_reached",
+        ),
+    ],
+)
+def test_human_resume_request_actions_do_not_bypass_hard_stops(
+    tmp_path: Path,
+    action: HumanReviewAction,
+    limit_fields: dict[str, object],
+    blocked_reason: str,
+) -> None:
+    fake = FakeAzure(verdict=Verdict.HUMAN_REVIEW)
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    needs_human = orchestrator.collect_deep_research(run.id)
+    orchestrator.repository.update_run(needs_human.id, **limit_fields)
+
+    with pytest.raises(ValueError, match=blocked_reason):
+        orchestrator.resume_run(
+            needs_human.id,
+            HumanReviewResumeRequest(action=action, comment="続行してください。"),
+            reviewer_id="reviewer-guard",
+        )
+
+    still_waiting = orchestrator.repository.get_run(needs_human.id)
+    decisions = orchestrator.repository.get_human_decisions(run.id)
+    history = orchestrator.repository.get_history(run.id)
+
+    assert still_waiting.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert still_waiting.needs_human_review is True
+    assert decisions == []
+    assert history[-1]["step"] == "human_review_resume_blocked"
+    assert history[-1]["reason"] == blocked_reason
+
+
 def test_human_resume_request_llm_fix_continues_workflow(tmp_path: Path) -> None:
     fake = FakeAzure(verdicts=[Verdict.HUMAN_REVIEW, Verdict.PASS])
     orchestrator = make_orchestrator(tmp_path, fake)
@@ -840,6 +961,81 @@ def test_human_resume_request_deep_research_submits_rerun(tmp_path: Path) -> Non
     assert "一次情報を追加してください。" in fake.submitted_prompts[-1]
 
 
+def test_human_resume_claim_prevents_second_resume(tmp_path: Path) -> None:
+    fake = FakeAzure(verdict=Verdict.HUMAN_REVIEW)
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    needs_human = orchestrator.collect_deep_research(run.id)
+    resumed = orchestrator.resume_run(
+        needs_human.id,
+        HumanReviewResumeRequest(
+            action=HumanReviewAction.REQUEST_DEEP_RESEARCH,
+            comment="追加調査してください。",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="not waiting for human review"):
+        orchestrator.resume_run(
+            needs_human.id,
+            HumanReviewResumeRequest(action=HumanReviewAction.APPROVE),
+        )
+
+    decisions = orchestrator.repository.get_human_decisions(run.id)
+    assert resumed.status == RunStatus.WAITING_DEEP_RESEARCH
+    assert len(decisions) == 1
+    assert decisions[0].action == HumanReviewAction.REQUEST_DEEP_RESEARCH
+    assert len(fake.submitted_prompts) == 2
+
+
+def test_human_review_eligibility_requires_status_and_flag(tmp_path: Path) -> None:
+    fake = FakeAzure(verdict=Verdict.HUMAN_REVIEW)
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    needs_human = orchestrator.collect_deep_research(run.id)
+    orchestrator.repository.update_run(
+        needs_human.id,
+        status=RunStatus.COMPLETED,
+        needs_human_review=True,
+        done_reason="stale_flag_test",
+    )
+
+    assert orchestrator.list_human_reviews() == []
+    with pytest.raises(ValueError, match="not waiting for human review"):
+        orchestrator.get_human_review_payload(needs_human.id)
+    with pytest.raises(ValueError, match="not waiting for human review"):
+        orchestrator.resume_run(
+            needs_human.id,
+            HumanReviewResumeRequest(action=HumanReviewAction.APPROVE),
+        )
+    assert orchestrator.repository.get_human_decisions(run.id) == []
+
+
+def test_cancel_human_review_run_clears_human_flag(tmp_path: Path) -> None:
+    fake = FakeAzure(verdict=Verdict.HUMAN_REVIEW)
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    needs_human = orchestrator.collect_deep_research(run.id)
+    cancelled = orchestrator.cancel_run(needs_human.id)
+
+    assert cancelled.status == RunStatus.CANCELLED
+    assert cancelled.needs_human_review is False
+    assert orchestrator.list_human_reviews() == []
+    with pytest.raises(ValueError, match="not waiting for human review"):
+        orchestrator.resume_run(
+            needs_human.id,
+            HumanReviewResumeRequest(action=HumanReviewAction.APPROVE),
+        )
+
+
 def test_human_resume_reject_stops_run(tmp_path: Path) -> None:
     fake = FakeAzure(verdict=Verdict.HUMAN_REVIEW)
     orchestrator = make_orchestrator(tmp_path, fake)
@@ -856,3 +1052,122 @@ def test_human_resume_reject_stops_run(tmp_path: Path) -> None:
     assert resumed.status == RunStatus.FAILED
     assert resumed.done_reason == "human_rejected"
     assert resumed.needs_human_review is False
+
+
+def test_phase_4_graph_requires_checkpointer() -> None:
+    with pytest.raises(ValueError, match="requires a checkpointer"):
+        build_phase_4_graph(checkpointer=None)
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_terminal", "expected_visits"),
+    [
+        (HumanReviewAction.APPROVE, "finalize", []),
+        (
+            HumanReviewAction.REQUEST_LLM_FIX,
+            "finalize",
+            ["visited_llm_finalize", "visited_review"],
+        ),
+        (
+            HumanReviewAction.REQUEST_DEEP_RESEARCH,
+            "finalize",
+            [
+                "visited_deep_research_submit",
+                "visited_deep_research_collect",
+                "visited_review",
+            ],
+        ),
+        (HumanReviewAction.REJECT, "partial_finalize", []),
+    ],
+)
+def test_phase_4_graph_interrupts_and_routes_resume_decision(
+    action: HumanReviewAction,
+    expected_terminal: str,
+    expected_visits: list[str],
+) -> None:
+    graph = build_phase_4_graph(checkpointer=MemorySaver())
+    config = {"configurable": {"thread_id": f"phase-4-human-review-{action.value}"}}
+
+    interrupted = graph.invoke(
+        {
+            "run_id": "run-1",
+            "report": "latest report",
+            "review": {"rationale": "needs human judgment"},
+            "audit_summary": {"total_reviews": 1},
+        },
+        config=config,
+    )
+    interrupts = interrupted["__interrupt__"]
+
+    assert interrupts[0].value["reason"] == "needs human judgment"
+    assert interrupts[0].value["latest_report"] == "latest report"
+    assert "approve" in interrupts[0].value["allowed_actions"]
+
+    resumed = graph.invoke(
+        Command(resume={"action": action.value}),
+        config=config,
+    )
+
+    assert resumed["human_decision"]["action"] == action.value
+    assert resumed["graph_terminal"] == expected_terminal
+    for visit_key in expected_visits:
+        assert resumed[visit_key] is True
+
+
+def test_phase_3_graph_uses_interrupt_for_human_review_route() -> None:
+    graph = build_phase_3_graph(checkpointer=MemorySaver())
+    config = {"configurable": {"thread_id": "phase-3-human-review-interrupt"}}
+
+    interrupted = graph.invoke(
+        {
+            "run_id": "run-1",
+            "report": "latest report",
+            "review": {
+                "verdict": Verdict.HUMAN_REVIEW.value,
+                "rationale": "manual decision required",
+            },
+        },
+        config=config,
+    )
+
+    interrupts = interrupted["__interrupt__"]
+    assert interrupts[0].value["reason"] == "manual decision required"
+
+    resumed = graph.invoke(
+        Command(resume={"action": HumanReviewAction.APPROVE.value}),
+        config=config,
+    )
+
+    assert resumed["graph_terminal"] == "finalize"
+    assert resumed["human_decision"]["action"] == HumanReviewAction.APPROVE.value
+
+
+@pytest.mark.parametrize(
+    "resume_payload",
+    [
+        {"comment": "missing action"},
+        {"action": "typo"},
+        [],
+    ],
+)
+def test_phase_4_graph_rejects_malformed_resume_decision(
+    resume_payload: object,
+) -> None:
+    graph = build_phase_4_graph(checkpointer=MemorySaver())
+    config = {
+        "configurable": {
+            "thread_id": f"phase-4-human-review-invalid-{type(resume_payload).__name__}"
+        }
+    }
+
+    graph.invoke(
+        {
+            "run_id": "run-1",
+            "report": "latest report",
+            "review": {"rationale": "needs human judgment"},
+        },
+        config=config,
+    )
+
+    with pytest.raises(ValueError, match="human review action|human_decision"):
+        graph.invoke(Command(resume=resume_payload), config=config)

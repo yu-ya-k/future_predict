@@ -126,14 +126,17 @@ async def test_human_review_resume_from_api_continues_workflow(
 
         resume_response = await client.post(
             f"/research-runs/{run_id}/resume",
+            headers={"X-Reviewer-Id": "integration-reviewer"},
             json={
                 "action": HumanReviewAction.REQUEST_LLM_FIX.value,
                 "comment": "章立てだけ整えてください。",
             },
         )
         status_response = await client.get(f"/research-runs/{run_id}")
+        audit_response = await client.get(f"/research-runs/{run_id}/audit")
 
     assert resume_response.status_code == 200
     assert resume_response.json()["status"] == RunStatus.COMPLETED.value
     assert status_response.json()["progress"]["total_reviews"] == 2
+    assert audit_response.json()["human_decisions"][0]["reviewer_id"] == "integration-reviewer"
     assert "章立てだけ整えてください。" in fake.llm_finalize_prompts[-1]
