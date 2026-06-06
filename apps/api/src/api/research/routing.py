@@ -80,6 +80,12 @@ def route_after_review(state: RouteState) -> ReviewRoute:
         return "human_review"
 
     if verdict_value == Verdict.NEEDS_LLM_FIX.value:
+        if review.get("requires_new_external_research", False):
+            return "human_review"
+
+        if not bool(review.get("can_be_fixed_by_llm", False)):
+            return "human_review"
+
         if llm_fix_runs < max_llm_fix:
             return "llm_finalize"
 

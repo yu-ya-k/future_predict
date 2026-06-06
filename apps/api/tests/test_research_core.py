@@ -10,6 +10,7 @@ from api.config import Settings
 from api.research.artifacts import ArtifactStore
 from api.research.azure_responses import AzureResponsesClient
 from api.research.poller import ResearchPoller
+from api.research.progress import compute_no_progress_count
 from api.research.repository import ResearchRepository
 from api.research.routing import route_after_review
 from api.research.schemas import (
@@ -18,6 +19,7 @@ from api.research.schemas import (
     HumanReviewAction,
     HumanReviewResumeRequest,
     ResearchRunOptions,
+    ReviewRecord,
     ReviewResult,
     RunStatus,
     Verdict,
@@ -37,12 +39,24 @@ class FakeAzure:
         retrieve_status: str = "completed",
         verdict: Verdict = Verdict.PASS,
         verdicts: list[Verdict] | None = None,
+        deep_research_usage: dict[str, int] | None = None,
+        review_usage: dict[str, int] | None = None,
+        review_gaps: list[str] | None = None,
+        review_factuality_concerns: list[str] | None = None,
+        review_source_quality_concerns: list[str] | None = None,
+        review_next_instructions: str | None = None,
         submit_raises: Exception | None = None,
         retrieve_raises: Exception | None = None,
     ) -> None:
         self.retrieve_status = retrieve_status
         self.verdict = verdict
         self.verdicts = verdicts or []
+        self.deep_research_usage = deep_research_usage or {}
+        self.review_usage = review_usage or {}
+        self.review_gaps = review_gaps or ["gap"]
+        self.review_factuality_concerns = review_factuality_concerns or []
+        self.review_source_quality_concerns = review_source_quality_concerns or []
+        self.review_next_instructions = review_next_instructions
         self.review_calls = 0
         self.submit_raises = submit_raises
         self.retrieve_raises = retrieve_raises
@@ -50,6 +64,7 @@ class FakeAzure:
         self.deep_research_web_search_enabled: bool | None = None
         self.cancelled: list[str] = []
         self.submitted_prompts: list[str] = []
+        self.submitted_max_tool_calls: list[int] = []
         self.llm_finalize_prompts: list[str] = []
 
     def submit_deep_research(
@@ -66,6 +81,7 @@ class FakeAzure:
             raise self.submit_raises
         self.deep_research_web_search_enabled = bool(web_search_enabled)
         self.submitted_prompts.append(prompt)
+        self.submitted_max_tool_calls.append(max_tool_calls)
         _ = (
             max_tool_calls,
             web_search_enabled,
@@ -87,6 +103,7 @@ class FakeAzure:
                 "id": response_id,
                 "status": "completed",
                 "output_text": "調査レポート本文",
+                "usage": self.deep_research_usage,
                 "output": [
                     {
                         "type": "message",
@@ -116,8 +133,15 @@ class FakeAzure:
         return {
             "id": response_id,
             "status": self.retrieve_status,
+            "usage": self.deep_research_usage,
             "error": {"message": "remote failed"},
-            "output": list[object](),
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "status": "failed",
+                    "query": "example failed query",
+                }
+            ],
         }
 
     def review_report(self, **kwargs: Any) -> tuple[ReviewResult, str, dict[str, object]]:
@@ -134,10 +158,16 @@ class FakeAzure:
                 goal_achieved=verdict == Verdict.PASS,
                 score=92 if verdict == Verdict.PASS else 72,
                 rationale="review rationale",
-                gaps=[] if verdict == Verdict.PASS else ["gap"],
-                factuality_concerns=[],
-                source_quality_concerns=[],
-                next_instructions=None,
+                gaps=[] if verdict == Verdict.PASS else self.review_gaps,
+                factuality_concerns=(
+                    [] if verdict == Verdict.PASS else self.review_factuality_concerns
+                ),
+                source_quality_concerns=(
+                    [] if verdict == Verdict.PASS else self.review_source_quality_concerns
+                ),
+                next_instructions=(
+                    None if verdict == Verdict.PASS else self.review_next_instructions
+                ),
                 can_be_fixed_by_llm=verdict == Verdict.NEEDS_LLM_FIX,
                 requires_new_external_research=verdict == Verdict.NEEDS_DEEP_RESEARCH,
                 reviewer_confidence=90,
@@ -145,7 +175,11 @@ class FakeAzure:
                 public_web_search_used=bool(kwargs["web_search_enabled"]),
             ),
             f"resp_review_{self.review_calls}",
-            {"id": f"resp_review_{self.review_calls}", "status": "completed"},
+            {
+                "id": f"resp_review_{self.review_calls}",
+                "status": "completed",
+                "usage": self.review_usage,
+            },
         )
 
     def llm_finalize_report(
@@ -176,6 +210,46 @@ def make_orchestrator(tmp_path: Path, fake: FakeAzure) -> ResearchOrchestrator:
         repository=ResearchRepository(settings.research_db_path),
         artifacts=ArtifactStore(settings.research_artifact_dir),
         azure=cast(AzureResponsesClient, fake),
+    )
+
+
+def _review_record(
+    *,
+    review_no: int,
+    verdict: Verdict = Verdict.NEEDS_LLM_FIX,
+    score: int = 70,
+    gaps: list[str] | None = None,
+    factuality_concerns: list[str] | None = None,
+    source_quality_concerns: list[str] | None = None,
+    can_be_fixed_by_llm: bool | None = None,
+    requires_new_external_research: bool | None = None,
+    report_hash: str | None = None,
+) -> ReviewRecord:
+    return ReviewRecord(
+        review_no=review_no,
+        verdict=verdict,
+        goal_achieved=False,
+        score=score,
+        rationale="review rationale",
+        gaps=gaps or [],
+        factuality_concerns=factuality_concerns or [],
+        source_quality_concerns=source_quality_concerns or [],
+        next_instructions=None,
+        recommended_route=verdict,
+        can_be_fixed_by_llm=(
+            verdict == Verdict.NEEDS_LLM_FIX
+            if can_be_fixed_by_llm is None
+            else can_be_fixed_by_llm
+        ),
+        requires_new_external_research=(
+            verdict == Verdict.NEEDS_DEEP_RESEARCH
+            if requires_new_external_research is None
+            else requires_new_external_research
+        ),
+        reviewer_confidence=80,
+        high_risk_flags=[],
+        public_web_search_used=False,
+        report_hash=report_hash,
     )
 
 
@@ -215,6 +289,120 @@ def test_route_deep_research_can_downgrade_to_llm_fix_after_deep_limit() -> None
     )
 
     assert route == "llm_finalize"
+
+
+def test_route_llm_fix_requires_explicit_llm_fixable_review() -> None:
+    route = route_after_review(
+        {
+            "review": {
+                "verdict": "needs_llm_fix",
+                "can_be_fixed_by_llm": True,
+                "requires_new_external_research": False,
+            },
+            "llm_fix_runs": 0,
+            "max_llm_fix_runs": 3,
+            "total_reviews": 1,
+            "max_total_iterations": 5,
+        }
+    )
+
+    assert route == "llm_finalize"
+
+
+@pytest.mark.parametrize(
+    "review_flags",
+    [
+        {"can_be_fixed_by_llm": False, "requires_new_external_research": False},
+        {"can_be_fixed_by_llm": True, "requires_new_external_research": True},
+    ],
+)
+def test_route_llm_fix_rejects_contradictory_review_flags(
+    review_flags: dict[str, bool],
+) -> None:
+    route = route_after_review(
+        {
+            "review": {"verdict": "needs_llm_fix", **review_flags},
+            "llm_fix_runs": 0,
+            "max_llm_fix_runs": 3,
+            "total_reviews": 1,
+            "max_total_iterations": 5,
+        }
+    )
+
+    assert route == "human_review"
+
+
+def test_no_progress_counts_repeated_factuality_concerns_even_when_gaps_change() -> None:
+    previous = _review_record(
+        review_no=1,
+        score=70,
+        gaps=["市場規模の表が不足"],
+        factuality_concerns=["2024年の売上数値に根拠がない"],
+    )
+    current = _review_record(
+        review_no=2,
+        score=72,
+        gaps=["競合比較の粒度が粗い"],
+        factuality_concerns=["2024年の売上数値に根拠がない"],
+    )
+
+    no_progress = compute_no_progress_count(
+        previous_reviews=[previous],
+        current_review=current,
+        current_no_progress_count=1,
+    )
+
+    assert no_progress == 2
+
+
+def test_no_progress_counts_repeated_source_quality_concerns_even_when_gaps_change() -> None:
+    previous = _review_record(
+        review_no=1,
+        score=68,
+        gaps=["採用事例が不足"],
+        source_quality_concerns=["公式資料ではなく二次情報に偏っている"],
+    )
+    current = _review_record(
+        review_no=2,
+        score=70,
+        gaps=["価格情報が不足"],
+        source_quality_concerns=["公式資料ではなく二次情報に偏っている"],
+    )
+
+    no_progress = compute_no_progress_count(
+        previous_reviews=[previous],
+        current_review=current,
+        current_no_progress_count=0,
+    )
+
+    assert no_progress == 1
+
+
+def test_no_progress_ignores_empty_concern_lists_when_gaps_and_report_change() -> None:
+    previous = _review_record(
+        review_no=1,
+        score=70,
+        gaps=["市場規模の表が不足"],
+        factuality_concerns=[],
+        source_quality_concerns=[],
+        report_hash="previous-report",
+    )
+    current = _review_record(
+        review_no=2,
+        score=72,
+        gaps=["競合比較の粒度が粗い"],
+        factuality_concerns=[],
+        source_quality_concerns=[],
+        report_hash="current-report",
+    )
+
+    no_progress = compute_no_progress_count(
+        previous_reviews=[previous],
+        current_review=current,
+        current_no_progress_count=1,
+    )
+
+    assert no_progress == 0
 
 
 def test_confidential_context_disables_reviewer_web_search() -> None:
@@ -277,8 +465,59 @@ def test_needs_llm_fix_runs_finalize_and_returns_to_review(tmp_path: Path) -> No
     assert len(orchestrator.repository.get_reviews(run.id)) == 2
 
 
+def test_repeated_needs_llm_fix_stops_at_max_llm_fix_runs(tmp_path: Path) -> None:
+    fake = FakeAzure(verdicts=[Verdict.NEEDS_LLM_FIX, Verdict.NEEDS_LLM_FIX])
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(
+            user_prompt="技術調査をしてください",
+            options=ResearchRunOptions(
+                max_llm_fix_runs=1,
+                max_no_progress_rounds=10,
+            ),
+        )
+    )
+    guarded = orchestrator.collect_deep_research(run.id)
+
+    assert guarded.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert guarded.done_reason == "review_route_needs_llm_fix"
+    assert guarded.llm_fix_runs == 1
+    assert guarded.total_reviews == 2
+    assert guarded.no_progress_count < guarded.max_no_progress_rounds
+    assert len(fake.llm_finalize_prompts) == 1
+
+
+def test_max_no_progress_rounds_stops_before_next_loop_action(tmp_path: Path) -> None:
+    fake = FakeAzure(verdicts=[Verdict.NEEDS_LLM_FIX, Verdict.NEEDS_LLM_FIX])
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(
+            user_prompt="技術調査をしてください",
+            options=ResearchRunOptions(
+                max_llm_fix_runs=3,
+                max_no_progress_rounds=1,
+            ),
+        )
+    )
+    guarded = orchestrator.collect_deep_research(run.id)
+
+    assert guarded.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert guarded.done_reason == "review_route_needs_llm_fix"
+    assert guarded.no_progress_count == guarded.max_no_progress_rounds
+    assert guarded.llm_fix_runs == 1
+    assert len(fake.llm_finalize_prompts) == 1
+
+
 def test_needs_deep_research_submits_rerun_brief(tmp_path: Path) -> None:
-    fake = FakeAzure(verdict=Verdict.NEEDS_DEEP_RESEARCH)
+    fake = FakeAzure(
+        verdict=Verdict.NEEDS_DEEP_RESEARCH,
+        review_gaps=["主要競合の価格比較が不足"],
+        review_factuality_concerns=["2025年の市場規模が未検証"],
+        review_source_quality_concerns=["公式発表ではなくブログに依存"],
+        review_next_instructions="一次情報と規制当局資料を優先して再調査してください。",
+    )
     orchestrator = make_orchestrator(tmp_path, fake)
 
     run = orchestrator.create_run(CreateResearchRunRequest(user_prompt="技術調査をしてください"))
@@ -287,8 +526,113 @@ def test_needs_deep_research_submits_rerun_brief(tmp_path: Path) -> None:
     assert rerun.status == RunStatus.WAITING_DEEP_RESEARCH
     assert rerun.deep_research_runs == 2
     assert len(fake.submitted_prompts) == 2
-    assert "# Rerun Policy" in fake.submitted_prompts[-1]
-    assert "gap" in fake.submitted_prompts[-1]
+    rerun_brief = fake.submitted_prompts[-1]
+    assert "# Review Result" in rerun_brief
+    assert "# Gaps To Fix" in rerun_brief
+    assert "# Factuality Concerns" in rerun_brief
+    assert "# Source Quality Concerns" in rerun_brief
+    assert "# Next Instructions" in rerun_brief
+    assert "# Rerun Policy" in rerun_brief
+    assert "主要競合の価格比較が不足" in rerun_brief
+    assert "2025年の市場規模が未検証" in rerun_brief
+    assert "公式発表ではなくブログに依存" in rerun_brief
+    assert "一次情報と規制当局資料を優先して再調査してください。" in rerun_brief
+
+
+def test_deep_research_rerun_uses_remaining_tool_call_budget(tmp_path: Path) -> None:
+    fake = FakeAzure(verdict=Verdict.NEEDS_DEEP_RESEARCH)
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(
+            user_prompt="技術調査をしてください",
+            options=ResearchRunOptions(max_total_tool_calls=2),
+        )
+    )
+    rerun = orchestrator.collect_deep_research(run.id)
+
+    assert rerun.status == RunStatus.WAITING_DEEP_RESEARCH
+    assert fake.submitted_max_tool_calls == [2, 1]
+
+
+def test_over_budget_needs_deep_research_stops_before_rerun_submit(
+    tmp_path: Path,
+) -> None:
+    fake = FakeAzure(
+        verdict=Verdict.NEEDS_DEEP_RESEARCH,
+        deep_research_usage={"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+        review_usage={"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+    )
+    settings = Settings(
+        research_db_path=tmp_path / "research.sqlite3",
+        research_artifact_dir=tmp_path / "artifacts",
+        research_poller_enabled=False,
+        research_deep_research_timeout_seconds=1800,
+        research_deep_research_input_cost_per_1m=1.0,
+        research_deep_research_output_cost_per_1m=1.0,
+        research_reviewer_input_cost_per_1m=1.0,
+        research_reviewer_output_cost_per_1m=1.0,
+    )
+    orchestrator = ResearchOrchestrator(
+        settings=settings,
+        repository=ResearchRepository(settings.research_db_path),
+        artifacts=ArtifactStore(settings.research_artifact_dir),
+        azure=cast(AzureResponsesClient, fake),
+    )
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(
+            user_prompt="技術調査をしてください",
+            options=ResearchRunOptions(max_cost_usd=0.5),
+        )
+    )
+    guarded = orchestrator.collect_deep_research(run.id)
+
+    assert guarded.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert guarded.done_reason == "review_route_needs_deep_research"
+    assert guarded.estimated_cost_usd >= guarded.max_cost_usd
+    assert guarded.deep_research_runs == 1
+    assert len(fake.submitted_prompts) == 1
+
+
+def test_estimated_usage_cost_guard_stops_before_llm_fix(tmp_path: Path) -> None:
+    fake = FakeAzure(
+        verdict=Verdict.NEEDS_LLM_FIX,
+        deep_research_usage={"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+        review_usage={"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+    )
+    settings = Settings(
+        research_db_path=tmp_path / "research.sqlite3",
+        research_artifact_dir=tmp_path / "artifacts",
+        research_poller_enabled=False,
+        research_deep_research_timeout_seconds=1800,
+        research_deep_research_input_cost_per_1m=1.0,
+        research_deep_research_output_cost_per_1m=1.0,
+        research_reviewer_input_cost_per_1m=1.0,
+        research_reviewer_output_cost_per_1m=1.0,
+    )
+    orchestrator = ResearchOrchestrator(
+        settings=settings,
+        repository=ResearchRepository(settings.research_db_path),
+        artifacts=ArtifactStore(settings.research_artifact_dir),
+        azure=cast(AzureResponsesClient, fake),
+    )
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(
+            user_prompt="技術調査をしてください",
+            options=ResearchRunOptions(max_cost_usd=0.5),
+        )
+    )
+    guarded = orchestrator.collect_deep_research(run.id)
+
+    assert guarded.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert guarded.done_reason == "review_route_needs_llm_fix"
+    assert guarded.estimated_cost_usd >= guarded.max_cost_usd
+    assert guarded.llm_fix_runs == 0
+    assert not fake.llm_finalize_prompts
+    cost_events = orchestrator.repository.get_cost_events(run.id)
+    assert {event.step for event in cost_events} >= {"deep_research", "review"}
 
 
 def test_failed_deep_research_records_attempt_error_and_human_review(tmp_path: Path) -> None:
@@ -302,6 +646,38 @@ def test_failed_deep_research_records_attempt_error_and_human_review(tmp_path: P
     attempts = orchestrator.repository.get_attempts(run.id)
     assert attempts[-1].status == "failed"
     assert attempts[-1].error is not None
+
+
+def test_failed_deep_research_records_usage_cost_and_tool_calls(tmp_path: Path) -> None:
+    fake = FakeAzure(
+        retrieve_status="failed",
+        deep_research_usage={"input_tokens": 1_000_000, "output_tokens": 500_000},
+    )
+    settings = Settings(
+        research_db_path=tmp_path / "research.sqlite3",
+        research_artifact_dir=tmp_path / "artifacts",
+        research_poller_enabled=False,
+        research_deep_research_timeout_seconds=1800,
+        research_deep_research_input_cost_per_1m=1.0,
+        research_deep_research_output_cost_per_1m=2.0,
+        research_web_search_cost_per_call=0.25,
+    )
+    orchestrator = ResearchOrchestrator(
+        settings=settings,
+        repository=ResearchRepository(settings.research_db_path),
+        artifacts=ArtifactStore(settings.research_artifact_dir),
+        azure=cast(AzureResponsesClient, fake),
+    )
+
+    run = orchestrator.create_run(CreateResearchRunRequest(user_prompt="競合調査をしてください"))
+    failed = orchestrator.collect_deep_research(run.id)
+
+    assert failed.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert failed.total_tool_calls == 1
+    assert failed.estimated_cost_usd == 2.25
+    cost_events = orchestrator.repository.get_cost_events(run.id)
+    assert cost_events[-1].step == "deep_research"
+    assert cost_events[-1].tool_calls == 1
 
 
 @pytest.mark.anyio

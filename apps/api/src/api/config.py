@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     default_max_cost_usd: float = 20.0
     default_max_total_tool_calls: int = 120
 
+    research_deep_research_input_cost_per_1m: float = 0.0
+    research_deep_research_output_cost_per_1m: float = 0.0
+    research_reviewer_input_cost_per_1m: float = 0.0
+    research_reviewer_output_cost_per_1m: float = 0.0
+    research_web_search_cost_per_call: float = 0.0
+
     o3_deep_research_azure_openai_endpoint: str = ""
     o3_deep_research_azure_openai_key: str = ""
     o3_deep_research_azure_openai_api_version: str = ""

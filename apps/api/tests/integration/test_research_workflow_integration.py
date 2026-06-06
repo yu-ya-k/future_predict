@@ -51,6 +51,11 @@ async def test_api_poller_workflow_persists_report_and_audit(
     assert len(audit["reviews"]) == 1
     assert len(audit["citations"]) == 1
     assert len(audit["tool_calls"]) == 1
+    assert "cost_events" in audit
+    assert {event["step"] for event in audit["cost_events"]} >= {
+        "deep_research",
+        "review",
+    }
     assert any(event["step"] == "deep_research_collected" for event in audit["history"])
 
 

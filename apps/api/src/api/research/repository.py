@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 from api.config import Settings
 from api.research.schemas import (
     Citation,
+    CostEvent,
     ResearchAttempt,
     ResearchRunOptions,
     ResearchRunRecord,
@@ -143,12 +144,29 @@ class ResearchRepository:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS research_cost_events (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
+                    step TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    response_id TEXT,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    tool_calls INTEGER NOT NULL DEFAULT 0,
+                    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS research_history (
                     id TEXT PRIMARY KEY,
                     run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
                     event_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS research_cost_events_response_dedupe
+                ON research_cost_events(run_id, step, response_id)
+                WHERE response_id IS NOT NULL AND response_id != '';
                 """
             )
 
@@ -394,6 +412,60 @@ class ResearchRepository:
                 },
             )
 
+    def add_tool_calls(
+        self,
+        run_id: UUID,
+        *,
+        response_id: str | None,
+        step: str,
+        tool_calls: list[ToolCallSummary],
+    ) -> None:
+        if not tool_calls:
+            return
+
+        with self.connect() as connection:
+            for tool_call in tool_calls:
+                self._insert_tool_call(
+                    connection,
+                    run_id,
+                    response_id=response_id,
+                    step=step,
+                    tool_call=tool_call,
+                )
+
+    def add_citations(self, run_id: UUID, citations: list[Citation]) -> None:
+        if not citations:
+            return
+
+        with self.connect() as connection:
+            for citation in citations:
+                self._insert_citation(connection, run_id, citation)
+
+    def add_cost_event(self, run_id: UUID, cost_event: CostEvent) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO research_cost_events (
+                    id, run_id, step, model, response_id, input_tokens, output_tokens,
+                    tool_calls, estimated_cost_usd, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    str(run_id),
+                    cost_event.step,
+                    cost_event.model,
+                    cost_event.response_id,
+                    cost_event.input_tokens,
+                    cost_event.output_tokens,
+                    cost_event.tool_calls,
+                    cost_event.estimated_cost_usd,
+                    utc_now().isoformat(),
+                ),
+            )
+            return cursor.rowcount == 1
+
     def get_attempts(self, run_id: UUID) -> list[ResearchAttempt]:
         with self.connect() as connection:
             rows = connection.execute(
@@ -438,7 +510,7 @@ class ResearchRepository:
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT tool_type, status, query, url
+                SELECT response_id, step, tool_type, status, query, url
                 FROM research_tool_calls
                 WHERE run_id = ?
                 ORDER BY created_at ASC
@@ -447,12 +519,32 @@ class ResearchRepository:
             ).fetchall()
 
         return [
-            ToolCallSummary(
-                type=row["tool_type"],
-                status=row["status"],
-                query=row["query"],
-                url=row["url"],
-            )
+                ToolCallSummary(
+                    type=row["tool_type"],
+                    status=row["status"],
+                    query=row["query"],
+                    url=row["url"],
+                    step=row["step"],
+                    response_id=row["response_id"],
+                )
+            for row in rows
+        ]
+
+    def get_cost_events(self, run_id: UUID) -> list[CostEvent]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT step, model, response_id, input_tokens, output_tokens, tool_calls,
+                       estimated_cost_usd, created_at
+                FROM research_cost_events
+                WHERE run_id = ?
+                ORDER BY created_at ASC
+                """,
+                (str(run_id),),
+            ).fetchall()
+
+        return [
+            CostEvent.model_validate({**dict(row), "created_at": _parse_dt(row["created_at"])})
             for row in rows
         ]
 

@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from api.config import Settings
 from api.research.artifacts import ArtifactStore
 from api.research.azure_responses import AzureResponsesClient, ReviewResponseParseError
+from api.research.costing import build_cost_event, count_billable_web_search_calls
 from api.research.extractors import (
     extract_citations,
     extract_tool_calls,
@@ -17,7 +18,7 @@ from api.research.extractors import (
     response_to_jsonable,
 )
 from api.research.nodes import build_optimized_prompt
-from api.research.progress import compute_no_progress_count
+from api.research.progress import compute_no_progress_count, report_hash
 from api.research.repository import ResearchRepository
 from api.research.routing import route_after_review
 from api.research.schemas import (
@@ -106,6 +107,16 @@ class ResearchOrchestrator:
                 },
             )
 
+        remaining_tool_calls = run.max_total_tool_calls - run.total_tool_calls
+        if remaining_tool_calls <= 0:
+            return self.repository.update_run(
+                run.id,
+                optimized_prompt=optimized_prompt,
+                status=RunStatus.NEEDS_HUMAN_REVIEW,
+                needs_human_review=True,
+                done_reason="max_total_tool_calls_reached_before_deep_research_submit",
+            )
+
         try:
             web_search_enabled = should_enable_deep_research_web_search(
                 context_classification=run.context_classification,
@@ -115,7 +126,7 @@ class ResearchOrchestrator:
             response = self.azure.submit_deep_research(
                 prompt=prompt,
                 max_tool_calls=min(
-                    run.max_total_tool_calls,
+                    remaining_tool_calls,
                     self.settings.default_max_total_tool_calls,
                 ),
                 web_search_enabled=web_search_enabled,
@@ -220,14 +231,28 @@ class ResearchOrchestrator:
                 deep_research_status=response_status,
             )
 
+        raw_response = response_to_jsonable(response)
         raw_path, _ = self.artifacts.save_json(
             run.id,
             f"raw-responses/deep_research_collect_{run.deep_research_runs:03d}.json",
-            response_to_jsonable(response),
+            raw_response,
         )
 
         if response_status in TERMINAL_FAILURE_STATUSES:
             error_text = _extract_response_error(response)
+            citations = extract_citations(response)
+            tool_calls = extract_tool_calls(response)
+            cost_event = build_cost_event(
+                step="deep_research",
+                model=self.azure.deep_research_deployment,
+                response_id=response_id,
+                response=raw_response,
+                tool_calls=len(tool_calls),
+                billable_tool_calls=count_billable_web_search_calls(tool_calls),
+                input_cost_per_1m=self.settings.research_deep_research_input_cost_per_1m,
+                output_cost_per_1m=self.settings.research_deep_research_output_cost_per_1m,
+                tool_call_cost=self.settings.research_web_search_cost_per_call,
+            )
             self.repository.add_attempt(
                 run.id,
                 ResearchAttempt(
@@ -236,16 +261,23 @@ class ResearchOrchestrator:
                     status=response_status,
                     model=self.azure.deep_research_deployment,
                     prompt=run.optimized_prompt or run.user_prompt,
+                    citations=citations,
+                    tool_calls_summary=tool_calls,
                     error=error_text,
                     raw_response_artifact_path=raw_path,
                 ),
             )
+            cost_recorded = self.repository.add_cost_event(run.id, cost_event)
+            tool_call_delta = len(tool_calls) if cost_recorded else 0
+            cost_delta = cost_event.estimated_cost_usd if cost_recorded else 0.0
             return self.repository.update_run(
                 run.id,
                 status=RunStatus.NEEDS_HUMAN_REVIEW,
                 needs_human_review=True,
                 done_reason=f"deep_research_{response_status}",
                 deep_research_status=response_status,
+                total_tool_calls=run.total_tool_calls + tool_call_delta,
+                estimated_cost_usd=run.estimated_cost_usd + cost_delta,
             )
 
         if response_status != "completed":
@@ -260,6 +292,17 @@ class ResearchOrchestrator:
         report = get_response_output_text(response)
         citations = extract_citations(response)
         tool_calls = extract_tool_calls(response)
+        cost_event = build_cost_event(
+            step="deep_research",
+            model=self.azure.deep_research_deployment,
+            response_id=response_id,
+            response=raw_response,
+            tool_calls=len(tool_calls),
+            billable_tool_calls=count_billable_web_search_calls(tool_calls),
+            input_cost_per_1m=self.settings.research_deep_research_input_cost_per_1m,
+            output_cost_per_1m=self.settings.research_deep_research_output_cost_per_1m,
+            tool_call_cost=self.settings.research_web_search_cost_per_call,
+        )
         self.repository.add_attempt(
             run.id,
             ResearchAttempt(
@@ -274,6 +317,9 @@ class ResearchOrchestrator:
                 raw_response_artifact_path=raw_path,
             ),
         )
+        cost_recorded = self.repository.add_cost_event(run.id, cost_event)
+        tool_call_delta = len(tool_calls) if cost_recorded else 0
+        cost_delta = cost_event.estimated_cost_usd if cost_recorded else 0.0
         report_path, _ = self.artifacts.save_text(
             run.id,
             f"reports/report_attempt_{run.deep_research_runs:03d}.md",
@@ -286,6 +332,7 @@ class ResearchOrchestrator:
                 "response_id": response_id,
                 "citations_count": len(citations),
                 "tool_calls_count": len(tool_calls),
+                "estimated_cost_usd": cost_event.estimated_cost_usd,
                 "report_path": report_path,
             },
         )
@@ -294,7 +341,8 @@ class ResearchOrchestrator:
             status=RunStatus.REVIEWING,
             report=report,
             deep_research_status=response_status,
-            total_tool_calls=run.total_tool_calls + len(tool_calls),
+            total_tool_calls=run.total_tool_calls + tool_call_delta,
+            estimated_cost_usd=run.estimated_cost_usd + cost_delta,
         )
         return self.review_run(updated.id)
 
@@ -322,6 +370,7 @@ class ResearchOrchestrator:
                 acceptance_criteria=acceptance_criteria,
                 web_search_enabled=web_search_enabled,
             )
+            run = self.repository.get_run(run.id)
         except ReviewResponseParseError as error:
             self.artifacts.save_json(
                 run.id,
@@ -350,18 +399,45 @@ class ResearchOrchestrator:
                 done_reason="review_schema_or_request_failed",
             )
 
+        review_tool_calls = extract_tool_calls(raw_response)
+        review_citations = extract_citations(raw_response)
+        cost_event = build_cost_event(
+            step="review",
+            model=self.azure.reviewer_deployment,
+            response_id=response_id,
+            response=raw_response,
+            tool_calls=len(review_tool_calls),
+            billable_tool_calls=count_billable_web_search_calls(review_tool_calls),
+            input_cost_per_1m=self.settings.research_reviewer_input_cost_per_1m,
+            output_cost_per_1m=self.settings.research_reviewer_output_cost_per_1m,
+            tool_call_cost=self.settings.research_web_search_cost_per_call,
+        )
+
         if raw_response:
             self.artifacts.save_json(
                 run.id,
                 f"raw-responses/review_resp_{run.total_reviews + 1:03d}.json",
                 raw_response,
             )
+        self.repository.add_tool_calls(
+            run.id,
+            response_id=response_id,
+            step="review",
+            tool_calls=review_tool_calls,
+        )
+        self.repository.add_citations(run.id, review_citations)
+        cost_recorded = self.repository.add_cost_event(run.id, cost_event)
+        tool_call_delta = len(review_tool_calls) if cost_recorded else 0
+        cost_delta = cost_event.estimated_cost_usd if cost_recorded else 0.0
+        next_total_tool_calls = run.total_tool_calls + tool_call_delta
+        next_estimated_cost = run.estimated_cost_usd + cost_delta
 
         review = ReviewRecord(
             **review_result.model_dump(),
             review_no=run.total_reviews + 1,
             recommended_route=review_result.verdict,
             reviewer_response_id=response_id,
+            report_hash=report_hash(run.report),
         )
         no_progress_count = compute_no_progress_count(
             previous_reviews=previous_reviews,
@@ -385,9 +461,9 @@ class ResearchOrchestrator:
                 "max_deep_research_runs": run.max_deep_research_runs,
                 "max_llm_fix_runs": run.max_llm_fix_runs,
                 "max_no_progress_rounds": run.max_no_progress_rounds,
-                "estimated_cost_usd": run.estimated_cost_usd,
+                "estimated_cost_usd": next_estimated_cost,
                 "max_cost_usd": run.max_cost_usd,
-                "total_tool_calls": run.total_tool_calls,
+                "total_tool_calls": next_total_tool_calls,
                 "max_total_tool_calls": run.max_total_tool_calls,
                 "contains_confidential_context": run.contains_confidential_context,
                 "web_search_allowed": run.web_search_allowed,
@@ -396,11 +472,24 @@ class ResearchOrchestrator:
 
         self.repository.append_history_event(
             run.id,
-            {"step": "route_after_review", "route": route, "verdict": review.verdict.value},
+            {
+                "step": "route_after_review",
+                "route": route,
+                "verdict": review.verdict.value,
+                "total_reviews": run.total_reviews + 1,
+                "no_progress_count": no_progress_count,
+                "total_tool_calls": next_total_tool_calls,
+                "estimated_cost_usd": next_estimated_cost,
+            },
         )
 
         if route == "finalize":
-            final_path, _ = self.artifacts.save_text(run.id, "reports/final_report.md", run.report)
+            final_report = run.report or ""
+            final_path, _ = self.artifacts.save_text(
+                run.id,
+                "reports/final_report.md",
+                final_report,
+            )
             self.repository.append_history_event(
                 run.id,
                 {"step": "finalized", "final_report_path": final_path},
@@ -408,10 +497,12 @@ class ResearchOrchestrator:
             return self.repository.update_run(
                 run.id,
                 status=RunStatus.COMPLETED,
-                final_report=run.report,
+                final_report=final_report,
                 done_reason="passed_review",
                 total_reviews=run.total_reviews + 1,
                 no_progress_count=no_progress_count,
+                total_tool_calls=next_total_tool_calls,
+                estimated_cost_usd=next_estimated_cost,
                 needs_human_review=False,
             )
 
@@ -423,6 +514,8 @@ class ResearchOrchestrator:
                 done_reason=f"review_route_{review.verdict.value}",
                 total_reviews=run.total_reviews + 1,
                 no_progress_count=no_progress_count,
+                total_tool_calls=next_total_tool_calls,
+                estimated_cost_usd=next_estimated_cost,
             )
 
         updated = self.repository.update_run(
@@ -432,6 +525,8 @@ class ResearchOrchestrator:
             done_reason=None,
             total_reviews=run.total_reviews + 1,
             no_progress_count=no_progress_count,
+            total_tool_calls=next_total_tool_calls,
+            estimated_cost_usd=next_estimated_cost,
         )
         if route == "llm_finalize":
             return self.llm_finalize(updated.id)
@@ -495,12 +590,36 @@ class ResearchOrchestrator:
                 done_reason="llm_finalize_failed",
             )
 
+        llm_tool_calls = extract_tool_calls(raw_response)
+        llm_citations = extract_citations(raw_response)
+        cost_event = build_cost_event(
+            step="llm_finalize",
+            model=self.azure.reviewer_deployment,
+            response_id=response_id,
+            response=raw_response,
+            tool_calls=len(llm_tool_calls),
+            billable_tool_calls=count_billable_web_search_calls(llm_tool_calls),
+            input_cost_per_1m=self.settings.research_reviewer_input_cost_per_1m,
+            output_cost_per_1m=self.settings.research_reviewer_output_cost_per_1m,
+            tool_call_cost=self.settings.research_web_search_cost_per_call,
+        )
+
         if raw_response:
             self.artifacts.save_json(
                 run.id,
                 f"raw-responses/llm_finalize_resp_{run_no:03d}.json",
                 raw_response,
             )
+        self.repository.add_tool_calls(
+            run.id,
+            response_id=response_id,
+            step="llm_finalize",
+            tool_calls=llm_tool_calls,
+        )
+        self.repository.add_citations(run.id, llm_citations)
+        cost_recorded = self.repository.add_cost_event(run.id, cost_event)
+        tool_call_delta = len(llm_tool_calls) if cost_recorded else 0
+        cost_delta = cost_event.estimated_cost_usd if cost_recorded else 0.0
         report_path, _ = self.artifacts.save_text(
             run.id,
             f"reports/llm_fix_{run_no:03d}.md",
@@ -512,6 +631,8 @@ class ResearchOrchestrator:
                 "step": "llm_finalize",
                 "run_no": run_no,
                 "response_id": response_id,
+                "tool_calls_count": len(llm_tool_calls),
+                "estimated_cost_usd": cost_event.estimated_cost_usd,
                 "report_path": report_path,
             },
         )
@@ -521,6 +642,8 @@ class ResearchOrchestrator:
             needs_human_review=False,
             report=revised_report,
             llm_fix_runs=run_no,
+            total_tool_calls=run.total_tool_calls + tool_call_delta,
+            estimated_cost_usd=run.estimated_cost_usd + cost_delta,
             done_reason=None,
         )
         return self.review_run(updated.id)
@@ -667,6 +790,33 @@ class ResearchOrchestrator:
                     citations=citations,
                     web_search_enabled=web_search_enabled,
                 )
+            except ReviewResponseParseError as error:
+                last_error = error
+                raw_response = error.raw_response
+                response_id = str(raw_response.get("id") or "")
+                artifact_name = (
+                    f"raw-responses/review_resp_parse_failed_"
+                    f"{run.total_reviews + 1:03d}_{attempt_no + 1}.json"
+                )
+                self.artifacts.save_json(
+                    run.id,
+                    artifact_name,
+                    raw_response,
+                )
+                self._record_review_response_cost(
+                    run_id=run.id,
+                    response_id=response_id,
+                    raw_response=raw_response,
+                    step="review_failed",
+                )
+                self.repository.append_history_event(
+                    run.id,
+                    {
+                        "step": "review_attempt_failed",
+                        "attempt_no": attempt_no + 1,
+                        "error": repr(error),
+                    },
+                )
             except (ValueError, ValidationError, RuntimeError) as error:
                 last_error = error
                 self.repository.append_history_event(
@@ -681,6 +831,44 @@ class ResearchOrchestrator:
         if last_error is None:
             raise RuntimeError("Review failed without an exception.")
         raise last_error
+
+    def _record_review_response_cost(
+        self,
+        *,
+        run_id: UUID,
+        response_id: str | None,
+        raw_response: dict[str, Any],
+        step: str,
+    ) -> None:
+        tool_calls = extract_tool_calls(raw_response)
+        citations = extract_citations(raw_response)
+        cost_event = build_cost_event(
+            step=step,
+            model=self.azure.reviewer_deployment,
+            response_id=response_id,
+            response=raw_response,
+            tool_calls=len(tool_calls),
+            billable_tool_calls=count_billable_web_search_calls(tool_calls),
+            input_cost_per_1m=self.settings.research_reviewer_input_cost_per_1m,
+            output_cost_per_1m=self.settings.research_reviewer_output_cost_per_1m,
+            tool_call_cost=self.settings.research_web_search_cost_per_call,
+        )
+        self.repository.add_tool_calls(
+            run_id,
+            response_id=response_id,
+            step=step,
+            tool_calls=tool_calls,
+        )
+        self.repository.add_citations(run_id, citations)
+        if not self.repository.add_cost_event(run_id, cost_event):
+            return
+
+        run = self.repository.get_run(run_id)
+        self.repository.update_run(
+            run_id,
+            total_tool_calls=run.total_tool_calls + len(tool_calls),
+            estimated_cost_usd=run.estimated_cost_usd + cost_event.estimated_cost_usd,
+        )
 
     def _latest_review(self, run_id: UUID) -> ReviewRecord | None:
         reviews = self.repository.get_reviews(run_id)
@@ -700,12 +888,14 @@ class ResearchOrchestrator:
             if latest_review is None
             else f"""verdict: {latest_review.verdict.value}
 score: {latest_review.score}
-rationale: {latest_review.rationale}
-gaps: {latest_review.gaps}
-factuality_concerns: {latest_review.factuality_concerns}
-source_quality_concerns: {latest_review.source_quality_concerns}
-next_instructions: {latest_review.next_instructions}"""
+rationale: {latest_review.rationale}"""
         )
+        gaps = [] if latest_review is None else latest_review.gaps
+        factuality_concerns = [] if latest_review is None else latest_review.factuality_concerns
+        source_quality_concerns = (
+            [] if latest_review is None else latest_review.source_quality_concerns
+        )
+        next_instructions = None if latest_review is None else latest_review.next_instructions
         human_block = human_comment or "なし"
         return f"""# Original User Prompt
 {run.user_prompt}
@@ -718,6 +908,18 @@ next_instructions: {latest_review.next_instructions}"""
 
 # Review Result
 {review_block}
+
+# Gaps To Fix
+{gaps}
+
+# Factuality Concerns
+{factuality_concerns}
+
+# Source Quality Concerns
+{source_quality_concerns}
+
+# Next Instructions
+{next_instructions}
 
 # Human Reviewer Comment
 {human_block}

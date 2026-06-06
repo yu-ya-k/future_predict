@@ -10,6 +10,7 @@ from api.research.schemas import (
     AuditResponse,
     CancelResponse,
     Citation,
+    CostEvent,
     CreateResearchRunRequest,
     CreateResearchRunResponse,
     HumanReviewResumeRequest,
@@ -68,6 +69,8 @@ def _status_response(
             total_reviews=run.total_reviews,
             latest_verdict=latest.verdict if latest else None,
             latest_score=latest.score if latest else None,
+            total_tool_calls=run.total_tool_calls,
+            estimated_cost_usd=run.estimated_cost_usd,
         ),
     )
 
@@ -99,6 +102,7 @@ def get_audit(
         reviews=orchestrator.repository.get_reviews(run.id),
         citations=orchestrator.repository.get_citations(run.id),
         tool_calls=orchestrator.repository.get_tool_calls(run.id),
+        cost_events=orchestrator.repository.get_cost_events(run.id),
         history=orchestrator.repository.get_history(run.id),
     )
 
@@ -137,6 +141,15 @@ def get_tool_calls(
 ) -> list[ToolCallSummary]:
     run = _get_run_or_404(orchestrator, run_id)
     return orchestrator.repository.get_tool_calls(run.id)
+
+
+@router.get("/{run_id}/cost-events", response_model=list[CostEvent])
+def get_cost_events(
+    run_id: UUID,
+    orchestrator: OrchestratorDependency,
+) -> list[CostEvent]:
+    run = _get_run_or_404(orchestrator, run_id)
+    return orchestrator.repository.get_cost_events(run.id)
 
 
 @router.post("/{run_id}/cancel", response_model=CancelResponse)

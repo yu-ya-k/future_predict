@@ -67,6 +67,8 @@ class RunProgress(BaseModel):
     total_reviews: int
     latest_verdict: Verdict | None
     latest_score: int | None
+    total_tool_calls: int = 0
+    estimated_cost_usd: float = 0.0
 
 
 class ResearchRunStatusResponse(BaseModel):
@@ -101,6 +103,8 @@ class ToolCallSummary(BaseModel):
     url: str | None = None
     server_label: str | None = None
     duration_ms: int | None = None
+    step: str | None = None
+    response_id: str | None = None
 
 
 def _empty_citations() -> list[Citation]:
@@ -144,6 +148,18 @@ class ReviewRecord(ReviewResult):
     review_no: int
     recommended_route: Verdict
     reviewer_response_id: str | None = None
+    report_hash: str | None = None
+
+
+class CostEvent(BaseModel):
+    step: str
+    model: str
+    response_id: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    tool_calls: int = 0
+    estimated_cost_usd: float = 0.0
+    created_at: datetime | None = None
 
 
 class AuditResponse(BaseModel):
@@ -152,6 +168,7 @@ class AuditResponse(BaseModel):
     reviews: list[ReviewRecord]
     citations: list[Citation]
     tool_calls: list[ToolCallSummary]
+    cost_events: list[CostEvent]
     history: list[dict[str, Any]]
 
 

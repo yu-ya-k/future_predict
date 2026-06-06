@@ -16,7 +16,7 @@ class GraphState(TypedDict, total=False):
     human_decision: dict[str, Any]
 
 
-def build_phase_1_2_graph() -> Any:
+def build_phase_3_graph() -> Any:
     builder = StateGraph(GraphState)
     builder.add_node("deep_research_collect", lambda state: state)
     builder.add_node("review", lambda state: state)
@@ -53,6 +53,10 @@ def build_phase_1_2_graph() -> Any:
     builder.add_edge("finalize", END)
     builder.add_edge("partial_finalize", END)
     return builder.compile()
+
+
+def build_phase_1_2_graph() -> Any:
+    return build_phase_3_graph()
 
 
 def _graph_route_after_human_review(state: GraphState) -> str:

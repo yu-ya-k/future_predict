@@ -20,11 +20,25 @@ class IntegrationFakeAzure:
         *,
         retrieve_statuses: list[str] | None = None,
         verdicts: list[Verdict] | None = None,
+        deep_research_usage: dict[str, int] | None = None,
+        review_usage: dict[str, int] | None = None,
+        llm_finalize_usage: dict[str, int] | None = None,
+        review_gaps: list[str] | None = None,
+        review_factuality_concerns: list[str] | None = None,
+        review_source_quality_concerns: list[str] | None = None,
+        review_next_instructions: str | None = None,
         submit_raises: Exception | None = None,
         retrieve_raises: Exception | None = None,
     ) -> None:
         self.retrieve_statuses = retrieve_statuses or ["completed"]
         self.verdicts = verdicts or [Verdict.PASS]
+        self.deep_research_usage = deep_research_usage or {}
+        self.review_usage = review_usage or {}
+        self.llm_finalize_usage = llm_finalize_usage or {}
+        self.review_gaps = review_gaps or ["source coverage gap"]
+        self.review_factuality_concerns = review_factuality_concerns or []
+        self.review_source_quality_concerns = review_source_quality_concerns or []
+        self.review_next_instructions = review_next_instructions
         self.submit_raises = submit_raises
         self.retrieve_raises = retrieve_raises
         self.submit_calls: list[dict[str, object]] = []
@@ -74,6 +88,7 @@ class IntegrationFakeAzure:
                 "id": response_id,
                 "status": "completed",
                 "output_text": f"調査レポート本文 {response_id}",
+                "usage": self.deep_research_usage,
                 "output": [
                     {
                         "type": "message",
@@ -119,10 +134,16 @@ class IntegrationFakeAzure:
                 goal_achieved=verdict == Verdict.PASS,
                 score=92 if verdict == Verdict.PASS else 72,
                 rationale=f"review rationale: {verdict.value}",
-                gaps=[] if verdict == Verdict.PASS else ["source coverage gap"],
-                factuality_concerns=[],
-                source_quality_concerns=[],
-                next_instructions=None,
+                gaps=[] if verdict == Verdict.PASS else self.review_gaps,
+                factuality_concerns=(
+                    [] if verdict == Verdict.PASS else self.review_factuality_concerns
+                ),
+                source_quality_concerns=(
+                    [] if verdict == Verdict.PASS else self.review_source_quality_concerns
+                ),
+                next_instructions=(
+                    None if verdict == Verdict.PASS else self.review_next_instructions
+                ),
                 can_be_fixed_by_llm=verdict == Verdict.NEEDS_LLM_FIX,
                 requires_new_external_research=verdict == Verdict.NEEDS_DEEP_RESEARCH,
                 reviewer_confidence=90,
@@ -130,7 +151,7 @@ class IntegrationFakeAzure:
                 public_web_search_used=bool(kwargs["web_search_enabled"]),
             ),
             response_id,
-            {"id": response_id, "status": "completed"},
+            {"id": response_id, "status": "completed", "usage": self.review_usage},
         )
 
     def llm_finalize_report(
@@ -144,7 +165,7 @@ class IntegrationFakeAzure:
         return (
             "軽微修正済みレポート本文",
             response_id,
-            {"id": response_id, "status": "completed"},
+            {"id": response_id, "status": "completed", "usage": self.llm_finalize_usage},
         )
 
     def cancel_response(self, response_id: str) -> dict[str, object]:
