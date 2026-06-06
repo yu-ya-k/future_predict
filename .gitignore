@@ -26,6 +26,9 @@ build/
 # uv
 .uv-cache/
 
+# Local temporary files
+tmp/
+
 # Node / frontend
 node_modules/
 .pnpm-store/

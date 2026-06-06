@@ -117,3 +117,26 @@ def test_live_deep_research_submit_retrieve_cancel_smoke(
                 response_id=response_id,
                 last_known_status=latest_status,
             )
+
+
+@pytest.mark.live_api
+def test_live_reviewer_finalize_smoke(
+    live_settings: Settings,
+    live_azure_client: AzureResponsesClient,
+) -> None:
+    require_live_reviewer_settings(live_settings)
+
+    report, response_id, raw_response = live_azure_client.finalize_report(
+        user_prompt="公開情報に基づく短い調査結果を整えてください。",
+        report="OpenAI は AI 研究と製品開発を行う企業である。限界: smoke test 用。",
+        review={
+            "verdict": Verdict.NEEDS_LLM_FIX.value,
+            "rationale": "表現を簡潔に整える必要がある。",
+            "gaps": ["構成を少し整える"],
+        },
+        web_search_enabled=False,
+    )
+
+    assert report.strip()
+    assert response_id
+    assert raw_response
