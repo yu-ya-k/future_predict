@@ -23,7 +23,6 @@ import type {
   ResearchItem,
   RerunPlan,
   ResearchRunStatusResponse,
-  ReviewRecord,
   ToolCallSummary,
 } from "../types";
 import { apiClient } from "./client";
@@ -101,10 +100,6 @@ export function getAudit(runId: string, signal?: AbortSignal): Promise<AuditResp
 
 export function getCitations(runId: string, signal?: AbortSignal): Promise<Citation[]> {
   return apiClient.request(`${BASE}/${runId}/citations`, { signal });
-}
-
-export function getReviews(runId: string, signal?: AbortSignal): Promise<ReviewRecord[]> {
-  return apiClient.request(`${BASE}/${runId}/reviews`, { signal });
 }
 
 export function getAttempts(runId: string, signal?: AbortSignal): Promise<ResearchAttempt[]> {

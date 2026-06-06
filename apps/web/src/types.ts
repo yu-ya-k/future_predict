@@ -142,6 +142,7 @@ export interface CreateResearchRunResponse {
 }
 
 export interface RunProgress {
+  deep_research_runs: number;
   items_total: number;
   items_answered: number;
   items_partial: number;
@@ -272,6 +273,7 @@ export interface ResearchAttempt {
   tool_calls_summary: ToolCallSummary[];
   error?: string | null;
   raw_response_artifact_path?: string | null;
+  created_at?: string | null;
 }
 
 export interface ReviewResult {
@@ -334,6 +336,7 @@ export interface AuditResponse {
   run_id: string;
   attempts: ResearchAttempt[];
   reviews: ReviewRecord[];
+  llm_calls: CostEvent[];
   citations: Citation[];
   tool_calls: ToolCallSummary[];
   cost_events: CostEvent[];

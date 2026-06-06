@@ -342,6 +342,7 @@ class ResearchAttempt(BaseModel):
     tool_calls_summary: list[ToolCallSummary] = Field(default_factory=_empty_tool_calls)
     error: str | None = None
     raw_response_artifact_path: str | None = None
+    created_at: datetime | None = None
 
 
 class ReviewResult(BaseModel):
@@ -384,6 +385,7 @@ class AuditResponse(BaseModel):
     run_id: UUID
     attempts: list[ResearchAttempt]
     reviews: list[ReviewRecord]
+    llm_calls: list[CostEvent]
     objective_contract: ObjectiveContract | None = None
     research_items: list[ResearchItem] = Field(default_factory=_empty_research_items)
     rerun_plans: list[RerunPlan] = Field(default_factory=_empty_rerun_plans)

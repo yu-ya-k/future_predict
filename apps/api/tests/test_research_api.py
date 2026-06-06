@@ -59,12 +59,24 @@ async def test_research_run_api_flow(tmp_path: Path) -> None:
         assert report_response.status_code == 200
         assert report_response.json()["final_report"] == "調査レポート本文"
 
+        reviews_response = await client.get(f"/research-runs/{run_id}/reviews")
+        assert reviews_response.status_code == 200
+        reviews_json = reviews_response.json()
+        assert reviews_json
+        assert reviews_json[0]["review_no"] == 1
+        assert reviews_json[0]["verdict"] == "pass"
+        assert reviews_json[0]["recommended_route"] == "pass"
+
         audit_response = await client.get(f"/research-runs/{run_id}/audit")
         assert audit_response.status_code == 200
         audit_json = audit_response.json()
         assert audit_json["attempts"]
-        assert audit_json["reviews"]
+        assert audit_json["reviews"] == reviews_json
         assert audit_json["citations"]
+        assert [call["step"] for call in audit_json["llm_calls"]] == [
+            "deep_research",
+            "review",
+        ]
 
 
 @pytest.mark.anyio
@@ -105,11 +117,13 @@ async def test_delete_research_run_removes_api_access(tmp_path: Path) -> None:
         status_response = await client.get(f"/research-runs/{run_id}")
         report_response = await client.get(f"/research-runs/{run_id}/report")
         audit_response = await client.get(f"/research-runs/{run_id}/audit")
+        reviews_response = await client.get(f"/research-runs/{run_id}/reviews")
 
     assert delete_response.status_code == 204
     assert status_response.status_code == 404
     assert report_response.status_code == 404
     assert audit_response.status_code == 404
+    assert reviews_response.status_code == 404
 
 
 @pytest.mark.anyio

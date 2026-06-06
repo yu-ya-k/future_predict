@@ -10,7 +10,7 @@
  * EmptyState per empty tab. Mono styling for ids.
  */
 
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import {
   BackLink,
@@ -21,13 +21,21 @@ import {
 } from "../components";
 import { getAudit } from "../api/research";
 import { usePolling } from "../hooks/usePolling";
-import { routes } from "../router";
+import { navigate, routes } from "../router";
 import type { AuditResponse } from "../types";
 
-type TabId = "attempts" | "reviews" | "tool-calls" | "citations" | "cost" | "human-decisions";
+type TabId =
+  | "attempts"
+  | "llm-calls"
+  | "reviews"
+  | "tool-calls"
+  | "citations"
+  | "cost"
+  | "human-decisions";
 
 const TABS: { id: TabId; label: string }[] = [
   { id: "attempts", label: "調査試行" },
+  { id: "llm-calls", label: "LLMコール" },
   { id: "reviews", label: "レビュー" },
   { id: "tool-calls", label: "ツール呼び出し" },
   { id: "citations", label: "引用" },
@@ -37,6 +45,8 @@ const TABS: { id: TabId; label: string }[] = [
 
 interface AuditLogProps {
   runId: string;
+  initialTab?: string;
+  focusReviewNo?: number | null;
 }
 
 const ACTION_LABELS: Record<string, string> = {
@@ -64,12 +74,41 @@ const ITEM_SEVERITY_LABELS: Record<string, string> = {
   minor: "Minor",
 };
 
+const LLM_STEP_LABELS: Record<string, string> = {
+  deep_research: "Deep Research",
+  review: "LLM Review",
+  review_failed: "LLM Review (failed)",
+  review_ignored: "LLM Review (ignored)",
+  llm_finalize: "LLM patch",
+  llm_finalize_ignored: "LLM patch (ignored)",
+  verification: "Verification",
+};
+
+function normalizeTab(value?: string): TabId {
+  return TABS.some((tab) => tab.id === value) ? (value as TabId) : "attempts";
+}
+
 function actionSummary(items: AuditResponse["reviews"][number]["item_assessments"]) {
   const counts = new Map<string, number>();
   for (const item of items) {
     counts.set(item.recommended_action, (counts.get(item.recommended_action) ?? 0) + 1);
   }
   return Array.from(counts.entries()).sort(([a], [b]) => a.localeCompare(b));
+}
+
+function formatAuditDate(value?: string | null) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("ja-JP", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
 }
 
 // ── Tab contents ──────────────────────────────────────────────────────────────
@@ -85,6 +124,7 @@ function AttemptsTab({ data }: { data: AuditResponse }) {
           <tr>
             <th>#</th>
             <th>ステータス</th>
+            <th>日時</th>
             <th>モデル</th>
             <th>レスポンスID</th>
             <th>エラー</th>
@@ -95,6 +135,7 @@ function AttemptsTab({ data }: { data: AuditResponse }) {
             <tr key={a.run_no}>
               <td className="mono">{a.run_no}</td>
               <td>{a.status}</td>
+              <td className="audit-date">{formatAuditDate(a.created_at)}</td>
               <td className="mono">{a.model}</td>
               <td className="mono">{a.response_id ?? "—"}</td>
               <td>{a.error ?? "—"}</td>
@@ -106,14 +147,66 @@ function AttemptsTab({ data }: { data: AuditResponse }) {
   );
 }
 
-function ReviewsTab({ data }: { data: AuditResponse }) {
+function LlmCallsTab({ data }: { data: AuditResponse }) {
+  const calls = data.llm_calls;
+  if (calls.length === 0) {
+    return <EmptyState title="LLMコールなし" description="LLM呼び出しの記録がありません。" />;
+  }
+  return (
+    <div className="audit-table-wrap">
+      <table className="audit-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>種別</th>
+            <th>日時</th>
+            <th>モデル</th>
+            <th>レスポンスID</th>
+            <th>入力</th>
+            <th>出力</th>
+            <th>ツール</th>
+            <th>コスト</th>
+          </tr>
+        </thead>
+        <tbody>
+          {calls.map((call, i) => (
+            <tr key={`${call.step}-${call.response_id ?? i}`}>
+              <td className="mono">{i + 1}</td>
+              <td>{LLM_STEP_LABELS[call.step] ?? call.step}</td>
+              <td className="audit-date">{formatAuditDate(call.created_at)}</td>
+              <td className="mono">{call.model}</td>
+              <td className="mono">{call.response_id ?? "—"}</td>
+              <td className="mono">{call.input_tokens.toLocaleString()}</td>
+              <td className="mono">{call.output_tokens.toLocaleString()}</td>
+              <td className="mono">{call.tool_calls}</td>
+              <td className="mono">${call.estimated_cost_usd.toFixed(4)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ReviewsTab({
+  data,
+  focusReviewNo,
+}: {
+  data: AuditResponse;
+  focusReviewNo?: number | null;
+}) {
   if (data.reviews.length === 0) {
     return <EmptyState title="レビューなし" description="まだレビューがありません。" />;
   }
   return (
     <div className="reviews-tab-list">
       {data.reviews.map((r) => (
-        <div key={r.review_no} className="audit-review-item">
+        <div
+          key={r.review_no}
+          id={`audit-review-${r.review_no}`}
+          className={`audit-review-item${focusReviewNo === r.review_no ? " audit-review-item--focused" : ""}`}
+          tabIndex={focusReviewNo === r.review_no ? -1 : undefined}
+        >
           <div className="audit-review-header">
             <span className="mono audit-review-no">#{r.review_no}</span>
             <VerdictBadge verdict={r.verdict} />
@@ -271,7 +364,7 @@ function CostTab({ data }: { data: AuditResponse }) {
                 <td className="mono">{e.output_tokens.toLocaleString()}</td>
                 <td className="mono">{e.tool_calls}</td>
                 <td className="mono">${e.estimated_cost_usd.toFixed(4)}</td>
-                <td className="audit-date">{e.created_at ?? "—"}</td>
+                <td className="audit-date">{formatAuditDate(e.created_at)}</td>
               </tr>
             ))}
           </tbody>
@@ -318,8 +411,9 @@ function HumanDecisionsTab({ data }: { data: AuditResponse }) {
 
 // ── AuditLog ──────────────────────────────────────────────────────────────────
 
-export function AuditLog({ runId }: AuditLogProps) {
-  const [activeTab, setActiveTab] = useState<TabId>("attempts");
+export function AuditLog({ runId, initialTab, focusReviewNo = null }: AuditLogProps) {
+  const normalizedInitialTab = useMemo(() => normalizeTab(initialTab), [initialTab]);
+  const [activeTab, setActiveTab] = useState<TabId>(normalizedInitialTab);
 
   const { data, loading, error, refetch } = usePolling<AuditResponse>({
     fetcher: (signal) => getAudit(runId, signal),
@@ -327,6 +421,24 @@ export function AuditLog({ runId }: AuditLogProps) {
     // One-shot fetch (GAP-6: audit is append-only; refetch on tab change if needed)
     interval: () => null,
   });
+
+  useEffect(() => {
+    setActiveTab(normalizedInitialTab);
+  }, [normalizedInitialTab]);
+
+  function handleTabSelect(tabId: TabId) {
+    setActiveTab(tabId);
+    navigate(routes().audit(runId, tabId === "attempts" ? undefined : { tab: tabId }));
+  }
+
+  useEffect(() => {
+    if (activeTab !== "reviews" || !focusReviewNo || !data) return;
+    window.requestAnimationFrame(() => {
+      const target = document.getElementById(`audit-review-${focusReviewNo}`);
+      target?.scrollIntoView({ behavior: "smooth", block: "start" });
+      target?.focus({ preventScroll: true });
+    });
+  }, [activeTab, data, focusReviewNo]);
 
   if (loading && !data) {
     return (
@@ -375,7 +487,7 @@ export function AuditLog({ runId }: AuditLogProps) {
             aria-controls={`audit-panel-${tab.id}`}
             id={`audit-tab-${tab.id}`}
             className={`audit-tab${activeTab === tab.id ? " audit-tab--active" : ""}`}
-            onClick={() => setActiveTab(tab.id)}
+            onClick={() => handleTabSelect(tab.id)}
           >
             {tab.label}
           </button>
@@ -390,7 +502,8 @@ export function AuditLog({ runId }: AuditLogProps) {
         className="audit-panel"
       >
         {activeTab === "attempts" && <AttemptsTab data={data} />}
-        {activeTab === "reviews" && <ReviewsTab data={data} />}
+        {activeTab === "llm-calls" && <LlmCallsTab data={data} />}
+        {activeTab === "reviews" && <ReviewsTab data={data} focusReviewNo={focusReviewNo} />}
         {activeTab === "tool-calls" && <ToolCallsTab data={data} />}
         {activeTab === "citations" && <CitationsTab data={data} />}
         {activeTab === "cost" && <CostTab data={data} />}

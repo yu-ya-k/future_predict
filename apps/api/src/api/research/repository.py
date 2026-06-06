@@ -14,6 +14,7 @@ from api.research.schemas import (
     HumanReviewAction,
     HumanReviewDecision,
     ObjectiveContract,
+    RecommendedAction,
     RerunPlan,
     ResearchAttempt,
     ResearchItem,
@@ -22,6 +23,7 @@ from api.research.schemas import (
     ReviewRecord,
     RunStatus,
     ToolCallSummary,
+    Verdict,
     VerificationQuery,
     utc_now,
 )
@@ -42,6 +44,34 @@ def _parse_dt(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed
+
+
+def _legacy_review_flags(review: ReviewRecord) -> dict[str, int]:
+    actions = {assessment.recommended_action for assessment in review.item_assessments}
+    can_be_fixed_by_llm = (
+        review.verdict == Verdict.NEEDS_LLM_PATCH
+        or RecommendedAction.LLM_PATCH in actions
+    )
+    requires_new_external_research = (
+        review.verdict
+        in {
+            Verdict.NEEDS_VERIFICATION,
+            Verdict.NEEDS_TARGETED_RERUN,
+            Verdict.NEEDS_FULL_RERUN,
+        }
+        or bool(
+            actions
+            & {
+                RecommendedAction.VERIFY,
+                RecommendedAction.TARGETED_RERUN,
+                RecommendedAction.FULL_RERUN,
+            }
+        )
+    )
+    return {
+        "can_be_fixed_by_llm": int(can_be_fixed_by_llm),
+        "requires_new_external_research": int(requires_new_external_research),
+    }
 
 
 class ResearchRepository:
@@ -717,27 +747,55 @@ class ResearchRepository:
     ) -> None:
         now = utc_now().isoformat()
         with self.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO research_reviews (
-                    id, run_id, review_no, response_id, model, verdict, score,
-                    goal_achieved, reviewer_confidence, review_json, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(uuid4()),
-                    str(run_id),
-                    review.review_no,
-                    review.reviewer_response_id,
-                    model,
-                    review.verdict.value,
-                    review.score,
-                    int(review.goal_achieved),
+            table_columns = self._table_columns(connection, "research_reviews")
+            columns = [
+                "id",
+                "run_id",
+                "review_no",
+                "response_id",
+                "model",
+                "verdict",
+                "score",
+                "goal_achieved",
+            ]
+            values: list[Any] = [
+                str(uuid4()),
+                str(run_id),
+                review.review_no,
+                review.reviewer_response_id,
+                model,
+                review.verdict.value,
+                review.score,
+                int(review.goal_achieved),
+            ]
+            legacy_values = _legacy_review_flags(review)
+            for legacy_column in (
+                "can_be_fixed_by_llm",
+                "requires_new_external_research",
+            ):
+                if legacy_column in table_columns:
+                    columns.append(legacy_column)
+                    values.append(legacy_values[legacy_column])
+            columns.extend(
+                [
+                    "reviewer_confidence",
+                    "review_json",
+                    "created_at",
+                ]
+            )
+            values.extend(
+                [
                     review.reviewer_confidence,
                     review.model_dump_json(),
                     now,
-                ),
+                ]
+            )
+            connection.execute(
+                f"""
+                INSERT INTO research_reviews ({", ".join(columns)})
+                VALUES ({", ".join("?" for _ in columns)})
+                """,
+                values,
             )
             self.append_history(
                 connection,
@@ -852,6 +910,10 @@ class ResearchRepository:
             ).fetchall()
 
         return [ReviewRecord.model_validate_json(row["review_json"]) for row in rows]
+
+    def _table_columns(self, connection: sqlite3.Connection, table_name: str) -> set[str]:
+        rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return {row["name"] for row in rows}
 
     def get_citations(self, run_id: UUID) -> list[Citation]:
         with self.connect() as connection:
@@ -1342,6 +1404,7 @@ class ResearchRepository:
             ],
             error=row["error"],
             raw_response_artifact_path=row["raw_response_artifact_path"],
+            created_at=_parse_dt(row["created_at"]),
         )
 
     def _coalesce_attempt_rows(self, rows: list[sqlite3.Row]) -> list[ResearchAttempt]:

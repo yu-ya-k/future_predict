@@ -49,12 +49,24 @@ export function App() {
         return route.runId ? <HumanReview runId={route.runId} /> : <NotFound />;
       case "report":
         return route.runId ? (
-          <ReportViewer runId={route.runId} initialTab={route.reportTab} />
+          <ReportViewer
+            runId={route.runId}
+            initialTab={route.reportTab}
+            initialAttemptNo={route.reportAttemptNo}
+          />
         ) : (
           <NotFound />
         );
       case "audit":
-        return route.runId ? <AuditLog runId={route.runId} /> : <NotFound />;
+        return route.runId ? (
+          <AuditLog
+            runId={route.runId}
+            initialTab={route.auditTab}
+            focusReviewNo={route.auditReviewNo}
+          />
+        ) : (
+          <NotFound />
+        );
       case "settings":
         return <Settings />;
       case "not-found":

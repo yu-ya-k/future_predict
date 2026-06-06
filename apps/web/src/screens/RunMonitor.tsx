@@ -1,7 +1,7 @@
 /**
  * SCR-3: Run Monitor — central hub for a single research run.
  *
- * Polling: statusPollInterval(status) drives getRunStatus; getReviews for history.
+ * Polling: statusPollInterval(status) drives getRunStatus; audit data feeds the DAG.
  * Header: StatusPill + run metadata.
  * Notifications: fires on transition to completed / needs_human_review.
  * Cancel: calls cancelRun, then refetches.
@@ -14,19 +14,16 @@ import { useCallback, useRef, useState } from "react";
 import {
   CostMeter,
   MetricCard,
-  PipelineStepper,
   ReviewHistoryItem,
-  ScoreChip,
   Skeleton,
   StatusPill,
   WaitBanner,
   BackLink,
   EmptyState,
-  type PipelineStep,
 } from "../components";
 import {
   getRunStatus,
-  getReviews,
+  getAudit,
   getAttempts,
   getItems,
   cancelRun,
@@ -46,34 +43,6 @@ import {
   type ReviewRecord,
   type RunStatus,
 } from "../types";
-
-// ── Pipeline step mapping ─────────────────────────────────────────────────────
-
-function statusToStep(status: RunStatus): PipelineStep {
-  switch (status) {
-    case "queued":
-    case "submitted":
-      return "brief";
-    case "waiting_deep_research":
-    case "collecting":
-      return "research";
-    case "reviewing":
-    case "needs_action":
-    case "needs_human_review":
-      return "review";
-    case "completed":
-    case "cancelled":
-    case "failed":
-      return "finalize";
-  }
-}
-
-function getCompletedSteps(status: RunStatus): PipelineStep[] {
-  const order: PipelineStep[] = ["brief", "research", "review", "finalize"];
-  const current = statusToStep(status);
-  const idx = order.indexOf(current);
-  return order.slice(0, idx) as PipelineStep[];
-}
 
 // ── No-progress heuristic ─────────────────────────────────────────────────────
 
@@ -156,6 +125,443 @@ function isUnresolved(item: ResearchItem): boolean {
   return item.status !== "answered" && item.status !== "out_of_scope";
 }
 
+type DagNodeStatus = "done" | "active" | "pending" | "blocked";
+type DagNodeTone = "brief" | "research" | "review" | "patch" | "verify" | "finalize";
+type FollowUpKind =
+  | "llm_patch"
+  | "verification"
+  | "targeted_rerun"
+  | "full_rerun"
+  | "item_revision"
+  | "human_review"
+  | "finalize_with_limitation";
+
+interface ExecutionDagNode {
+  id: string;
+  title: string;
+  meta: string;
+  status: DagNodeStatus;
+  tone: DagNodeTone;
+  lane: number;
+  col: number;
+  href?: string;
+  ariaLabel?: string;
+  score?: number;
+}
+
+interface ExecutionDagEdge {
+  id: string;
+  from: string;
+  to: string;
+  status: "done" | "active" | "pending";
+  label?: string;
+}
+
+const FOLLOW_UP_LABEL: Record<FollowUpKind, string> = {
+  llm_patch: "LLMパッチ",
+  verification: "検証",
+  targeted_rerun: "Targeted rerun",
+  full_rerun: "Full rerun",
+  item_revision: "Item revision",
+  human_review: "Human review",
+  finalize_with_limitation: "制約付き最終化",
+};
+
+const DAG_STATUS_LABEL: Record<DagNodeStatus, string> = {
+  done: "完了",
+  active: "実行中",
+  pending: "待機",
+  blocked: "停止",
+};
+
+function activeDagNodeId(
+  status: RunStatus,
+  attempts: ResearchAttempt[],
+  reviews: ReviewRecord[],
+  progress?: ResearchRunStatusResponse["progress"],
+) {
+  if (status === "waiting_deep_research" || status === "collecting") {
+    const latestAttemptNo = Math.max(0, ...attempts.map((attempt) => attempt.run_no));
+    return `research-${Math.max(latestAttemptNo, progress?.deep_research_runs ?? 0, 1)}`;
+  }
+  if (status === "reviewing" || status === "needs_action") {
+    return `review-${reviews.length + 1}`;
+  }
+  if (status === "needs_human_review") return "human-review";
+  if (status === "completed" || status === "cancelled" || status === "failed") {
+    return "final";
+  }
+  return "brief";
+}
+
+function inferFollowUp(review: ReviewRecord): FollowUpKind | null {
+  if (review.verdict === "pass") return null;
+  const actions = new Set(review.item_assessments.map((item) => item.recommended_action));
+  if (actions.has("llm_patch") || review.verdict === "needs_llm_patch") return "llm_patch";
+  if (actions.has("verify") || review.verdict === "needs_verification") return "verification";
+  if (actions.has("targeted_rerun") || review.verdict === "needs_targeted_rerun") {
+    return "targeted_rerun";
+  }
+  if (actions.has("full_rerun") || review.verdict === "needs_full_rerun") return "full_rerun";
+  if (actions.has("revise_items") || review.verdict === "needs_item_revision") {
+    return "item_revision";
+  }
+  if (
+    actions.has("finalize_with_limitation") ||
+    review.verdict === "finalize_with_limitation"
+  ) {
+    return "finalize_with_limitation";
+  }
+  return "human_review";
+}
+
+function followUpTone(kind: FollowUpKind): DagNodeTone {
+  if (kind === "llm_patch") return "patch";
+  if (kind === "verification") return "verify";
+  if (kind === "targeted_rerun" || kind === "full_rerun") return "research";
+  return "review";
+}
+
+function followUpTitle(kind: FollowUpKind, index: number) {
+  if (kind === "llm_patch") return `LLMパッチ ${index}回目`;
+  if (kind === "verification") return `検証 ${index}回目`;
+  if (kind === "targeted_rerun") return `Targeted rerun ${index}`;
+  if (kind === "full_rerun") return `Full rerun ${index}`;
+  if (kind === "item_revision") return `Item revision ${index}`;
+  if (kind === "finalize_with_limitation") return `Limit finalize ${index}`;
+  return `Human review ${index}`;
+}
+
+function buildExecutionDag({
+  status,
+  attempts,
+  reviews,
+  progress,
+  runId,
+}: {
+  status: RunStatus;
+  attempts: ResearchAttempt[];
+  reviews: ReviewRecord[];
+  progress?: ResearchRunStatusResponse["progress"];
+  runId: string;
+}): { nodes: ExecutionDagNode[]; edges: ExecutionDagEdge[] } {
+  const nodes: ExecutionDagNode[] = [];
+  const edges: ExecutionDagEdge[] = [];
+  const activeId = activeDagNodeId(status, attempts, reviews, progress);
+  const maxAttemptRunNo = Math.max(0, ...attempts.map((attempt) => attempt.run_no));
+  const minimumResearchCount =
+    status === "queued" || status === "submitted"
+      ? maxAttemptRunNo
+      : Math.max(maxAttemptRunNo, progress?.deep_research_runs ?? 1, 1);
+  const attemptsByRunNo = new Map(attempts.map((attempt) => [attempt.run_no, attempt]));
+
+  nodes.push({
+    id: "brief",
+    title: "指示内容",
+    meta: "Objective contract / ResearchItems",
+    status: activeId === "brief" ? "active" : "done",
+    tone: "brief",
+    lane: 1,
+    col: 1,
+  });
+
+  let previousId = "brief";
+  let col = 2;
+  const followUpCounts: Record<FollowUpKind, number> = {
+    llm_patch: 0,
+    verification: 0,
+    targeted_rerun: 0,
+    full_rerun: 0,
+    item_revision: 0,
+    human_review: 0,
+    finalize_with_limitation: 0,
+  };
+  let nextResearchRunNo = 1;
+
+  function appendResearchNode() {
+    const runNo = nextResearchRunNo;
+    const attempt =
+      attemptsByRunNo.get(runNo) ??
+      ({
+        run_no: runNo,
+        status: activeId === `research-${runNo}` ? "running" : "pending",
+        model: "Deep Research",
+        prompt: "",
+        report: "",
+        citations: [],
+        tool_calls_summary: [],
+      } satisfies ResearchAttempt);
+    nextResearchRunNo += 1;
+    const researchId = `research-${attempt.run_no}`;
+    nodes.push({
+      id: researchId,
+      title: `Deep Research ${attempt.run_no}回目`,
+      meta: `status: ${attempt.status}`,
+      status: activeId === researchId ? "active" : "done",
+      tone: "research",
+      lane: 1,
+      col,
+      href: routes().report(runId, { attempt: attempt.run_no }),
+    });
+    edges.push({
+      id: `${previousId}-${researchId}`,
+      from: previousId,
+      to: researchId,
+      status: activeId === researchId ? "active" : "done",
+    });
+    previousId = researchId;
+    col += 1;
+  }
+
+  if (minimumResearchCount > 0) {
+    appendResearchNode();
+  }
+
+  for (const review of reviews) {
+    const reviewId = `review-${review.review_no}`;
+    nodes.push({
+      id: reviewId,
+      title: `LLMレビュー ${review.review_no}回目`,
+      meta: review.verdict,
+      status: "done",
+      tone: "review",
+      lane: 1,
+      col,
+      href: routes().audit(runId, { tab: "reviews", review: review.review_no }),
+      score: review.score,
+    });
+    edges.push({
+      id: `${previousId}-${reviewId}`,
+      from: previousId,
+      to: reviewId,
+      status: "done",
+    });
+    previousId = reviewId;
+    col += 1;
+
+    const followUp = inferFollowUp(review);
+    if (!followUp) continue;
+
+    followUpCounts[followUp] += 1;
+    const followUpIndex = followUpCounts[followUp];
+    const followId = `followup-${review.review_no}`;
+    const label = FOLLOW_UP_LABEL[followUp];
+    nodes.push({
+      id: followId,
+      title: followUpTitle(followUp, followUpIndex),
+      meta: label,
+      status: "done",
+      tone: followUpTone(followUp),
+      lane: review.review_no % 2 === 0 ? 2 : 0,
+      col,
+      href: routes().audit(runId, { tab: "reviews", review: review.review_no }),
+    });
+    edges.push({
+      id: `${previousId}-${followId}`,
+      from: previousId,
+      to: followId,
+      status: "done",
+      label,
+    });
+    previousId = followId;
+    col += 1;
+
+    if (followUp === "targeted_rerun" || followUp === "full_rerun") {
+      appendResearchNode();
+    }
+  }
+
+  while (nextResearchRunNo <= minimumResearchCount) {
+    appendResearchNode();
+  }
+
+  if (activeId === `review-${reviews.length + 1}`) {
+    const reviewId = `review-${reviews.length + 1}`;
+    nodes.push({
+      id: reviewId,
+      title: `LLMレビュー ${reviews.length + 1}回目`,
+      meta: "running",
+      status: "active",
+      tone: "review",
+      lane: 1,
+      col,
+      href: routes().audit(runId, { tab: "reviews", review: reviews.length + 1 }),
+    });
+    edges.push({
+      id: `${previousId}-${reviewId}`,
+      from: previousId,
+      to: reviewId,
+      status: "active",
+    });
+    previousId = reviewId;
+    col += 1;
+  }
+
+  if (activeId === "human-review") {
+    nodes.push({
+      id: "human-review",
+      title: "人間判断",
+      meta: "判断待ち / review画面",
+      status: "active",
+      tone: "review",
+      lane: 1,
+      col,
+      href: routes().review(runId),
+      ariaLabel: "人間判断画面を開く",
+    });
+    edges.push({
+      id: `${previousId}-human-review`,
+      from: previousId,
+      to: "human-review",
+      status: "active",
+      label: "Human review",
+    });
+    previousId = "human-review";
+    col += 1;
+  }
+
+  const finalStatus: DagNodeStatus =
+    status === "completed" ? "done" : status === "failed" || status === "cancelled" ? "blocked" : "pending";
+  nodes.push({
+    id: "final",
+    title: status === "completed" ? "最終レポート" : "最終化",
+    meta: status === "completed" ? "生成済み / レポート履歴" : status,
+    status: activeId === "final" ? finalStatus : "pending",
+    tone: "finalize",
+    lane: 1,
+    col,
+    href: status === "completed" ? routes().report(runId) : undefined,
+  });
+  edges.push({
+    id: `${previousId}-final`,
+    from: previousId,
+    to: "final",
+    status: status === "completed" ? "done" : activeId === "final" ? "active" : "pending",
+  });
+
+  return { nodes, edges };
+}
+
+function ExecutionDag({
+  status,
+  attempts,
+  reviews,
+  progress,
+  runId,
+}: {
+  status: RunStatus;
+  attempts: ResearchAttempt[];
+  reviews: ReviewRecord[];
+  progress?: ResearchRunStatusResponse["progress"];
+  runId: string;
+}) {
+  const { nodes, edges } = buildExecutionDag({
+    status,
+    attempts,
+    reviews,
+    progress,
+    runId,
+  });
+  const maxCol = Math.max(...nodes.map((node) => node.col), 1);
+  const maxLane = Math.max(...nodes.map((node) => node.lane), 1);
+  const gridStyle = {
+    gridTemplateColumns: `repeat(${maxCol}, minmax(var(--dag-node-width), 1fr))`,
+    gridTemplateRows: `repeat(${maxLane + 1}, minmax(96px, auto))`,
+  };
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+
+  return (
+    <section className="execution-dag" aria-labelledby="execution-dag-heading">
+      <div className="section-heading-row">
+        <h2 id="execution-dag-heading" className="section-title">
+          具体的な実行フロー
+        </h2>
+        <span className="item-progress-summary execution-dag-summary">
+          Deep Research {progress?.deep_research_runs ?? attempts.length}回 / Review {reviews.length}回
+        </span>
+      </div>
+      <div className="execution-dag-legend" aria-hidden="true">
+        <span className="execution-dag-legend-item execution-dag-legend-item--research">
+          Deep Research
+        </span>
+        <span className="execution-dag-legend-item execution-dag-legend-item--review">
+          LLMレビュー
+        </span>
+        <span className="execution-dag-legend-item execution-dag-legend-item--repair">
+          補正/検証
+        </span>
+      </div>
+      <div
+        className="execution-dag-grid"
+        style={gridStyle}
+        aria-label="具体的な実行フロー"
+      >
+        {edges.map((edge) => {
+          const from = byId.get(edge.from);
+          const to = byId.get(edge.to);
+          if (!from || !to) return null;
+          const row = Math.min(from.lane, to.lane) + 1;
+          const rowSpan = Math.abs(from.lane - to.lane) + 1;
+          return (
+            <div
+              key={edge.id}
+              className={`execution-dag-edge execution-dag-edge--${edge.status}`}
+              style={{
+                gridColumn: `${from.col} / ${to.col + 1}`,
+                gridRow: `${row} / span ${rowSpan}`,
+              }}
+              aria-hidden="true"
+            >
+              <span className="execution-dag-edge-line" />
+              {edge.label && <span className="execution-dag-edge-label">{edge.label}</span>}
+            </div>
+          );
+        })}
+        {nodes.map((node) => {
+          const className = `execution-dag-node execution-dag-node--${node.status} execution-dag-node--${node.tone}${node.href ? " execution-dag-node-link" : ""}`;
+          const style = {
+            gridColumn: node.col,
+            gridRow: node.lane + 1,
+          };
+          const content = (
+            <>
+            <div className="execution-dag-node-topline">
+              <span className="execution-dag-dot" aria-hidden="true" />
+              <span className="execution-dag-state">{DAG_STATUS_LABEL[node.status]}</span>
+            </div>
+            <h3 className="execution-dag-title">{node.title}</h3>
+            <p className="execution-dag-meta">{node.meta}</p>
+            {node.score !== undefined && (
+              <span className="execution-dag-score" aria-label={`レビュー点数 ${node.score}点`}>
+                {node.score}点
+              </span>
+            )}
+            </>
+          );
+          if (node.href) {
+            return (
+              <Link
+                key={node.id}
+                to={node.href}
+                className={className}
+                style={style}
+                aria-label={node.ariaLabel ?? `${node.title}の結果を開く`}
+              >
+                {content}
+              </Link>
+            );
+          }
+          return (
+            <article key={node.id} className={className} style={style}>
+              {content}
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 // ── RunMonitor ────────────────────────────────────────────────────────────────
 
 interface RunMonitorProps {
@@ -206,17 +612,30 @@ export function RunMonitor({ runId }: RunMonitorProps) {
     ),
   });
 
-  // ── Reviews polling ────────────────────────────────────────────────────────
+  // ── Review data polling ───────────────────────────────────────────────────
 
   const { data: reviews } = usePolling<ReviewRecord[]>({
-    fetcher: (signal) => getReviews(runId, signal),
-    key: `reviews:${runId}`,
+    fetcher: async (signal) => (await getAudit(runId, signal)).reviews,
+    key: `review-audit:${runId}`,
     interval: (data) => {
       if (runStatus && isTerminal(runStatus.status)) return null;
       // Slow down when in long phases
       const s = runStatus?.status;
       if (s === "waiting_deep_research" || s === "collecting") return 30_000;
       return data !== undefined ? 10_000 : 5_000;
+    },
+  });
+
+  // ── Attempts polling ───────────────────────────────────────────────────────
+
+  const { data: dagAttempts } = usePolling<ResearchAttempt[]>({
+    fetcher: async (signal) => coalesceAttemptsByRunNo(await getAttempts(runId, signal)),
+    key: `attempts:${runId}`,
+    interval: () => {
+      if (runStatus && isTerminal(runStatus.status)) return null;
+      const s = runStatus?.status;
+      if (s === "waiting_deep_research" || s === "collecting") return 30_000;
+      return 15_000;
     },
   });
 
@@ -239,6 +658,9 @@ export function RunMonitor({ runId }: RunMonitorProps) {
   const progress = runStatus?.progress;
   const sortedReviews = Array.isArray(reviews)
     ? [...reviews].sort((a, b) => a.review_no - b.review_no)
+    : [];
+  const sortedAttempts = Array.isArray(dagAttempts)
+    ? dagAttempts
     : [];
 
   const elapsed = useElapsed(tracked?.created_at, !isTerminal(status));
@@ -371,9 +793,6 @@ export function RunMonitor({ runId }: RunMonitorProps) {
             </button>
             <Link to={routes().report(runId)} className="btn-secondary btn-sm">
               レポート履歴
-            </Link>
-            <Link to={routes().report(runId, "reviews")} className="btn-secondary btn-sm">
-              レビュー内容
             </Link>
             <Link to={routes().audit(runId)} className="btn-secondary btn-sm">
               監査ログ
@@ -574,30 +993,18 @@ export function RunMonitor({ runId }: RunMonitorProps) {
           value={progress?.verification_runs ?? 0}
           icon="ti-shield-check"
         />
-        {progress?.latest_score !== null && progress?.latest_score !== undefined && (
-          <div className="metric-score-wrap">
-            <ScoreChip score={progress.latest_score} animate />
-          </div>
-        )}
         <div className="metric-cost-wrap">
           <CostMeter estimated={estimatedCost} />
         </div>
       </div>
 
-      {/* ── Pipeline stepper ─────────────────────────── */}
-      <div className="monitor-pipeline">
-        <PipelineStepper
-          currentStep={statusToStep(status)}
-          completedSteps={getCompletedSteps(status)}
-          loopCount={
-            (progress?.targeted_rerun_runs ?? 0) +
-            (progress?.full_rerun_runs ?? 0) +
-            (progress?.llm_patch_runs ?? 0) +
-            (progress?.verification_runs ?? 0)
-          }
-          maxIterations={tracked?.max_total_iterations ?? 0}
-        />
-      </div>
+      <ExecutionDag
+        status={status}
+        attempts={sortedAttempts}
+        reviews={sortedReviews}
+        progress={progress}
+        runId={runId}
+      />
 
       {/* ── Wait banner ───────────────────────────────── */}
       {isWaiting && (
@@ -640,6 +1047,11 @@ export function RunMonitor({ runId }: RunMonitorProps) {
         <div className="done-reason" role="note">
           <span className="done-reason-label">終了理由:</span>{" "}
           {runStatus.done_reason}
+          {status === "completed" && (
+            <Link to={routes().report(runId)} className="done-report-link">
+              最終レポートを開く
+            </Link>
+          )}
         </div>
       )}
     </div>

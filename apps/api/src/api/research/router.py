@@ -124,20 +124,37 @@ def get_audit(
     orchestrator: OrchestratorDependency,
 ) -> AuditResponse:
     run = _get_run_or_404(orchestrator, run_id)
+    cost_events = orchestrator.get_cost_events(run.id)
     return AuditResponse(
         run_id=run.id,
         attempts=orchestrator.repository.get_attempts(run.id),
         reviews=orchestrator.repository.get_reviews(run.id),
+        llm_calls=_llm_calls(cost_events),
         objective_contract=orchestrator.repository.get_objective_contract(run.id),
         research_items=orchestrator.repository.get_research_items(run.id),
         rerun_plans=orchestrator.repository.get_rerun_plans(run.id),
         verification_queries=orchestrator.repository.get_verification_queries(run.id),
         citations=orchestrator.repository.get_citations(run.id),
         tool_calls=orchestrator.repository.get_tool_calls(run.id),
-        cost_events=orchestrator.get_cost_events(run.id),
+        cost_events=cost_events,
         human_decisions=orchestrator.repository.get_human_decisions(run.id),
         history=orchestrator.repository.get_history(run.id),
     )
+
+
+LLM_CALL_STEPS = {
+    "deep_research",
+    "review",
+    "review_failed",
+    "review_ignored",
+    "llm_finalize",
+    "llm_finalize_ignored",
+    "verification",
+}
+
+
+def _llm_calls(cost_events: list[CostEvent]) -> list[CostEvent]:
+    return [event for event in cost_events if event.step in LLM_CALL_STEPS]
 
 
 @router.get("/{run_id}/contract", response_model=ObjectiveContractResponse)
