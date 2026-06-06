@@ -56,6 +56,7 @@ from api.research.schemas import (
     ResearchRunRecord,
     ReviewRecord,
     RunStatus,
+    Severity,
     VerificationQuery,
 )
 
@@ -1129,11 +1130,30 @@ class ResearchOrchestrator:
     def _finalize_with_limitation(self, run_id: UUID) -> ResearchRunRecord:
         run = self.repository.get_run(run_id)
         items = self.repository.get_research_items(run.id)
+        blocked_reason = _limitation_finalize_blocked_reason(items)
+        if blocked_reason is not None:
+            self.repository.append_history_event(
+                run.id,
+                {
+                    "step": "finalize_with_limitation_blocked",
+                    "reason": blocked_reason,
+                },
+            )
+            return self._enter_human_review(
+                run.id,
+                done_reason=blocked_reason,
+                allowed_statuses={RunStatus.REVIEWING},
+            )
         unresolved = [
             item
             for item in items
             if item.status
-            in {ItemStatus.PARTIAL, ItemStatus.UNANSWERED, ItemStatus.UNVERIFIABLE}
+            in {
+                ItemStatus.NOT_STARTED,
+                ItemStatus.PARTIAL,
+                ItemStatus.UNANSWERED,
+                ItemStatus.UNVERIFIABLE,
+            }
         ]
         limitation_lines = [
             f"- {item.item_id}: {item.unresolved_reason or item.question}"
@@ -2224,6 +2244,18 @@ def _looks_like_full_merged_report(existing_report: str, delta: str) -> bool:
         if existing_lines and len(existing_lines & candidate_lines) / len(existing_lines) >= 0.5:
             return True
     return False
+
+
+def _limitation_finalize_blocked_reason(items: list[ResearchItem]) -> str | None:
+    for item in items:
+        if item.severity == Severity.BLOCKER and item.status not in {
+            ItemStatus.ANSWERED,
+            ItemStatus.OUT_OF_SCOPE,
+        }:
+            return "limitation_blocker_unresolved"
+        if item.severity == Severity.MAJOR and item.status == ItemStatus.NOT_STARTED:
+            return "limitation_required_item_unreviewed"
+    return None
 
 
 def _is_waiting_for_human_review(run: ResearchRunRecord) -> bool:
