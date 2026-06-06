@@ -5,7 +5,11 @@ description = "FastAPI service for Future Predict."
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "fastapi>=0.115.0",
+  "langgraph>=0.2.60",
+  "langgraph-checkpoint-sqlite>=2.0.1",
+  "openai>=1.59.0",
   "pydantic-settings>=2.7.0",
+  "tenacity>=9.0.0",
   "uvicorn[standard]>=0.34.0",
 ]
 
@@ -25,7 +29,11 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -m 'not live_api'"
+markers = [
+  "integration: local integration tests that exercise multiple app layers",
+  "live_api: tests that call real Azure OpenAI / OpenAI APIs and may incur cost",
+]
 
 [tool.ruff]
 target-version = "py312"
