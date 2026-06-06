@@ -10,45 +10,13 @@
 import { useEffect, useState } from "react";
 
 import { ContextBadge, WebSearchBadge } from "../components";
+import {
+  FACTORY_RESEARCH_DEFAULTS,
+  loadResearchDefaults,
+  saveResearchDefaults,
+  type ResearchDefaults,
+} from "../researchDefaults";
 import { OPTION_BOUNDS, type ContextClassification } from "../types";
-
-const DEFAULTS_STORAGE_KEY = "dro.defaults";
-
-interface Defaults {
-  max_deep_research_runs: number;
-  max_llm_fix_runs: number;
-  max_total_iterations: number;
-  max_no_progress_rounds: number;
-  max_cost_usd: number;
-  max_total_tool_calls: number;
-}
-
-const FACTORY_DEFAULTS: Defaults = {
-  max_deep_research_runs: 3,
-  max_llm_fix_runs: 3,
-  max_total_iterations: 10,
-  max_no_progress_rounds: 3,
-  max_cost_usd: 5.0,
-  max_total_tool_calls: 200,
-};
-
-function loadDefaults(): Defaults {
-  try {
-    const raw = localStorage.getItem(DEFAULTS_STORAGE_KEY);
-    if (!raw) return { ...FACTORY_DEFAULTS };
-    return { ...FACTORY_DEFAULTS, ...(JSON.parse(raw) as Partial<Defaults>) };
-  } catch {
-    return { ...FACTORY_DEFAULTS };
-  }
-}
-
-function saveDefaults(d: Defaults): void {
-  try {
-    localStorage.setItem(DEFAULTS_STORAGE_KEY, JSON.stringify(d));
-  } catch {
-    /* ignore storage errors */
-  }
-}
 
 const WEB_SEARCH_POLICY: { context: ContextClassification; allowed: boolean; note: string }[] = [
   { context: "public", allowed: true, note: "Web検索有効" },
@@ -58,27 +26,27 @@ const WEB_SEARCH_POLICY: { context: ContextClassification; allowed: boolean; not
 ];
 
 export function Settings() {
-  const [defaults, setDefaults] = useState<Defaults>(() => loadDefaults());
+  const [defaults, setDefaults] = useState<ResearchDefaults>(() => loadResearchDefaults());
   const [saved, setSaved] = useState(false);
 
   // Persist whenever defaults change (auto-save on blur/change)
   useEffect(() => {
-    saveDefaults(defaults);
+    saveResearchDefaults(defaults);
   }, [defaults]);
 
-  function handleChange(key: keyof Defaults, value: number) {
+  function handleChange(key: keyof ResearchDefaults, value: number) {
     setDefaults((prev) => ({ ...prev, [key]: value }));
     setSaved(false);
   }
 
   function handleSave() {
-    saveDefaults(defaults);
+    saveResearchDefaults(defaults);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   }
 
   function handleReset() {
-    setDefaults({ ...FACTORY_DEFAULTS });
+    setDefaults({ ...FACTORY_RESEARCH_DEFAULTS });
     setSaved(false);
   }
 

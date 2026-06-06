@@ -189,7 +189,7 @@ async def test_poller_failed_deep_research_enters_human_review_with_audit(
 
 
 @pytest.mark.integration
-def test_internal_context_disables_public_web_search_across_research_and_review(
+def test_internal_context_stops_before_deep_research_submit(
     integration_orchestrator_factory: Callable[[IntegrationFakeAzure], ResearchOrchestrator],
 ) -> None:
     fake = IntegrationFakeAzure()
@@ -197,16 +197,17 @@ def test_internal_context_disables_public_web_search_across_research_and_review(
 
     run = orchestrator.create_run(
         CreateResearchRunRequest(
-            user_prompt="社内メモを前提に公開情報と混ぜずに整理してください。",
+            user_prompt="公開情報を整理してください。",
             options=ResearchRunOptions(allow_web_search=True, context_classification="internal"),
         )
     )
-    completed = orchestrator.collect_deep_research(run.id)
+    history = orchestrator.repository.get_history(run.id)
 
-    assert completed.status == RunStatus.COMPLETED
-    assert fake.submit_calls[0]["context_classification"] == "internal"
-    assert fake.submit_calls[0]["web_search_enabled"] is False
-    assert fake.review_calls[0]["web_search_enabled"] is False
+    assert run.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert run.done_reason == "deep_research_web_search_blocked_internal_context"
+    assert fake.submit_calls == []
+    assert fake.review_calls == []
+    assert history[-2]["step"] == "deep_research_submit_blocked"
 
 
 @pytest.mark.integration

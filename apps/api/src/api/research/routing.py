@@ -5,6 +5,7 @@ from typing import Literal, TypedDict
 from api.research.schemas import Verdict
 
 ReviewRoute = Literal["deep_research_submit", "llm_finalize", "finalize", "human_review"]
+MIN_REVIEWER_CONFIDENCE_FOR_AUTO_FINALIZE = 70
 
 
 class RouteState(TypedDict, total=False):
@@ -33,6 +34,17 @@ def route_after_review(state: RouteState) -> ReviewRoute:
         verdict_value = verdict.value
     else:
         verdict_value = str(verdict)
+
+    high_risk_flags = review.get("high_risk_flags", [])
+    if isinstance(high_risk_flags, list) and high_risk_flags:
+        return "human_review"
+
+    reviewer_confidence = review.get("reviewer_confidence")
+    if (
+        isinstance(reviewer_confidence, int | float)
+        and reviewer_confidence < MIN_REVIEWER_CONFIDENCE_FOR_AUTO_FINALIZE
+    ):
+        return "human_review"
 
     if verdict_value == Verdict.PASS.value:
         return "finalize"

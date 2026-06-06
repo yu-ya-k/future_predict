@@ -49,6 +49,17 @@ function clearStorage() {
   localStorage.clear();
 }
 
+function legacyFactoryDefaults() {
+  return {
+    max_deep_research_runs: 3,
+    max_llm_fix_runs: 3,
+    max_total_iterations: 10,
+    max_no_progress_rounds: 3,
+    max_cost_usd: 5,
+    max_total_tool_calls: 200,
+  };
+}
+
 // ── Setup / teardown ──────────────────────────────────────────────────────────
 
 beforeEach(() => {
@@ -210,6 +221,80 @@ describe("NewResearch (SCR-1)", () => {
     });
   });
 
+  it("submits API-aligned factory default guardrails", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 202,
+      json: () =>
+        Promise.resolve({
+          run_id: "run-defaults-test",
+          thread_id: "thread-1",
+          status: "queued",
+          created_at: new Date().toISOString(),
+        }),
+    } as Response);
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    const textarea = screen.getByRole("textbox", { name: /リサーチ内容/i });
+    await userEvent.type(textarea, "テスト用プロンプト");
+    await userEvent.click(screen.getByRole("button", { name: /リサーチを開始/i }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalled();
+    });
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const body = JSON.parse(String(init.body)) as {
+      options: Record<string, unknown>;
+    };
+
+    expect(body.options).toEqual({
+      context_classification: "public",
+      allow_web_search: true,
+      max_deep_research_runs: 2,
+      max_llm_fix_runs: 3,
+      max_total_iterations: 5,
+      max_no_progress_rounds: 2,
+      max_cost_usd: 20,
+      max_total_tool_calls: 120,
+    });
+  });
+
+  it("migrates legacy stored factory defaults before submitting", async () => {
+    localStorage.setItem("dro.defaults", JSON.stringify(legacyFactoryDefaults()));
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 202,
+      json: () =>
+        Promise.resolve({
+          run_id: "run-legacy-defaults-test",
+          thread_id: "thread-1",
+          status: "queued",
+          created_at: new Date().toISOString(),
+        }),
+    } as Response);
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.type(screen.getByRole("textbox", { name: /リサーチ内容/i }), "テスト");
+    await userEvent.click(screen.getByRole("button", { name: /リサーチを開始/i }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalled();
+    });
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const body = JSON.parse(String(init.body)) as {
+      options: Record<string, unknown>;
+    };
+
+    expect(body.options.max_deep_research_runs).toBe(2);
+    expect(body.options.max_total_iterations).toBe(5);
+    expect(body.options.max_cost_usd).toBe(20);
+    expect(body.options.max_total_tool_calls).toBe(120);
+  });
+
   it("shows error when API fails", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: false,
@@ -345,6 +430,42 @@ describe("Settings (SCR-7)", () => {
     expect(screen.getByText(/デフォルトオプション/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/最大Deep Research回数/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/最大LLM修正回数/i)).toBeInTheDocument();
+  });
+
+  it("renders API-aligned factory defaults", () => {
+    render(<App />);
+
+    expect(screen.getByLabelText(/最大Deep Research回数/i)).toHaveValue(2);
+    expect(screen.getByLabelText(/最大LLM修正回数/i)).toHaveValue(3);
+    expect(screen.getByLabelText(/最大反復回数/i)).toHaveValue(5);
+    expect(screen.getByLabelText(/最大停滞許容回数/i)).toHaveValue(2);
+    expect(screen.getByLabelText(/最大コスト/i)).toHaveValue(20);
+    expect(screen.getByLabelText(/最大ツール呼び出し数/i)).toHaveValue(120);
+  });
+
+  it("migrates legacy saved factory defaults in settings", () => {
+    localStorage.setItem("dro.defaults", JSON.stringify(legacyFactoryDefaults()));
+
+    render(<App />);
+
+    expect(screen.getByLabelText(/最大Deep Research回数/i)).toHaveValue(2);
+    expect(screen.getByLabelText(/最大反復回数/i)).toHaveValue(5);
+    expect(screen.getByLabelText(/最大コスト/i)).toHaveValue(20);
+    expect(screen.getByLabelText(/最大ツール呼び出し数/i)).toHaveValue(120);
+  });
+
+  it("keeps user-modified saved defaults instead of migrating them", () => {
+    localStorage.setItem(
+      "dro.defaults",
+      JSON.stringify({ ...legacyFactoryDefaults(), max_cost_usd: 7 }),
+    );
+
+    render(<App />);
+
+    expect(screen.getByLabelText(/最大Deep Research回数/i)).toHaveValue(3);
+    expect(screen.getByLabelText(/最大反復回数/i)).toHaveValue(10);
+    expect(screen.getByLabelText(/最大コスト/i)).toHaveValue(7);
+    expect(screen.getByLabelText(/最大ツール呼び出し数/i)).toHaveValue(200);
   });
 
   it("shows web search policy table with rows for all context types", () => {

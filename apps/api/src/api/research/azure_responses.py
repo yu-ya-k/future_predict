@@ -101,13 +101,14 @@ class AzureResponsesClient:
             if web_search_enabled is None
             else web_search_enabled and policy_allows_web_search
         )
+        if not web_search_enabled:
+            raise ValueError("Deep Research requires an enabled public web search tool.")
 
-        tools = [{"type": "web_search_preview"}] if web_search_enabled else []
         return self.deep_research_client.responses.create(
             model=self.deep_research_deployment,
             background=True,
             input=prompt,
-            tools=tools,
+            tools=[{"type": "web_search_preview"}],
             max_tool_calls=max_tool_calls,
         )
 

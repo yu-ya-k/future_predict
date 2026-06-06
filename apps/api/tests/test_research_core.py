@@ -48,8 +48,11 @@ class FakeAzure:
         review_factuality_concerns: list[str] | None = None,
         review_source_quality_concerns: list[str] | None = None,
         review_next_instructions: str | None = None,
+        reviewer_confidence: int = 90,
+        high_risk_flags: list[str] | None = None,
         submit_raises: Exception | None = None,
         retrieve_raises: Exception | None = None,
+        cancel_raises: Exception | None = None,
     ) -> None:
         self.retrieve_status = retrieve_status
         self.verdict = verdict
@@ -60,9 +63,12 @@ class FakeAzure:
         self.review_factuality_concerns = review_factuality_concerns or []
         self.review_source_quality_concerns = review_source_quality_concerns or []
         self.review_next_instructions = review_next_instructions
+        self.reviewer_confidence = reviewer_confidence
+        self.high_risk_flags = high_risk_flags or []
         self.review_calls = 0
         self.submit_raises = submit_raises
         self.retrieve_raises = retrieve_raises
+        self.cancel_raises = cancel_raises
         self.review_web_search_enabled: bool | None = None
         self.deep_research_web_search_enabled: bool | None = None
         self.cancelled: list[str] = []
@@ -173,8 +179,8 @@ class FakeAzure:
                 ),
                 can_be_fixed_by_llm=verdict == Verdict.NEEDS_LLM_FIX,
                 requires_new_external_research=verdict == Verdict.NEEDS_DEEP_RESEARCH,
-                reviewer_confidence=90,
-                high_risk_flags=[],
+                reviewer_confidence=self.reviewer_confidence,
+                high_risk_flags=self.high_risk_flags,
                 public_web_search_used=bool(kwargs["web_search_enabled"]),
             ),
             f"resp_review_{self.review_calls}",
@@ -197,6 +203,8 @@ class FakeAzure:
         )
 
     def cancel_response(self, response_id: str) -> dict[str, object]:
+        if self.cancel_raises is not None:
+            raise self.cancel_raises
         self.cancelled.append(response_id)
         return {"id": response_id, "status": "cancelled"}
 
@@ -271,6 +279,54 @@ def test_route_pass_wins_over_hard_stop() -> None:
         {
             "review": {"verdict": "pass"},
             "total_reviews": 5,
+            "max_total_iterations": 5,
+        }
+    )
+
+    assert route == "finalize"
+
+
+def test_route_high_risk_pass_requires_human_review() -> None:
+    route = route_after_review(
+        {
+            "review": {
+                "verdict": "pass",
+                "reviewer_confidence": 95,
+                "high_risk_flags": ["legal"],
+            },
+            "total_reviews": 1,
+            "max_total_iterations": 5,
+        }
+    )
+
+    assert route == "human_review"
+
+
+def test_route_low_confidence_pass_requires_human_review() -> None:
+    route = route_after_review(
+        {
+            "review": {
+                "verdict": "pass",
+                "reviewer_confidence": 69,
+                "high_risk_flags": [],
+            },
+            "total_reviews": 1,
+            "max_total_iterations": 5,
+        }
+    )
+
+    assert route == "human_review"
+
+
+def test_route_confident_pass_without_high_risk_finalizes() -> None:
+    route = route_after_review(
+        {
+            "review": {
+                "verdict": "pass",
+                "reviewer_confidence": 70,
+                "high_risk_flags": [],
+            },
+            "total_reviews": 1,
             "max_total_iterations": 5,
         }
     )
@@ -453,6 +509,52 @@ def test_completed_deep_research_is_reviewed_and_finalized(tmp_path: Path) -> No
     assert reviews[0].requires_new_external_research is False
 
 
+def test_high_risk_pass_enters_human_review(tmp_path: Path) -> None:
+    fake = FakeAzure(verdict=Verdict.PASS, high_risk_flags=["regulated_advice"])
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(CreateResearchRunRequest(user_prompt="市場調査をしてください"))
+    needs_human = orchestrator.collect_deep_research(run.id)
+
+    assert needs_human.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert needs_human.done_reason == "review_route_high_risk"
+    assert needs_human.final_report is None
+
+
+def test_low_confidence_pass_enters_human_review(tmp_path: Path) -> None:
+    fake = FakeAzure(verdict=Verdict.PASS, reviewer_confidence=69)
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(CreateResearchRunRequest(user_prompt="市場調査をしてください"))
+    needs_human = orchestrator.collect_deep_research(run.id)
+
+    assert needs_human.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert needs_human.done_reason == "review_route_low_confidence"
+    assert needs_human.final_report is None
+
+
+def test_review_does_not_overwrite_cancelled_run_after_review_response(
+    tmp_path: Path,
+) -> None:
+    fake = FakeAzure()
+    orchestrator = make_orchestrator(tmp_path, fake)
+    run = orchestrator.create_run(CreateResearchRunRequest(user_prompt="市場調査をしてください"))
+    original_review = fake.review_report
+
+    def review_and_cancel(**kwargs: Any) -> tuple[ReviewResult, str, dict[str, object]]:
+        result = original_review(**kwargs)
+        orchestrator.cancel_run(run.id)
+        return result
+
+    fake.review_report = review_and_cancel  # type: ignore[method-assign]
+
+    cancelled = orchestrator.collect_deep_research(run.id)
+
+    assert cancelled.status == RunStatus.CANCELLED
+    assert cancelled.done_reason == "cancelled_by_user"
+    assert cancelled.final_report is None
+
+
 def test_needs_llm_fix_runs_finalize_and_returns_to_review(tmp_path: Path) -> None:
     fake = FakeAzure(verdicts=[Verdict.NEEDS_LLM_FIX, Verdict.PASS])
     orchestrator = make_orchestrator(tmp_path, fake)
@@ -466,6 +568,33 @@ def test_needs_llm_fix_runs_finalize_and_returns_to_review(tmp_path: Path) -> No
     assert reviewed.llm_fix_runs == 1
     assert fake.llm_finalize_prompts
     assert len(orchestrator.repository.get_reviews(run.id)) == 2
+
+
+def test_llm_finalize_does_not_overwrite_cancelled_run_after_response(
+    tmp_path: Path,
+) -> None:
+    fake = FakeAzure(verdicts=[Verdict.NEEDS_LLM_FIX, Verdict.PASS])
+    orchestrator = make_orchestrator(tmp_path, fake)
+    original_finalize = fake.llm_finalize_report
+
+    run = orchestrator.create_run(CreateResearchRunRequest(user_prompt="技術調査をしてください"))
+
+    def finalize_and_cancel(
+        *,
+        prompt: str,
+        run: object,
+    ) -> tuple[str, str, dict[str, object]]:
+        result = original_finalize(prompt=prompt, run=run)
+        orchestrator.cancel_run(cast(Any, run).id)
+        return result
+
+    fake.llm_finalize_report = finalize_and_cancel  # type: ignore[method-assign]
+
+    cancelled = orchestrator.collect_deep_research(run.id)
+
+    assert cancelled.status == RunStatus.CANCELLED
+    assert cancelled.done_reason == "cancelled_by_user"
+    assert cancelled.final_report is None
 
 
 def test_repeated_needs_llm_fix_stops_at_max_llm_fix_runs(tmp_path: Path) -> None:
@@ -754,6 +883,234 @@ def test_retrieve_failure_returns_to_waiting_for_repoll(tmp_path: Path) -> None:
     assert history[-1]["step"] == "deep_research_retrieve_retryable_error"
 
 
+def test_cancel_waiting_run_cancels_remote_response(tmp_path: Path) -> None:
+    fake = FakeAzure(retrieve_status="in_progress")
+    orchestrator = make_orchestrator(tmp_path, fake)
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+
+    cancelled = orchestrator.cancel_run(run.id)
+    history = orchestrator.repository.get_history(run.id)
+
+    assert cancelled.status == RunStatus.CANCELLED
+    assert cancelled.done_reason == "cancelled_by_user"
+    assert fake.cancelled == ["resp_deep_1"]
+    assert history[-1]["step"] == "cancel_remote_succeeded"
+
+
+def test_cancel_waiting_run_continues_when_remote_cancel_fails(tmp_path: Path) -> None:
+    fake = FakeAzure(
+        retrieve_status="in_progress",
+        cancel_raises=RuntimeError("remote cancel unavailable"),
+    )
+    orchestrator = make_orchestrator(tmp_path, fake)
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+
+    cancelled = orchestrator.cancel_run(run.id)
+    history = orchestrator.repository.get_history(run.id)
+
+    assert cancelled.status == RunStatus.CANCELLED
+    assert cancelled.done_reason == "cancelled_by_user"
+    assert history[-1]["step"] == "cancel_remote_failed"
+
+
+def test_cancel_collecting_run_cancels_remote_response(tmp_path: Path) -> None:
+    fake = FakeAzure(retrieve_status="in_progress")
+    orchestrator = make_orchestrator(tmp_path, fake)
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    claimed = orchestrator.repository.claim_deep_research_run(run.id)
+    assert claimed is not None
+
+    cancelled = orchestrator.cancel_run(run.id)
+    history = orchestrator.repository.get_history(run.id)
+
+    assert cancelled.status == RunStatus.CANCELLED
+    assert fake.cancelled == ["resp_deep_1"]
+    assert history[-1]["step"] == "cancel_remote_succeeded"
+
+
+def test_cancel_does_not_overwrite_terminal_status_changed_during_cancel(
+    tmp_path: Path,
+) -> None:
+    fake = FakeAzure(retrieve_status="in_progress")
+    orchestrator = make_orchestrator(tmp_path, fake)
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    original_update_if_status = orchestrator.repository.update_run_if_status
+
+    def complete_before_cancel_update(*args: object, **kwargs: object):
+        orchestrator.repository.update_run(
+            run.id,
+            status=RunStatus.COMPLETED,
+            done_reason="race_completed",
+        )
+        return cast(Any, original_update_if_status)(*args, **kwargs)
+
+    orchestrator.repository.update_run_if_status = complete_before_cancel_update  # type: ignore[method-assign]
+
+    after_cancel = orchestrator.cancel_run(run.id)
+
+    assert after_cancel.status == RunStatus.COMPLETED
+    assert after_cancel.done_reason == "race_completed"
+    assert fake.cancelled == []
+
+
+def test_cancel_terminal_run_does_not_change_status(tmp_path: Path) -> None:
+    fake = FakeAzure()
+    orchestrator = make_orchestrator(tmp_path, fake)
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    completed = orchestrator.collect_deep_research(run.id)
+
+    after_cancel = orchestrator.cancel_run(completed.id)
+    history = orchestrator.repository.get_history(run.id)
+
+    assert after_cancel.status == RunStatus.COMPLETED
+    assert after_cancel.done_reason == "passed_review"
+    assert fake.cancelled == []
+    assert history[-1]["step"] == "cancel_ignored_terminal_run"
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [RunStatus.FAILED, RunStatus.CANCELLED],
+)
+def test_cancel_other_terminal_runs_does_not_change_status(
+    tmp_path: Path,
+    terminal_status: RunStatus,
+) -> None:
+    fake = FakeAzure(retrieve_status="in_progress")
+    orchestrator = make_orchestrator(tmp_path, fake)
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    orchestrator.repository.update_run(
+        run.id,
+        status=terminal_status,
+        done_reason=f"already_{terminal_status.value}",
+    )
+
+    after_cancel = orchestrator.cancel_run(run.id)
+
+    assert after_cancel.status == terminal_status
+    assert after_cancel.done_reason == f"already_{terminal_status.value}"
+    assert fake.cancelled == []
+
+
+def test_timeout_cancels_remote_response_before_human_review(tmp_path: Path) -> None:
+    fake = FakeAzure(retrieve_status="in_progress")
+    orchestrator = make_orchestrator(tmp_path, fake)
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+
+    timed_out = orchestrator.mark_timeout(run.id)
+    history = orchestrator.repository.get_history(run.id)
+
+    assert timed_out.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert timed_out.done_reason == "deep_research_timeout"
+    assert fake.cancelled == ["resp_deep_1"]
+    assert any(event["step"] == "timeout_remote_cancel_succeeded" for event in history)
+
+
+def test_timeout_continues_when_remote_cancel_fails(tmp_path: Path) -> None:
+    fake = FakeAzure(
+        retrieve_status="in_progress",
+        cancel_raises=RuntimeError("remote cancel unavailable"),
+    )
+    orchestrator = make_orchestrator(tmp_path, fake)
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+
+    timed_out = orchestrator.mark_timeout(run.id)
+    history = orchestrator.repository.get_history(run.id)
+
+    assert timed_out.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert timed_out.done_reason == "deep_research_timeout"
+    assert any(event["step"] == "timeout_remote_cancel_failed" for event in history)
+
+
+def test_timeout_does_not_overwrite_cancelled_run_after_remote_cancel(
+    tmp_path: Path,
+) -> None:
+    fake = FakeAzure(retrieve_status="in_progress")
+    orchestrator = make_orchestrator(tmp_path, fake)
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    original_cancel = fake.cancel_response
+
+    def cancel_and_mark_local_cancelled(response_id: str) -> dict[str, object]:
+        result = original_cancel(response_id)
+        orchestrator.repository.update_run(
+            run.id,
+            status=RunStatus.CANCELLED,
+            done_reason="cancelled_by_user",
+            needs_human_review=False,
+        )
+        return result
+
+    fake.cancel_response = cancel_and_mark_local_cancelled  # type: ignore[method-assign]
+
+    timed_out = orchestrator.mark_timeout(run.id)
+
+    assert timed_out.status == RunStatus.CANCELLED
+    assert timed_out.done_reason == "cancelled_by_user"
+
+
+def test_collect_does_not_overwrite_cancelled_run_after_retrieve(tmp_path: Path) -> None:
+    fake = FakeAzure()
+    orchestrator = make_orchestrator(tmp_path, fake)
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    original_retrieve = fake.retrieve_response
+
+    def retrieve_and_cancel(response_id: str) -> dict[str, object]:
+        orchestrator.cancel_run(run.id)
+        return original_retrieve(response_id)
+
+    fake.retrieve_response = retrieve_and_cancel  # type: ignore[method-assign]
+
+    collected = orchestrator.collect_deep_research(run.id)
+    history = orchestrator.repository.get_history(run.id)
+
+    assert collected.status == RunStatus.CANCELLED
+    assert collected.done_reason == "cancelled_by_user"
+    assert fake.review_calls == 0
+    assert any(
+        event["step"] == "deep_research_collect_ignored_terminal_run" for event in history
+    )
+
+
+def test_retrieve_failure_does_not_overwrite_cancelled_run(tmp_path: Path) -> None:
+    fake = FakeAzure(retrieve_raises=RuntimeError("temporary 503"))
+    orchestrator = make_orchestrator(tmp_path, fake)
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    original_retrieve = fake.retrieve_response
+
+    def retrieve_and_cancel(response_id: str) -> dict[str, object]:
+        orchestrator.cancel_run(run.id)
+        return original_retrieve(response_id)
+
+    fake.retrieve_response = retrieve_and_cancel  # type: ignore[method-assign]
+
+    collected = orchestrator.collect_deep_research(run.id)
+
+    assert collected.status == RunStatus.CANCELLED
+    assert collected.done_reason == "cancelled_by_user"
+
+
 @pytest.mark.anyio
 async def test_poller_tick_survives_repository_exception(tmp_path: Path) -> None:
     orchestrator = make_orchestrator(tmp_path, FakeAzure())
@@ -767,20 +1124,65 @@ async def test_poller_tick_survives_repository_exception(tmp_path: Path) -> None
     await poller.tick()
 
 
-def test_confidential_run_records_no_public_review_search(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("prompt", "options", "done_reason"),
+    [
+        (
+            "公開情報を調査してください",
+            ResearchRunOptions(allow_web_search=False),
+            "deep_research_web_search_disabled_by_run_option",
+        ),
+        (
+            "公開情報を調査してください",
+            ResearchRunOptions(context_classification="internal"),
+            "deep_research_web_search_blocked_internal_context",
+        ),
+        (
+            "公開情報を調査してください",
+            ResearchRunOptions(context_classification="confidential"),
+            "deep_research_web_search_blocked_confidential_context",
+        ),
+        (
+            "公開情報を調査してください",
+            ResearchRunOptions(context_classification="mixed"),
+            "deep_research_web_search_blocked_mixed_context",
+        ),
+        (
+            "社外秘: internal strategy を調査してください",
+            ResearchRunOptions(),
+            "deep_research_web_search_blocked_confidential_detected",
+        ),
+    ],
+)
+def test_non_public_or_web_disabled_run_stops_before_deep_research_submit(
+    tmp_path: Path,
+    prompt: str,
+    options: ResearchRunOptions,
+    done_reason: str,
+) -> None:
     fake = FakeAzure()
     orchestrator = make_orchestrator(tmp_path, fake)
 
     run = orchestrator.create_run(
         CreateResearchRunRequest(
-            user_prompt="社外秘: internal strategy を調査してください",
-            options=ResearchRunOptions(context_classification="confidential"),
+            user_prompt=prompt,
+            options=options,
         )
     )
-    orchestrator.collect_deep_research(run.id)
+    history = orchestrator.repository.get_history(run.id)
 
-    assert fake.review_web_search_enabled is False
-    assert fake.deep_research_web_search_enabled is False
+    assert run.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert run.done_reason == done_reason
+    assert run.deep_research_runs == 0
+    assert fake.submitted_prompts == []
+    assert fake.deep_research_web_search_enabled is None
+    assert history[-2]["step"] == "deep_research_submit_blocked"
+    assert history[-2]["reason"] == done_reason
+    payload = orchestrator.get_human_review_payload(run.id)
+    assert HumanReviewAction.APPROVE in payload.allowed_actions
+    assert HumanReviewAction.REJECT in payload.allowed_actions
+    assert HumanReviewAction.REQUEST_LLM_FIX in payload.allowed_actions
+    assert HumanReviewAction.REQUEST_DEEP_RESEARCH not in payload.allowed_actions
 
 
 def test_human_resume_approve_finalizes_report(tmp_path: Path) -> None:
@@ -821,6 +1223,78 @@ def test_human_review_queue_and_payload_include_latest_context(tmp_path: Path) -
     assert payload.latest_review is not None
     assert payload.latest_review.verdict == Verdict.HUMAN_REVIEW
     assert HumanReviewAction.APPROVE in payload.allowed_actions
+
+
+@pytest.mark.parametrize(
+    ("limit_fields", "blocked_actions", "allowed_actions"),
+    [
+        (
+            {"estimated_cost_usd": 20.0, "max_cost_usd": 20.0},
+            {
+                HumanReviewAction.REQUEST_LLM_FIX,
+                HumanReviewAction.REQUEST_DEEP_RESEARCH,
+            },
+            set[HumanReviewAction](),
+        ),
+        (
+            {"total_tool_calls": 120, "max_total_tool_calls": 120},
+            {
+                HumanReviewAction.REQUEST_LLM_FIX,
+                HumanReviewAction.REQUEST_DEEP_RESEARCH,
+            },
+            set[HumanReviewAction](),
+        ),
+        (
+            {"total_reviews": 5, "max_total_iterations": 5},
+            {
+                HumanReviewAction.REQUEST_LLM_FIX,
+                HumanReviewAction.REQUEST_DEEP_RESEARCH,
+            },
+            set[HumanReviewAction](),
+        ),
+        (
+            {"no_progress_count": 2, "max_no_progress_rounds": 2},
+            {
+                HumanReviewAction.REQUEST_LLM_FIX,
+                HumanReviewAction.REQUEST_DEEP_RESEARCH,
+            },
+            set[HumanReviewAction](),
+        ),
+        (
+            {"deep_research_runs": 2, "max_deep_research_runs": 2},
+            {HumanReviewAction.REQUEST_DEEP_RESEARCH},
+            {HumanReviewAction.REQUEST_LLM_FIX},
+        ),
+        (
+            {"llm_fix_runs": 3, "max_llm_fix_runs": 3},
+            {HumanReviewAction.REQUEST_LLM_FIX},
+            {HumanReviewAction.REQUEST_DEEP_RESEARCH},
+        ),
+    ],
+)
+def test_human_review_payload_filters_blocked_resume_actions(
+    tmp_path: Path,
+    limit_fields: dict[str, object],
+    blocked_actions: set[HumanReviewAction],
+    allowed_actions: set[HumanReviewAction],
+) -> None:
+    fake = FakeAzure(verdict=Verdict.HUMAN_REVIEW)
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    needs_human = orchestrator.collect_deep_research(run.id)
+    orchestrator.repository.update_run(needs_human.id, **limit_fields)
+
+    payload = orchestrator.get_human_review_payload(needs_human.id)
+
+    assert HumanReviewAction.APPROVE in payload.allowed_actions
+    assert HumanReviewAction.REJECT in payload.allowed_actions
+    for action in blocked_actions:
+        assert action not in payload.allowed_actions
+    for action in allowed_actions:
+        assert action in payload.allowed_actions
 
 
 def test_human_review_payload_rejects_non_waiting_run(tmp_path: Path) -> None:

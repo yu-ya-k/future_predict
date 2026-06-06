@@ -133,6 +133,38 @@ async def test_resume_api_approves_human_review_run(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_human_review_payload_filters_non_executable_deep_research_action(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_orchestrator(tmp_path, FakeAzure())
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs",
+            json={
+                "user_prompt": "市場調査をしてください",
+                "options": {"allow_web_search": False},
+            },
+        )
+        run_id = create_response.json()["run_id"]
+        payload_response = await client.get(
+            f"/research-runs/{run_id}/human-review",
+            headers=REVIEWER_HEADERS,
+        )
+
+    assert payload_response.status_code == 200
+    allowed_actions = payload_response.json()["allowed_actions"]
+    assert HumanReviewAction.REQUEST_DEEP_RESEARCH.value not in allowed_actions
+    assert HumanReviewAction.APPROVE.value in allowed_actions
+    assert HumanReviewAction.REJECT.value in allowed_actions
+
+
+@pytest.mark.anyio
 async def test_human_review_api_requires_reviewer_identity(tmp_path: Path) -> None:
     orchestrator = make_orchestrator(tmp_path, FakeAzure(verdict=Verdict.HUMAN_REVIEW))
     app = create_app()

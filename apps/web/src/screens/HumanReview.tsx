@@ -7,7 +7,7 @@
  * Guard rules (A4 / A8 Q-4):
  *  - Any action not in payload.allowed_actions → disabled.
  *  - request_deep_research shows a warning when audit_summary.no_progress_count >= 2
- *    (conservative heuristic — backend may not filter allowed_actions for this case).
+ *    so reviewers see the loop-risk context before resuming.
  *  - 409 conflict → show detail + refetch payload.
  *  - ReviewerRequiredError → prompt for reviewer id.
  */

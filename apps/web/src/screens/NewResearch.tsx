@@ -18,31 +18,16 @@ import { WebSearchBadge } from "../components";
 import { createRun } from "../api/research";
 import { ApiError } from "../api/client";
 import { requestNotificationPermission } from "../notifications";
+import {
+  FACTORY_RESEARCH_DEFAULTS,
+  loadResearchDefaults,
+  RESEARCH_DEFAULTS_STORAGE_KEY,
+} from "../researchDefaults";
 import { navigate, routes } from "../router";
 import { trackRun } from "../runStore";
 import { OPTION_BOUNDS, type ContextClassification } from "../types";
 
 const MAX_PROMPT_CHARS = 50_000;
-const DEFAULTS_STORAGE_KEY = "dro.defaults";
-
-interface Defaults {
-  max_deep_research_runs?: number;
-  max_llm_fix_runs?: number;
-  max_total_iterations?: number;
-  max_no_progress_rounds?: number;
-  max_cost_usd?: number;
-  max_total_tool_calls?: number;
-}
-
-function loadDefaults(): Defaults {
-  try {
-    const raw = localStorage.getItem(DEFAULTS_STORAGE_KEY);
-    if (!raw) return {};
-    return JSON.parse(raw) as Defaults;
-  } catch {
-    return {};
-  }
-}
 
 function deriveWebSearch(ctx: ContextClassification): boolean {
   // I-1: only public allows web search
@@ -57,7 +42,7 @@ const CONTEXT_OPTIONS: { value: ContextClassification; label: string; descriptio
 ];
 
 export function NewResearch() {
-  const defaults = useRef(loadDefaults());
+  const defaults = useRef(loadResearchDefaults());
 
   const [prompt, setPrompt] = useState("");
   const [context, setContext] = useState<ContextClassification>("public");
@@ -67,27 +52,35 @@ export function NewResearch() {
 
   // Advanced options — initialised from localStorage defaults
   const [maxDeepResearch, setMaxDeepResearch] = useState(
-    defaults.current.max_deep_research_runs ?? 3,
+    defaults.current.max_deep_research_runs ?? FACTORY_RESEARCH_DEFAULTS.max_deep_research_runs,
   );
-  const [maxLlmFix, setMaxLlmFix] = useState(defaults.current.max_llm_fix_runs ?? 3);
-  const [maxIterations, setMaxIterations] = useState(defaults.current.max_total_iterations ?? 10);
+  const [maxLlmFix, setMaxLlmFix] = useState(
+    defaults.current.max_llm_fix_runs ?? FACTORY_RESEARCH_DEFAULTS.max_llm_fix_runs,
+  );
+  const [maxIterations, setMaxIterations] = useState(
+    defaults.current.max_total_iterations ?? FACTORY_RESEARCH_DEFAULTS.max_total_iterations,
+  );
   const [maxNoProgress, setMaxNoProgress] = useState(
-    defaults.current.max_no_progress_rounds ?? 3,
+    defaults.current.max_no_progress_rounds ?? FACTORY_RESEARCH_DEFAULTS.max_no_progress_rounds,
   );
-  const [maxCost, setMaxCost] = useState(defaults.current.max_cost_usd ?? 5.0);
-  const [maxToolCalls, setMaxToolCalls] = useState(defaults.current.max_total_tool_calls ?? 200);
+  const [maxCost, setMaxCost] = useState(
+    defaults.current.max_cost_usd ?? FACTORY_RESEARCH_DEFAULTS.max_cost_usd,
+  );
+  const [maxToolCalls, setMaxToolCalls] = useState(
+    defaults.current.max_total_tool_calls ?? FACTORY_RESEARCH_DEFAULTS.max_total_tool_calls,
+  );
 
   // Reload defaults when storage changes (e.g. from Settings tab)
   useEffect(() => {
     function onStorage(e: StorageEvent) {
-      if (e.key !== DEFAULTS_STORAGE_KEY) return;
-      const d = loadDefaults();
-      if (d.max_deep_research_runs !== undefined) setMaxDeepResearch(d.max_deep_research_runs);
-      if (d.max_llm_fix_runs !== undefined) setMaxLlmFix(d.max_llm_fix_runs);
-      if (d.max_total_iterations !== undefined) setMaxIterations(d.max_total_iterations);
-      if (d.max_no_progress_rounds !== undefined) setMaxNoProgress(d.max_no_progress_rounds);
-      if (d.max_cost_usd !== undefined) setMaxCost(d.max_cost_usd);
-      if (d.max_total_tool_calls !== undefined) setMaxToolCalls(d.max_total_tool_calls);
+      if (e.key !== RESEARCH_DEFAULTS_STORAGE_KEY) return;
+      const d = loadResearchDefaults();
+      setMaxDeepResearch(d.max_deep_research_runs);
+      setMaxLlmFix(d.max_llm_fix_runs);
+      setMaxIterations(d.max_total_iterations);
+      setMaxNoProgress(d.max_no_progress_rounds);
+      setMaxCost(d.max_cost_usd);
+      setMaxToolCalls(d.max_total_tool_calls);
     }
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);

@@ -350,6 +350,40 @@ class ResearchRepository:
 
         return self.get_run(run_id)
 
+    def update_run_if_status(
+        self,
+        run_id: UUID,
+        allowed_statuses: set[RunStatus],
+        **fields: Any,
+    ) -> ResearchRunRecord | None:
+        if not allowed_statuses:
+            return None
+        if not fields:
+            run = self.get_run(run_id)
+            return run if run.status in allowed_statuses else None
+
+        fields["updated_at"] = utc_now().isoformat()
+        columns = ", ".join(f"{key} = ?" for key in fields)
+        status_placeholders = ", ".join("?" for _ in allowed_statuses)
+        values = [self._db_value(value) for value in fields.values()]
+        values.append(str(run_id))
+        values.extend(status.value for status in allowed_statuses)
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE research_runs
+                SET {columns}
+                WHERE id = ?
+                  AND status IN ({status_placeholders})
+                """,
+                values,
+            )
+            if cursor.rowcount != 1:
+                return None
+
+        return self.get_run(run_id)
+
     def add_attempt(self, run_id: UUID, attempt: ResearchAttempt) -> None:
         now = utc_now().isoformat()
         attempt_id = str(uuid4())

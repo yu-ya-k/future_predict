@@ -78,32 +78,23 @@ def test_deep_research_submit_applies_public_tool_policy() -> None:
     client = AzureResponsesClient(settings=_settings(), client=fake_client)
 
     client.submit_deep_research(prompt="public research", max_tool_calls=10)
-    client.submit_deep_research(
-        prompt="public research",
-        max_tool_calls=10,
-        web_search_allowed=False,
-    )
-    client.submit_deep_research(
-        prompt="public research",
-        max_tool_calls=10,
-        context_classification="internal",
-        web_search_enabled=True,
-    )
-    client.submit_deep_research(
-        prompt="public research",
-        max_tool_calls=10,
-        context_classification="mixed",
-    )
-    client.submit_deep_research(prompt="社外秘の戦略を調査", max_tool_calls=10)
+    blocked_calls: list[dict[str, Any]] = [
+        {"prompt": "public research", "max_tool_calls": 10, "web_search_allowed": False},
+        {
+            "prompt": "public research",
+            "max_tool_calls": 10,
+            "context_classification": "internal",
+            "web_search_enabled": True,
+        },
+        {"prompt": "public research", "max_tool_calls": 10, "context_classification": "mixed"},
+        {"prompt": "社外秘の戦略を調査", "max_tool_calls": 10},
+    ]
+    for kwargs in blocked_calls:
+        with pytest.raises(ValueError, match="requires an enabled public web search"):
+            client.submit_deep_research(**kwargs)
 
     tools_by_call = [call["tools"] for call in fake_client.responses.create_calls]
-    assert tools_by_call == [
-        [{"type": "web_search_preview"}],
-        [],
-        [],
-        [],
-        [],
-    ]
+    assert tools_by_call == [[{"type": "web_search_preview"}]]
 
 
 def test_review_report_falls_back_to_strict_schema_after_parse_api_error() -> None:
