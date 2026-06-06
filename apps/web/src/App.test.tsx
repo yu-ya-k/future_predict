@@ -2228,12 +2228,19 @@ describe("AuditLog (SCR-6)", () => {
 describe("HumanReview (SCR-4)", () => {
   const runId = "run-hr-test";
 
-  function makePayload(allowedActions: string[]) {
+  function makePayload(
+    allowedActions: string[],
+    overrides: Partial<{
+      latest_report: string;
+      latest_review: null;
+      reason: string;
+    }> = {},
+  ) {
     return {
       run_id: runId,
-      reason: "スコアが閾値以下です",
-      latest_report: "# テストレポート\n\nサンプル内容",
-      latest_review: {
+      reason: overrides.reason ?? "スコアが閾値以下です",
+      latest_report: overrides.latest_report ?? "# テストレポート\n\nサンプル内容",
+      latest_review: overrides.latest_review === null ? null : {
         review_no: 1,
         verdict: "human_review",
         recommended_route: "human_review",
@@ -2297,9 +2304,44 @@ describe("HumanReview (SCR-4)", () => {
     // Wait for payload to load (buttons are rendered after fetch)
     const llmPatchBtn = await screen.findByRole("button", { name: /LLM patch/i });
     const targetedRerunBtn = screen.getByRole("button", { name: /Targeted rerun/i });
+    const fullRerunBtn = screen.getByRole("button", { name: /全体再実行/i });
 
     expect(llmPatchBtn).toBeDisabled();
     expect(targetedRerunBtn).toBeDisabled();
+    expect(fullRerunBtn).toBeDisabled();
+  });
+
+  it("shows full rerun as the empty-report recovery action", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve(
+          makePayload(["request_full_rerun", "reject"], {
+            reason: "deep_research_incomplete",
+            latest_report: "",
+            latest_review: null,
+          }),
+        ),
+    } as Response);
+
+    render(<App />);
+
+    const approveBtn = await screen.findByRole("button", {
+      name: /現状で最終化/i,
+    });
+    const targetedRerunBtn = await screen.findByRole("button", {
+      name: /Targeted rerun/i,
+    });
+    const fullRerunBtn = screen.getByRole("button", { name: /全体再実行/i });
+    const firstDecisionButton = document.querySelector<HTMLButtonElement>(
+      ".decision-buttons button",
+    );
+
+    expect(approveBtn).toBeDisabled();
+    expect(targetedRerunBtn).toBeDisabled();
+    expect(fullRerunBtn).not.toBeDisabled();
+    expect(firstDecisionButton?.dataset.action).toBe("request_full_rerun");
   });
 
   it("enables actions that are in allowed_actions", async () => {

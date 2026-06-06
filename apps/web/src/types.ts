@@ -38,6 +38,7 @@ export type HumanReviewAction =
   | "request_llm_patch"
   | "request_verification"
   | "request_targeted_rerun"
+  | "request_full_rerun"
   | "request_item_revision"
   | "reject";
 

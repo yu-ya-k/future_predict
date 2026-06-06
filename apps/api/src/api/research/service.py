@@ -1353,6 +1353,13 @@ class ResearchOrchestrator:
         if request.action == HumanReviewAction.REQUEST_TARGETED_RERUN:
             return self.submit_deep_research(run.id, human_comment=request.comment)
 
+        if request.action == HumanReviewAction.REQUEST_FULL_RERUN:
+            return self.submit_deep_research(
+                run.id,
+                human_comment=request.comment,
+                scope="full_rerun",
+            )
+
         if request.action == HumanReviewAction.REQUEST_VERIFICATION:
             return self.verify_items(run.id)
 
@@ -2398,6 +2405,14 @@ def _blocked_human_resume_reason(
     run: ResearchRunRecord,
     action: HumanReviewAction,
 ) -> str | None:
+    if action in {
+        HumanReviewAction.APPROVE,
+        HumanReviewAction.APPROVE_WITH_LIMITATION,
+    }:
+        if not run.report:
+            return "missing_report_for_approval"
+        return None
+
     if action == HumanReviewAction.REQUEST_REVIEW:
         if run.done_reason not in {
             "review_timeout",
@@ -2408,9 +2423,19 @@ def _blocked_human_resume_reason(
             return "missing_report_for_review_retry"
         return None
 
+    if action == HumanReviewAction.REQUEST_LLM_PATCH and not run.report:
+        return "missing_report_for_llm_patch"
+
+    if action == HumanReviewAction.REQUEST_VERIFICATION and run.total_reviews == 0:
+        return "missing_review_for_verification"
+
+    if action == HumanReviewAction.REQUEST_TARGETED_RERUN and not run.report:
+        return "missing_report_for_targeted_rerun_use_full_rerun"
+
     if action not in {
         HumanReviewAction.REQUEST_LLM_PATCH,
         HumanReviewAction.REQUEST_TARGETED_RERUN,
+        HumanReviewAction.REQUEST_FULL_RERUN,
         HumanReviewAction.REQUEST_VERIFICATION,
         HumanReviewAction.REQUEST_ITEM_REVISION,
     }:
@@ -2430,6 +2455,12 @@ def _blocked_human_resume_reason(
         and run.targeted_rerun_runs >= run.max_targeted_rerun_runs
     ):
         return "max_targeted_rerun_runs_reached"
+
+    if (
+        action == HumanReviewAction.REQUEST_FULL_RERUN
+        and run.full_rerun_runs >= run.max_full_rerun_runs
+    ):
+        return "max_full_rerun_runs_reached"
 
     if (
         action == HumanReviewAction.REQUEST_LLM_PATCH

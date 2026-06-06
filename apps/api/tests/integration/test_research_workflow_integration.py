@@ -334,6 +334,70 @@ async def test_human_review_request_targeted_rerun_resume_completes_after_poller
 
 @pytest.mark.integration
 @pytest.mark.anyio
+async def test_human_review_full_rerun_recovers_empty_error_attempt(
+    integration_orchestrator_factory: Callable[[IntegrationFakeAzure], ResearchOrchestrator],
+) -> None:
+    fake = IntegrationFakeAzure(
+        retrieve_statuses=["incomplete", "completed"],
+        verdicts=[Verdict.PASS],
+    )
+    orchestrator = integration_orchestrator_factory(fake)
+
+    from api.main import create_app
+    from api.research.dependencies import get_research_orchestrator
+
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs",
+            json={
+                "user_prompt": "公開情報だけで調査してください。",
+            },
+        )
+        run_id = create_response.json()["run_id"]
+        needs_human = orchestrator.collect_deep_research(run_id)
+        assert needs_human.status == RunStatus.NEEDS_HUMAN_REVIEW
+        assert needs_human.report is None
+
+        payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+        allowed_actions = payload_response.json()["allowed_actions"]
+        assert HumanReviewAction.REQUEST_FULL_RERUN.value in allowed_actions
+        assert HumanReviewAction.APPROVE.value not in allowed_actions
+        assert HumanReviewAction.REQUEST_TARGETED_RERUN.value not in allowed_actions
+
+        resume_response = await client.post(
+            f"/research-runs/{run_id}/resume",
+            json={
+                "action": HumanReviewAction.REQUEST_FULL_RERUN.value,
+                "comment": "エラーで空レポートになったので全体を再実行してください。",
+            },
+        )
+        assert resume_response.status_code == 200
+        assert resume_response.json()["status"] == RunStatus.WAITING_DEEP_RESEARCH.value
+
+        poller = ResearchPoller(orchestrator=orchestrator, interval_seconds=0.01)
+        await poller.tick()
+
+        status_response = await client.get(f"/research-runs/{run_id}")
+        audit_response = await client.get(f"/research-runs/{run_id}/audit")
+
+    status = status_response.json()
+    assert status["status"] == RunStatus.COMPLETED.value
+    assert status["progress"]["deep_research_runs"] == 2
+    assert status["progress"]["full_rerun_runs"] == 1
+    assert status["progress"]["targeted_rerun_runs"] == 0
+    assert audit_response.json()["human_decisions"][0]["action"] == (
+        HumanReviewAction.REQUEST_FULL_RERUN.value
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
 async def test_human_review_resume_hard_stop_keeps_queue_and_records_no_decision(
     integration_orchestrator_factory: Callable[[IntegrationFakeAzure], ResearchOrchestrator],
 ) -> None:

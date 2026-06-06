@@ -39,6 +39,7 @@ class HumanReviewAction(StrEnum):
     REQUEST_LLM_PATCH = "request_llm_patch"
     REQUEST_VERIFICATION = "request_verification"
     REQUEST_TARGETED_RERUN = "request_targeted_rerun"
+    REQUEST_FULL_RERUN = "request_full_rerun"
     REQUEST_ITEM_REVISION = "request_item_revision"
     REJECT = "reject"
 
