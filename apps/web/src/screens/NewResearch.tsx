@@ -24,7 +24,7 @@ import {
 } from "../researchDefaults";
 import { navigate, routes } from "../router";
 import { trackRun } from "../runStore";
-import { OPTION_BOUNDS, type ContextClassification } from "../types";
+import { OPTION_BOUNDS } from "../types";
 
 const MAX_PROMPT_CHARS = 50_000;
 
@@ -35,8 +35,6 @@ export function NewResearch() {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [contextClassification, setContextClassification] =
-    useState<ContextClassification>("public");
 
   // Advanced options — initialised from localStorage defaults
   const [maxTargetedRerun, setMaxTargetedRerun] = useState(
@@ -90,7 +88,6 @@ export function NewResearch() {
 
       const response = await createRun({
         user_prompt: promptTrimmed,
-        context_classification: contextClassification,
         options: {
           max_targeted_rerun_runs: maxTargetedRerun,
           max_full_rerun_runs: maxFullRerun,
@@ -127,7 +124,6 @@ export function NewResearch() {
 
   const remaining = MAX_PROMPT_CHARS - prompt.length;
   const overLimit = prompt.length > MAX_PROMPT_CHARS;
-  const nonPublicContextSelected = contextClassification !== "public";
 
   return (
     <div className="screen-new">
@@ -168,33 +164,6 @@ export function NewResearch() {
                 : `残り ${remaining.toLocaleString()} 文字`}
             </span>
           </div>
-        </section>
-
-        <section className="form-section">
-          <label className="form-label" htmlFor="context-classification">
-            コンテキスト分類
-            <span className="form-required" aria-hidden="true">*</span>
-          </label>
-          <select
-            id="context-classification"
-            className="option-input"
-            value={contextClassification}
-            onChange={(e) =>
-              setContextClassification(e.target.value as ContextClassification)
-            }
-            disabled={submitting}
-            required
-          >
-            <option value="public">public</option>
-            <option value="internal">internal</option>
-            <option value="confidential">confidential</option>
-            <option value="mixed">mixed</option>
-          </select>
-          {nonPublicContextSelected && (
-            <div className="form-warning" role="alert">
-              public web Deep Research は policy により送信されず、人間レビューで停止します。
-            </div>
-          )}
         </section>
 
         {/* Advanced options (collapsible) */}

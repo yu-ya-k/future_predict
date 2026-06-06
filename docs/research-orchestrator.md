@@ -29,8 +29,9 @@ validated with evals.
 
 ## Workflow
 
-1. `POST /research-runs` requires `context_classification` and creates a run.
-2. The orchestrator validates security policy, builds an `ObjectiveContract`,
+1. `POST /research-runs` creates a run from the user prompt and optional guard
+   limits.
+2. The orchestrator validates query policy, builds an `ObjectiveContract`,
    generates initial `ResearchItem` rows, freezes the contract, and submits an
    Azure OpenAI Responses background request for initial Deep Research.
 3. The API stores the run as `waiting_deep_research` with the pending response
@@ -55,21 +56,12 @@ validated with evals.
 12. Human review is a resumable control point. Payloads include unresolved
     items, failure modes, attempted actions, and allowed next actions.
 
-## Required Context Classification
-
-Every run must declare how the prompt may be used:
-
-- `public`: public web search is allowed.
-- `internal`: public web search is blocked unless a private tool is explicitly
-  used by a future implementation.
-- `confidential`: public web search is blocked.
-- `mixed`: public web search is blocked until a redaction/private-tool path is
-  implemented.
+## Query Policy
 
 The query policy gate runs before public-web Deep Research submission and
-targeted verification. Verification decisions are persisted as
-`verification_queries` with raw query, safe query, policy decision, and blocked
-reason.
+targeted verification. It blocks generated queries that contain sensitive
+terms. Verification decisions are persisted as `verification_queries` with raw
+query, safe query, policy decision, and blocked reason.
 
 ## Review Verdicts
 

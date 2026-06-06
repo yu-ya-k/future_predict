@@ -5,13 +5,11 @@ from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from pydantic import ValidationError
 
 from api.main import create_app
 from api.research.azure_responses import ReviewRequestTimeout
 from api.research.dependencies import get_research_orchestrator
 from api.research.schemas import (
-    ContextClassification,
     CreateResearchRunRequest,
     HumanReviewAction,
     ReviewResult,
@@ -19,13 +17,6 @@ from api.research.schemas import (
     Verdict,
 )
 from research_v2_fakes import V2FakeAzure, make_v2_orchestrator
-
-
-def _resolve_openapi_ref(schemas: dict[str, Any], value: dict[str, Any]) -> dict[str, Any]:
-    ref = value.get("$ref")
-    if not isinstance(ref, str):
-        return value
-    return schemas[ref.removeprefix("#/components/schemas/")]
 
 
 @pytest.mark.anyio
@@ -42,7 +33,6 @@ async def test_research_run_api_flow(tmp_path: Path) -> None:
             "/research-runs",
             json={
                 "user_prompt": "市場調査をしてください",
-                "context_classification": "public",
             },
         )
 
@@ -106,7 +96,6 @@ async def test_delete_research_run_removes_api_access(tmp_path: Path) -> None:
             "/research-runs",
             json={
                 "user_prompt": "市場調査をしてください",
-                "context_classification": "public",
             },
         )
         run_id = create_response.json()["run_id"]
@@ -159,7 +148,6 @@ async def test_delete_waiting_run_returns_409_when_remote_cancel_fails(
             "/research-runs",
             json={
                 "user_prompt": "市場調査をしてください",
-                "context_classification": "public",
             },
         )
         run_id = create_response.json()["run_id"]
@@ -191,7 +179,6 @@ async def test_cancel_waiting_run_returns_409_when_remote_cancel_fails(
             "/research-runs",
             json={
                 "user_prompt": "市場調査をしてください",
-                "context_classification": "public",
             },
         )
         run_id = create_response.json()["run_id"]
@@ -221,7 +208,6 @@ def test_mark_timeout_preserves_retryable_state_when_remote_cancel_fails(
     run = orchestrator.create_run(
         CreateResearchRunRequest(
             user_prompt="市場調査をしてください",
-            context_classification=ContextClassification.PUBLIC,
         )
     )
 
@@ -247,10 +233,8 @@ def test_review_operation_claim_blocks_duplicate_review_workers(tmp_path: Path) 
     orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
     run = orchestrator.repository.create_run(
         user_prompt="市場調査をしてください",
-        context_classification=ContextClassification.PUBLIC,
         options=CreateResearchRunRequest(
             user_prompt="市場調査をしてください",
-            context_classification=ContextClassification.PUBLIC,
         ).options,
         settings=orchestrator.settings,
     )
@@ -303,7 +287,6 @@ async def test_resume_api_approves_human_review_run(tmp_path: Path) -> None:
             "/research-runs",
             json={
                 "user_prompt": "市場調査をしてください",
-                "context_classification": "public",
             },
         )
         run_id = create_response.json()["run_id"]
@@ -374,7 +357,6 @@ async def test_resume_api_can_retry_review_after_review_timeout(tmp_path: Path) 
             "/research-runs",
             json={
                 "user_prompt": "市場調査をしてください",
-                "context_classification": "public",
             },
         )
         run_id = create_response.json()["run_id"]
@@ -413,7 +395,6 @@ async def test_create_run_accepts_required_context_and_v2_options(
             "/research-runs",
             json={
                 "user_prompt": "市場調査をしてください",
-                "context_classification": "public",
                 "options": {
                     "max_targeted_rerun_runs": 2,
                     "max_full_rerun_runs": 1,
@@ -454,7 +435,6 @@ async def test_create_run_rejects_legacy_option_fields(
             "/research-runs",
             json={
                 "user_prompt": "市場調査をしてください",
-                "context_classification": "public",
                 "options": {field: value},
             },
         )
@@ -463,7 +443,7 @@ async def test_create_run_rejects_legacy_option_fields(
 
 
 @pytest.mark.anyio
-async def test_openapi_create_request_requires_context_and_v2_options() -> None:
+async def test_openapi_create_request_omits_context_and_exposes_v2_options() -> None:
     app = create_app()
 
     async with AsyncClient(
@@ -475,18 +455,9 @@ async def test_openapi_create_request_requires_context_and_v2_options() -> None:
     assert response.status_code == 200
     schemas = response.json()["components"]["schemas"]
     assert schemas["CreateResearchRunRequest"]["additionalProperties"] is False
-    assert "context_classification" in schemas["CreateResearchRunRequest"]["required"]
+    assert "context_classification" not in schemas["CreateResearchRunRequest"].get("required", [])
     create_properties = schemas["CreateResearchRunRequest"]["properties"]
-    context_schema = _resolve_openapi_ref(
-        schemas,
-        create_properties["context_classification"],
-    )
-    assert set(context_schema["enum"]) == {
-        "public",
-        "internal",
-        "confidential",
-        "mixed",
-    }
+    assert "context_classification" not in create_properties
     option_properties = schemas["ResearchRunOptions"].get("properties", {})
     assert set(option_properties) == {
         "max_targeted_rerun_runs",
@@ -517,7 +488,6 @@ async def test_human_review_api_does_not_require_reviewer_identity(tmp_path: Pat
             "/research-runs",
             json={
                 "user_prompt": "市場調査をしてください",
-                "context_classification": "public",
             },
         )
         run_id = create_response.json()["run_id"]
@@ -554,7 +524,6 @@ async def test_resume_api_rejects_body_reviewer_id(tmp_path: Path) -> None:
             "/research-runs",
             json={
                 "user_prompt": "市場調査をしてください",
-                "context_classification": "public",
             },
         )
         run_id = create_response.json()["run_id"]
@@ -585,7 +554,6 @@ async def test_resume_api_rejects_run_not_waiting_for_human(tmp_path: Path) -> N
             "/research-runs",
             json={
                 "user_prompt": "市場調査をしてください",
-                "context_classification": "public",
             },
         )
         run_id = create_response.json()["run_id"]
@@ -599,16 +567,11 @@ async def test_resume_api_rejects_run_not_waiting_for_human(tmp_path: Path) -> N
     assert resume_response.status_code == 409
 
 
-def test_create_request_requires_context_classification() -> None:
-    with pytest.raises(ValidationError):
-        CreateResearchRunRequest.model_validate({"user_prompt": "調査してください"})
-
+def test_create_request_defaults_options_without_context_classification() -> None:
     request = CreateResearchRunRequest(
         user_prompt="調査してください",
-        context_classification=ContextClassification.PUBLIC,
     )
 
-    assert request.context_classification == "public"
     assert request.options.model_dump() == {
         "max_targeted_rerun_runs": None,
         "max_full_rerun_runs": None,

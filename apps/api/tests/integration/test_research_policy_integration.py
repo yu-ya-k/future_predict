@@ -23,14 +23,9 @@ from research_fakes import IntegrationFakeAzure
 
 @pytest.mark.integration
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    "context_classification",
-    ["internal", "confidential", "mixed"],
-)
-async def test_initial_deep_research_submit_is_blocked_for_non_public_contexts(
+async def test_initial_deep_research_submit_blocks_sensitive_queries(
     integration_app: FastAPI,
     integration_fake_azure: IntegrationFakeAzure,
-    context_classification: str,
 ) -> None:
     async with AsyncClient(
         transport=ASGITransport(app=integration_app),
@@ -39,8 +34,7 @@ async def test_initial_deep_research_submit_is_blocked_for_non_public_contexts(
         create_response = await client.post(
             "/research-runs",
             json={
-                "user_prompt": "社内情報を含む可能性がある調査をしてください。",
-                "context_classification": context_classification,
+                "user_prompt": "Research internal project Codename Atlas launch plans.",
             },
         )
         assert create_response.status_code == 202
@@ -118,7 +112,6 @@ async def test_verification_route_blocks_sensitive_queries_and_records_policy_de
             "/research-runs",
             json={
                 "user_prompt": "公開情報だけで事実確認してください。",
-                "context_classification": "public",
             },
         )
         assert create_response.status_code == 202

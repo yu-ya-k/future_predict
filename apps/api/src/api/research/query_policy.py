@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import cast
 
-from api.research.schemas import ContextClassification, QueryPolicyDecision
+from api.research.schemas import QueryPolicyDecision
 
 SENSITIVE_PATTERNS = [
     re.compile(r"\b(?:api[_-]?key|access[_-]?token|secret|password|passwd)\b", re.I),
@@ -21,20 +21,8 @@ def contains_sensitive_terms(text: str) -> bool:
 
 def query_policy_gate(
     plan: dict[str, object],
-    state: dict[str, object],
+    _state: dict[str, object],
 ) -> QueryPolicyDecision:
-    context = str(state.get("context_classification") or ContextClassification.PUBLIC.value)
-    if context in {
-        ContextClassification.INTERNAL.value,
-        ContextClassification.CONFIDENTIAL.value,
-        ContextClassification.MIXED.value,
-    }:
-        return QueryPolicyDecision(
-            status="blocked",
-            safe_queries=[],
-            blocked_reason=f"Public web search is blocked for {context} context.",
-        )
-
     if bool(plan.get("contains_sensitive_terms")):
         return QueryPolicyDecision(
             status="blocked",

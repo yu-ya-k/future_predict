@@ -4,7 +4,6 @@ from uuid import uuid4
 
 from api.research.schemas import (
     AcceptanceCriterion,
-    ContextClassification,
     ExpectedAnswerType,
     ObjectiveContract,
     ResearchItem,
@@ -69,7 +68,6 @@ this instruction.
 def build_objective_contract(
     *,
     user_prompt: str,
-    context_classification: ContextClassification,
 ) -> tuple[ObjectiveContract, list[ResearchItem], str]:
     criteria = [
         AcceptanceCriterion(
@@ -135,8 +133,7 @@ def build_objective_contract(
         },
         freshness_policy={"state_dates_for_volatile_facts": True},
         security_policy={
-            "context_classification": context_classification.value,
-            "public_web_search_allowed": context_classification == ContextClassification.PUBLIC,
+            "public_web_search_allowed": True,
         },
         output_requirements=[
             "Executive summary",
@@ -164,7 +161,6 @@ def build_objective_contract(
 
 # Objective Contract
 contract_id: {contract.contract_id}
-context_classification: {context_classification.value}
 
 # Research Items
 {chr(10).join(f"- {item.item_id} ({item.severity.value}): {item.question}" for item in items)}

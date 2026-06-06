@@ -6,17 +6,16 @@ from langgraph.types import Command
 from api.research.graph import build_phase_3_graph, build_phase_4_graph
 from api.research.nodes import build_objective_contract
 from api.research.routing import route_after_review
-from api.research.schemas import ContextClassification, HumanReviewAction, Verdict
+from api.research.schemas import HumanReviewAction, Verdict
 
 
 def test_objective_contract_builder_creates_frozen_items() -> None:
     contract, items, prompt = build_objective_contract(
         user_prompt="Research battery recycling in Japan.",
-        context_classification=ContextClassification.PUBLIC,
     )
 
     assert contract.contract_frozen is True
-    assert contract.security_policy["context_classification"] == "public"
+    assert contract.security_policy["public_web_search_allowed"] is True
     assert len(items) == len(contract.acceptance_criteria)
     assert [item.item_id for item in items] == [
         "RI-001",

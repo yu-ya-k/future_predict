@@ -11,7 +11,6 @@ from api.main import create_app
 from api.research.dependencies import get_research_orchestrator
 from api.research.poller import ResearchPoller
 from api.research.schemas import (
-    ContextClassification,
     FailureMode,
     ItemAssessment,
     ItemStatus,
@@ -72,7 +71,6 @@ async def test_targeted_rerun_rejects_full_merged_report_and_preserves_report(
             "/research-runs",
             json={
                 "user_prompt": "公開情報に基づく競合調査をしてください。",
-                "context_classification": ContextClassification.PUBLIC.value,
             },
         )
         run_id = create_response.json()["run_id"]
@@ -177,7 +175,6 @@ async def test_finalize_with_limitation_completes_with_terminal_status_and_audit
             "/research-runs",
             json={
                 "user_prompt": "公開情報に基づく市場調査をしてください。",
-                "context_classification": ContextClassification.PUBLIC.value,
             },
         )
         run_id = create_response.json()["run_id"]
@@ -234,7 +231,6 @@ async def test_finalize_with_limitation_routes_to_human_review_when_required_ite
             "/research-runs",
             json={
                 "user_prompt": "公開情報に基づく市場調査をしてください。",
-                "context_classification": ContextClassification.PUBLIC.value,
             },
         )
         run_id = create_response.json()["run_id"]
@@ -272,7 +268,6 @@ async def test_targeted_rerun_budget_guard_routes_to_human_review_without_submit
             "/research-runs",
             json={
                 "user_prompt": "公開情報に基づく競合調査をしてください。",
-                "context_classification": ContextClassification.PUBLIC.value,
                 "options": {"max_targeted_rerun_runs": 0},
             },
         )

@@ -43,13 +43,6 @@ class HumanReviewAction(StrEnum):
     REJECT = "reject"
 
 
-class ContextClassification(StrEnum):
-    PUBLIC = "public"
-    INTERNAL = "internal"
-    CONFIDENTIAL = "confidential"
-    MIXED = "mixed"
-
-
 class ResearchRunOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -65,7 +58,6 @@ class CreateResearchRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     user_prompt: str = Field(min_length=1, max_length=50000)
-    context_classification: ContextClassification
     options: ResearchRunOptions = Field(default_factory=ResearchRunOptions)
 
 
@@ -489,7 +481,6 @@ class ResearchRunRecord(BaseModel):
     needs_human_review: bool
     pending_deep_research_response_id: str | None
     deep_research_status: str | None
-    context_classification: ContextClassification
     deep_research_runs: int
     targeted_rerun_runs: int
     full_rerun_runs: int

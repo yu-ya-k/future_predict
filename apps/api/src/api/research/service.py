@@ -83,7 +83,6 @@ class ResearchOrchestrator:
     def create_run(self, request: CreateResearchRunRequest) -> ResearchRunRecord:
         run = self.repository.create_run(
             user_prompt=request.user_prompt,
-            context_classification=request.context_classification,
             options=request.options,
             settings=self.settings,
         )
@@ -103,7 +102,6 @@ class ResearchOrchestrator:
         if run.deep_research_runs == 0:
             contract, research_items, optimized_prompt = build_objective_contract(
                 user_prompt=run.user_prompt,
-                context_classification=run.context_classification,
             )
             self.repository.save_objective_contract(run.id, contract)
             self.repository.upsert_research_items(run.id, research_items)
@@ -153,14 +151,13 @@ class ResearchOrchestrator:
                 },
             )
 
-        policy_decision = _deep_research_query_policy_decision(run, prompt)
+        policy_decision = _deep_research_query_policy_decision(prompt)
         if policy_decision.status != "allowed":
             self.repository.append_history_event(
                 run.id,
                 {
                     "step": "deep_research_submit_blocked",
                     "reason": policy_decision.blocked_reason,
-                    "context_classification": run.context_classification.value,
                     "policy_status": policy_decision.status,
                 },
             )
@@ -1081,7 +1078,7 @@ class ResearchOrchestrator:
                     contains_sensitive_terms(query) for query in raw_queries
                 ),
             },
-            {"context_classification": run.context_classification.value},
+            {},
         )
         for index, (item, raw_query) in enumerate(
             zip(target_research_items, raw_queries, strict=True)
@@ -1109,7 +1106,6 @@ class ResearchOrchestrator:
                 {
                     "step": "verification_blocked",
                     "reason": policy_decision.blocked_reason,
-                    "context_classification": run.context_classification.value,
                 },
             )
             return self._enter_human_review(
@@ -2049,7 +2045,7 @@ Return only the final report body.
             user_prompt=run.user_prompt,
             report=run.report or "",
             review={"prompt": prompt},
-            enable_web_search=run.context_classification.value == "public",
+            enable_web_search=True,
         )
         if not revised_report:
             raise RuntimeError("LLM finalize returned an empty report.")
@@ -2094,16 +2090,13 @@ def _acceptance_criteria_from_history(history: list[dict[str, Any]]) -> list[str
     return []
 
 
-def _deep_research_query_policy_decision(
-    run: ResearchRunRecord,
-    prompt: str,
-) -> QueryPolicyDecision:
+def _deep_research_query_policy_decision(prompt: str) -> QueryPolicyDecision:
     return query_policy_gate(
         {
             "candidate_queries": [prompt],
             "contains_sensitive_terms": contains_sensitive_terms(prompt),
         },
-        {"context_classification": run.context_classification.value},
+        {},
     )
 
 

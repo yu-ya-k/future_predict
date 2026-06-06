@@ -10,7 +10,6 @@ from httpx import ASGITransport, AsyncClient
 
 from api.research.poller import ResearchPoller
 from api.research.schemas import (
-    ContextClassification,
     CreateResearchRunRequest,
     FailureMode,
     HumanReviewAction,
@@ -53,7 +52,6 @@ async def test_api_poller_workflow_persists_v2_contract_items_and_audit(
             "/research-runs",
             json={
                 "user_prompt": "公開情報だけを使って短い市場調査をしてください。",
-                "context_classification": "public",
                 "options": {"max_total_tool_calls": 5},
             },
         )
@@ -98,7 +96,6 @@ def test_concurrent_review_run_is_db_claimed_across_orchestrator_instances(
     run = first_orchestrator.create_run(
         CreateResearchRunRequest(
             user_prompt="公開情報に基づく市場調査をしてください。",
-            context_classification=ContextClassification.PUBLIC,
         )
     )
 
@@ -151,7 +148,6 @@ def test_llm_patch_path_revises_report_and_re_reviews(
     run = orchestrator.create_run(
         CreateResearchRunRequest(
             user_prompt="公開情報に基づく技術調査をしてください。",
-            context_classification=ContextClassification.PUBLIC,
         )
     )
     completed = orchestrator.collect_deep_research(run.id)
@@ -174,7 +170,6 @@ async def test_targeted_rerun_uses_delta_prompt_and_merges_without_replacing_rep
     run = orchestrator.create_run(
         CreateResearchRunRequest(
             user_prompt="公開情報に基づく競合調査をしてください。",
-            context_classification=ContextClassification.PUBLIC,
         )
     )
     rerun = orchestrator.collect_deep_research(run.id)
@@ -205,7 +200,6 @@ async def test_full_rerun_uses_full_counter_and_replaces_report(
     run = orchestrator.create_run(
         CreateResearchRunRequest(
             user_prompt="公開情報に基づく調査をフルでやり直してください。",
-            context_classification=ContextClassification.PUBLIC,
         )
     )
     waiting = orchestrator.collect_deep_research(run.id)
@@ -251,7 +245,6 @@ def test_unknown_review_item_id_routes_to_human_review(
     run = orchestrator.create_run(
         CreateResearchRunRequest(
             user_prompt="公開情報に基づく市場調査をしてください。",
-            context_classification=ContextClassification.PUBLIC,
         )
     )
     stopped = orchestrator.collect_deep_research(run.id)
@@ -274,7 +267,6 @@ def test_verification_route_runs_policy_and_records_queries(
     run = orchestrator.create_run(
         CreateResearchRunRequest(
             user_prompt="公開情報に基づく事実確認をしてください。",
-            context_classification=ContextClassification.PUBLIC,
         )
     )
     completed = orchestrator.collect_deep_research(run.id)
@@ -310,7 +302,6 @@ async def test_human_review_request_targeted_rerun_resume_completes_after_poller
             "/research-runs",
             json={
                 "user_prompt": "公開情報だけで追加調査してください。",
-                "context_classification": "public",
             },
         )
         run_id = create_response.json()["run_id"]
@@ -363,7 +354,6 @@ async def test_human_review_resume_hard_stop_keeps_queue_and_records_no_decision
             "/research-runs",
             json={
                 "user_prompt": "公開情報だけで調査してください。",
-                "context_classification": "public",
             },
         )
         run_id = create_response.json()["run_id"]

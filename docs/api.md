@@ -12,7 +12,6 @@ curl -sS -X POST http://127.0.0.1:8000/research-runs \
   -H 'Content-Type: application/json' \
   -d '{
     "user_prompt": "Research the market outlook for battery recycling in Japan.",
-    "context_classification": "public",
     "options": {
       "max_targeted_rerun_runs": 2,
       "max_full_rerun_runs": 1,
@@ -24,17 +23,9 @@ curl -sS -X POST http://127.0.0.1:8000/research-runs \
   }'
 ```
 
-`context_classification` is required and must be one of:
-
-- `public`
-- `internal`
-- `confidential`
-- `mixed`
-
-Only `public` runs can submit public-web Deep Research or targeted verification
-automatically. `internal`, `confidential`, and `mixed` runs create the
-ObjectiveContract / ResearchItems, then stop for human review until a private
-tool or redaction path is available.
+Runs use public-web Deep Research by default. The query policy gate still runs
+before public-web Deep Research submission and targeted verification, and blocks
+queries that contain sensitive terms.
 
 `options` is optional. Defaults come from API settings. The v2 API rejects
 legacy options including `max_deep_research_runs` and
@@ -171,7 +162,6 @@ Returns the frozen `ObjectiveContract`:
       "state_dates_for_volatile_facts": true
     },
     "security_policy": {
-      "context_classification": "public",
       "public_web_search_allowed": true
     },
     "output_requirements": [

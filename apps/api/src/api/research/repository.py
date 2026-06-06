@@ -10,7 +10,6 @@ from uuid import UUID, uuid4
 from api.config import Settings
 from api.research.schemas import (
     Citation,
-    ContextClassification,
     CostEvent,
     HumanReviewAction,
     HumanReviewDecision,
@@ -262,7 +261,6 @@ class ResearchRepository:
         self,
         *,
         user_prompt: str,
-        context_classification: ContextClassification,
         options: ResearchRunOptions,
         settings: Settings,
     ) -> ResearchRunRecord:
@@ -276,19 +274,18 @@ class ResearchRepository:
                 """
                 INSERT INTO research_runs (
                     id, thread_id, user_prompt, status, needs_human_review,
-                    context_classification, max_targeted_rerun_runs, max_full_rerun_runs,
+                    max_targeted_rerun_runs, max_full_rerun_runs,
                     max_llm_patch_runs, max_verification_runs, max_total_iterations,
                     max_total_tool_calls,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(run_id),
                     thread_id,
                     user_prompt,
                     RunStatus.QUEUED.value,
-                    context_classification.value,
                     options.max_targeted_rerun_runs
                     if options.max_targeted_rerun_runs is not None
                     else settings.default_max_targeted_rerun_runs,
@@ -1298,7 +1295,6 @@ class ResearchRepository:
             needs_human_review=bool(row["needs_human_review"]),
             pending_deep_research_response_id=row["pending_deep_research_response_id"],
             deep_research_status=row["deep_research_status"],
-            context_classification=ContextClassification(row["context_classification"]),
             deep_research_runs=row["deep_research_runs"],
             targeted_rerun_runs=row["targeted_rerun_runs"],
             full_rerun_runs=row["full_rerun_runs"],

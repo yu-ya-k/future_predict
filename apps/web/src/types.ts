@@ -41,8 +41,6 @@ export type HumanReviewAction =
   | "request_item_revision"
   | "reject";
 
-export type ContextClassification = "public" | "internal" | "confidential" | "mixed";
-
 export type ResearchItemStatus =
   | "not_started"
   | "answered"
@@ -133,7 +131,6 @@ export interface ResearchRunOptions {
 
 export interface CreateResearchRunRequest {
   user_prompt: string; // 1-50000 chars
-  context_classification: ContextClassification;
   options?: ResearchRunOptions;
 }
 

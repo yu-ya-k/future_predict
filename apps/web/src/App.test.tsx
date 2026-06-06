@@ -791,17 +791,11 @@ describe("NewResearch (SCR-1)", () => {
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     const body = JSON.parse(String(init.body)) as {
       user_prompt: string;
-      context_classification: string;
       options: Record<string, unknown>;
     };
 
-    expect(Object.keys(body).sort()).toEqual([
-      "context_classification",
-      "options",
-      "user_prompt",
-    ]);
+    expect(Object.keys(body).sort()).toEqual(["options", "user_prompt"]);
     expect(body.user_prompt).toBe("テスト用プロンプト");
-    expect(body.context_classification).toBe("public");
     expect(body.options).toEqual({
       max_targeted_rerun_runs: 2,
       max_full_rerun_runs: 1,
@@ -810,19 +804,6 @@ describe("NewResearch (SCR-1)", () => {
       max_total_iterations: 5,
       max_total_tool_calls: 120,
     });
-  });
-
-  it("warns that non-public context stops public web Deep Research for human review", async () => {
-    render(<App />);
-
-    await userEvent.selectOptions(
-      screen.getByRole("combobox", { name: /コンテキスト分類/i }),
-      "internal",
-    );
-
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      /public web Deep Research は policy により送信されず/,
-    );
   });
 
   it("normalizes stale saved factory defaults before submitting", async () => {

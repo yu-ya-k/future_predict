@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from api.research.repository import ResearchRepository
-from api.research.schemas import ContextClassification, CreateResearchRunRequest, RunStatus
+from api.research.schemas import CreateResearchRunRequest, RunStatus
 from api.research.service import ResearchOrchestrator
 
 
@@ -17,7 +17,6 @@ def test_research_artifacts_and_sqlite_state_survive_repository_reopen(
     run = integration_orchestrator.create_run(
         CreateResearchRunRequest(
             user_prompt="公開情報だけを使って分析してください。",
-            context_classification=ContextClassification.PUBLIC,
         )
     )
     completed = integration_orchestrator.collect_deep_research(run.id)

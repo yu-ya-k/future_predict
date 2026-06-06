@@ -71,14 +71,6 @@ def _item_assessment(
     return assessment
 
 
-def _resolve_json_schema_ref(schema: dict[str, Any], value: dict[str, Any]) -> dict[str, Any]:
-    ref = value.get("$ref")
-    if not isinstance(ref, str):
-        return value
-    name = ref.removeprefix("#/$defs/")
-    return schema["$defs"][name]
-
-
 def test_v2_review_schema_replaces_legacy_deep_research_verdict() -> None:
     enum_values = set(REVIEW_RESULT_SCHEMA["properties"]["verdict"]["enum"])
 
@@ -98,15 +90,11 @@ def test_v2_human_review_actions_replace_deep_research_resume_action() -> None:
     assert "request_deep_research" not in action_values
 
 
-def test_v2_create_request_requires_context_classification() -> None:
+def test_v2_create_request_omits_context_classification() -> None:
     schema = CreateResearchRunRequest.model_json_schema()
 
-    assert "context_classification" in schema["required"]
-    context_schema = _resolve_json_schema_ref(
-        schema,
-        schema["properties"]["context_classification"],
-    )
-    assert set(context_schema["enum"]) == {"public", "internal", "confidential", "mixed"}
+    assert "context_classification" not in schema.get("required", [])
+    assert "context_classification" not in schema["properties"]
 
 
 def test_v2_options_replace_deep_research_and_no_progress_limits() -> None:
@@ -118,7 +106,7 @@ def test_v2_options_replace_deep_research_and_no_progress_limits() -> None:
 
 
 @pytest.mark.anyio
-async def test_v2_create_run_accepts_required_context_and_action_budgets(
+async def test_v2_create_run_accepts_action_budgets_without_context(
     tmp_path: Path,
 ) -> None:
     orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
@@ -133,7 +121,6 @@ async def test_v2_create_run_accepts_required_context_and_action_budgets(
             "/research-runs",
             json={
                 "user_prompt": "Research public battery recycling market data.",
-                "context_classification": "public",
                 "options": {
                     "max_targeted_rerun_runs": 2,
                     "max_full_rerun_runs": 1,
@@ -149,7 +136,7 @@ async def test_v2_create_run_accepts_required_context_and_action_budgets(
 
 
 @pytest.mark.anyio
-async def test_v2_create_run_rejects_missing_context_classification(
+async def test_v2_create_run_accepts_missing_context_classification(
     tmp_path: Path,
 ) -> None:
     orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
@@ -165,7 +152,7 @@ async def test_v2_create_run_rejects_missing_context_classification(
             json={"user_prompt": "Research public battery recycling market data."},
         )
 
-    assert create_response.status_code == 422
+    assert create_response.status_code == 202
 
 
 @pytest.mark.anyio
@@ -282,7 +269,7 @@ def test_v2_route_table_uses_item_failure_modes(
     assert route == expected_route
 
 
-def test_v2_query_policy_blocks_confidential_public_web_search() -> None:
+def test_v2_query_policy_blocks_sensitive_public_web_search() -> None:
     from api.research.query_policy import query_policy_gate
 
     decision = query_policy_gate(
@@ -292,12 +279,12 @@ def test_v2_query_policy_blocks_confidential_public_web_search() -> None:
             "contains_sensitive_terms": True,
             "sensitive_terms": ["internal project codename"],
         },
-        {"context_classification": "confidential"},
+        {},
     )
 
     assert decision.status == "blocked"
     assert decision.safe_queries == []
-    assert "confidential" in (decision.blocked_reason or "")
+    assert "sensitive terms" in (decision.blocked_reason or "")
 
 
 def test_v2_deterministic_merge_rejects_preserved_section_changes() -> None:
