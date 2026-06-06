@@ -9,7 +9,7 @@
     "lint": "eslint . --max-warnings=0",
     "format": "prettier --write .",
     "test": "vitest run",
-    "check": "tsc --noEmit && eslint . --max-warnings=0 && vitest run"
+    "check": "tsc -b && eslint . --max-warnings=0 && vitest run"
   },
   "dependencies": {
     "react": "^19.0.0",

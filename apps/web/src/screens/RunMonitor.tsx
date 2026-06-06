@@ -1,0 +1,381 @@
+/**
+ * SCR-3: Run Monitor — central hub for a single research run.
+ *
+ * Polling: statusPollInterval(status) drives getRunStatus; getReviews for history.
+ * Header: StatusPill + ContextBadge + WebSearchBadge (from getTrackedRun; hidden if absent).
+ * Notifications: fires on transition to completed / needs_human_review.
+ * Cancel: calls cancelRun, then refetches.
+ * No-progress heuristic: banner shown when needs_human_review OR latest two
+ *   review scores didn't improve.
+ */
+
+import { useCallback, useRef, useState } from "react";
+
+import {
+  CostMeter,
+  MetricCard,
+  PipelineStepper,
+  ReviewHistoryItem,
+  ScoreChip,
+  Skeleton,
+  StatusPill,
+  ContextBadge,
+  WebSearchBadge,
+  WaitBanner,
+  EmptyState,
+  type PipelineStep,
+} from "../components";
+import { getRunStatus, getReviews, cancelRun } from "../api/research";
+import { ApiError } from "../api/client";
+import { usePolling } from "../hooks/usePolling";
+import { useElapsed, formatElapsed } from "../hooks/useElapsed";
+import { statusPollInterval } from "../polling";
+import { routes, Link } from "../router";
+import { getTrackedRun, updateTrackedStatus } from "../runStore";
+import { notify } from "../notifications";
+import {
+  isTerminal,
+  type ResearchRunStatusResponse,
+  type ReviewRecord,
+  type RunStatus,
+} from "../types";
+
+// ── Pipeline step mapping ─────────────────────────────────────────────────────
+
+function statusToStep(status: RunStatus): PipelineStep {
+  switch (status) {
+    case "queued":
+    case "submitted":
+      return "brief";
+    case "waiting_deep_research":
+    case "collecting":
+      return "research";
+    case "reviewing":
+    case "needs_action":
+    case "needs_human_review":
+      return "review";
+    case "completed":
+    case "cancelled":
+    case "failed":
+      return "finalize";
+  }
+}
+
+function getCompletedSteps(status: RunStatus): PipelineStep[] {
+  const order: PipelineStep[] = ["brief", "research", "review", "finalize"];
+  const current = statusToStep(status);
+  const idx = order.indexOf(current);
+  return order.slice(0, idx) as PipelineStep[];
+}
+
+// ── No-progress heuristic ─────────────────────────────────────────────────────
+
+function hasNoProgressSignal(
+  status: RunStatus,
+  reviews: ReviewRecord[],
+): boolean {
+  if (status === "needs_human_review") return true;
+  if (reviews.length >= 2) {
+    const latest = reviews[reviews.length - 1].score;
+    const prev = reviews[reviews.length - 2].score;
+    if (latest <= prev) return true;
+  }
+  return false;
+}
+
+// ── RunMonitor ────────────────────────────────────────────────────────────────
+
+interface RunMonitorProps {
+  runId: string;
+}
+
+export function RunMonitor({ runId }: RunMonitorProps) {
+  const tracked = getTrackedRun(runId);
+  const prevStatusRef = useRef<RunStatus | undefined>(undefined);
+
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+
+  // ── Status polling ────────────────────────────────────────────────────────
+
+  const {
+    data: runStatus,
+    loading: statusLoading,
+    error: statusError,
+    connectionUnstable,
+    refetch,
+  } = usePolling<ResearchRunStatusResponse>({
+    fetcher: (signal) => getRunStatus(runId, signal),
+    interval: (data) => statusPollInterval(data?.status),
+    onData: useCallback(
+      (data: ResearchRunStatusResponse) => {
+        updateTrackedStatus(runId, data.status, {
+          estimated_cost_usd: data.progress?.estimated_cost_usd,
+          latest_score: data.progress?.latest_score,
+        });
+
+        const prev = prevStatusRef.current;
+        if (prev !== undefined && prev !== data.status) {
+          if (data.status === "completed") {
+            notify("リサーチ完了", `run ${runId} のレポートが完成しました。`);
+          } else if (data.status === "needs_human_review") {
+            notify("人間レビューが必要", `run ${runId} の判断が必要です。`);
+          }
+        }
+        prevStatusRef.current = data.status;
+      },
+      [runId],
+    ),
+  });
+
+  // ── Reviews polling ────────────────────────────────────────────────────────
+
+  const { data: reviews } = usePolling<ReviewRecord[]>({
+    fetcher: (signal) => getReviews(runId, signal),
+    interval: (data) => {
+      if (runStatus && isTerminal(runStatus.status)) return null;
+      // Slow down when in long phases
+      const s = runStatus?.status;
+      if (s === "waiting_deep_research" || s === "collecting") return 30_000;
+      return data !== undefined ? 10_000 : 5_000;
+    },
+  });
+
+  // ── Derived values ────────────────────────────────────────────────────────
+
+  const status = runStatus?.status ?? (tracked?.last_status ?? "queued");
+  const progress = runStatus?.progress;
+  const sortedReviews = Array.isArray(reviews)
+    ? [...reviews].sort((a, b) => a.review_no - b.review_no)
+    : [];
+
+  const elapsed = useElapsed(tracked?.created_at, !isTerminal(status));
+
+  const isWaiting =
+    status === "waiting_deep_research" || status === "collecting";
+
+  // Only estimate remaining time when we actually know the start time. For a
+  // direct-URL run with no tracked entry, `elapsed` is 0 and a "残り約30分"
+  // figure would be misleading (GAP-1), so leave it undefined.
+  const estimatedRemaining = tracked?.created_at
+    ? Math.max(0, 30 - elapsed)
+    : undefined;
+
+  const showHumanReviewBanner = status === "needs_human_review";
+  const showNoProgressNote =
+    !!runStatus && hasNoProgressSignal(runStatus.status, sortedReviews);
+
+  const maxCost = tracked?.max_cost_usd ?? 10;
+  const estimatedCost = progress?.estimated_cost_usd ?? 0;
+
+  // ── Cancel action ─────────────────────────────────────────────────────────
+
+  async function handleCancel() {
+    if (!window.confirm("このrunをキャンセルしますか？")) return;
+    setCancelling(true);
+    setCancelError(null);
+    try {
+      await cancelRun(runId);
+      refetch();
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setCancelError(err.detail ?? err.message);
+      } else {
+        setCancelError("キャンセルに失敗しました");
+      }
+    } finally {
+      setCancelling(false);
+    }
+  }
+
+  // Initial loading state
+  if (statusLoading && !runStatus) {
+    return (
+      <div className="screen-monitor">
+        <div className="monitor-skeleton">
+          <Skeleton width="60%" height="28px" />
+          <Skeleton width="100%" height="120px" />
+          <Skeleton width="100%" height="200px" />
+        </div>
+      </div>
+    );
+  }
+
+  if (statusError && !runStatus) {
+    return (
+      <div className="screen-monitor">
+        <div className="monitor-error" role="alert">
+          <p>runの状態を取得できませんでした。</p>
+          <button type="button" className="btn-secondary" onClick={refetch}>
+            再試行
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="screen-monitor">
+      {/* ── Header ───────────────────────────────────── */}
+      <header className="monitor-header">
+        <div className="monitor-header-top">
+          <div className="monitor-title-row">
+            <StatusPill status={status} />
+            {tracked && (
+              <>
+                <ContextBadge context={tracked.context_classification} showLock />
+                <WebSearchBadge
+                  webSearchAllowed={tracked.web_search_allowed}
+                  context={tracked.context_classification}
+                />
+              </>
+            )}
+            {connectionUnstable && (
+              <span className="connection-warning" role="status">
+                接続が不安定です — 自動再試行中
+              </span>
+            )}
+          </div>
+
+          <div className="monitor-actions">
+            <Link to={routes().report(runId)} className="btn-secondary btn-sm">
+              最新レポートを見る
+            </Link>
+            <Link to={routes().audit(runId)} className="btn-secondary btn-sm">
+              監査ログ
+            </Link>
+            {!isTerminal(status) && (
+              <button
+                type="button"
+                className="btn-danger btn-sm"
+                onClick={handleCancel}
+                disabled={cancelling}
+              >
+                {cancelling ? "キャンセル中..." : "キャンセル"}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {tracked?.title && (
+          <h1 className="monitor-run-title">{tracked.title}</h1>
+        )}
+        <p className="monitor-run-id">{runId}</p>
+      </header>
+
+      {cancelError && (
+        <div className="monitor-error-banner" role="alert">
+          {cancelError}
+        </div>
+      )}
+
+      {/* ── Human review banner ───────────────────────── */}
+      {showHumanReviewBanner && (
+        <div className="human-review-banner" role="alert">
+          <div className="human-review-banner-content">
+            <span className="human-review-banner-label">人間による判断が必要です</span>
+            <p className="human-review-banner-reason">
+              {runStatus?.done_reason ?? "AIが自動継続を停止しました。"}
+            </p>
+          </div>
+          <Link
+            to={routes().review(runId)}
+            className="btn-primary"
+            aria-label="判断画面へ"
+          >
+            判断する →
+          </Link>
+        </div>
+      )}
+
+      {/* ── No-progress note ──────────────────────────── */}
+      {showNoProgressNote && !showHumanReviewBanner && (
+        <div className="no-progress-note" role="note">
+          直近のレビューでスコアの改善が見られません。
+          人間レビューが必要になる可能性があります。
+        </div>
+      )}
+
+      {/* ── Metrics row ───────────────────────────────── */}
+      <div className="metrics-row">
+        <MetricCard
+          label="経過時間"
+          value={formatElapsed(elapsed)}
+          icon="ti-clock"
+        />
+        <MetricCard
+          label="レビュー回数"
+          value={progress?.total_reviews ?? 0}
+          icon="ti-repeat"
+        />
+        {progress?.latest_score !== null && progress?.latest_score !== undefined && (
+          <div className="metric-score-wrap">
+            <ScoreChip score={progress.latest_score} animate />
+          </div>
+        )}
+        <div className="metric-cost-wrap">
+          <CostMeter estimated={estimatedCost} max={maxCost} />
+        </div>
+      </div>
+
+      {/* ── Pipeline stepper ─────────────────────────── */}
+      <div className="monitor-pipeline">
+        <PipelineStepper
+          currentStep={statusToStep(status)}
+          completedSteps={getCompletedSteps(status)}
+          loopCount={progress?.deep_research_runs ?? 0}
+          maxIterations={tracked?.max_total_iterations ?? 0}
+        />
+      </div>
+
+      {/* ── Wait banner ───────────────────────────────── */}
+      {isWaiting && (
+        <WaitBanner
+          elapsedMinutes={elapsed}
+          // WaitBanner's `estimatedRemainingMinutes` is required and always
+          // renders the "残り約N分" line, so when the start time is unknown we
+          // pass 0 (clamped by the component) — the elapsed clock reads 0 too in
+          // that case, so the banner just shows tool-call progress meaningfully.
+          estimatedRemainingMinutes={estimatedRemaining ?? 0}
+          totalToolCalls={progress?.total_tool_calls ?? 0}
+          canLeave
+        />
+      )}
+
+      {/* ── Review history ───────────────────────────── */}
+      <section className="monitor-reviews" aria-labelledby="history-heading">
+        <h2 id="history-heading" className="section-title">レビュー履歴</h2>
+
+        {sortedReviews.length === 0 ? (
+          <EmptyState
+            title="レビュー履歴なし"
+            description="レビューが完了すると、ここに表示されます。"
+          />
+        ) : (
+          <div className="review-list">
+            {[...sortedReviews].reverse().map((review, i) => (
+              <ReviewHistoryItem
+                key={review.review_no}
+                review={review}
+                showTrend={i < sortedReviews.length - 1}
+                previousScore={
+                  i < sortedReviews.length - 1
+                    ? sortedReviews[sortedReviews.length - 2 - i]?.score
+                    : undefined
+                }
+              />
+            ))}
+          </div>
+        )}
+      </section>
+
+      {/* ── Done reason ───────────────────────────────── */}
+      {isTerminal(status) && runStatus?.done_reason && (
+        <div className="done-reason" role="note">
+          <span className="done-reason-label">終了理由:</span>{" "}
+          {runStatus.done_reason}
+        </div>
+      )}
+    </div>
+  );
+}
