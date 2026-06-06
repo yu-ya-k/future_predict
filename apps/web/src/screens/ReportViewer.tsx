@@ -119,6 +119,7 @@ export function ReportViewer({ runId, initialTab = "research" }: ReportViewerPro
 
   const { data: report, loading: reportLoading } = usePolling({
     fetcher: (signal) => getReport(runId, signal),
+    key: `report:${runId}`,
     interval: (data) => {
       if (data?.final_report) return null;
       return 15_000;
@@ -127,16 +128,19 @@ export function ReportViewer({ runId, initialTab = "research" }: ReportViewerPro
 
   const { data: citations } = usePolling({
     fetcher: (signal) => getCitations(runId, signal),
+    key: `citations:${runId}`,
     interval: () => 30_000,
   });
 
   const { data: reviews } = usePolling({
     fetcher: (signal) => getReviews(runId, signal),
+    key: `reviews:${runId}`,
     interval: () => 30_000,
   });
 
   const { data: attempts } = usePolling({
     fetcher: (signal) => getAttempts(runId, signal),
+    key: `attempts:${runId}`,
     interval: () => 30_000,
   });
 

@@ -506,6 +506,9 @@ class ResearchRunRecord(BaseModel):
     total_tool_calls: int
     estimated_cost_usd: float
     terminal_status: str | None = None
+    review_claim_token: str | None = None
+    review_claim_operation: str | None = None
+    review_claim_expires_at: datetime | None = None
     deep_research_submitted_at: datetime | None = None
     poll_error_count: int = 0
     poll_claimed_until: datetime | None = None

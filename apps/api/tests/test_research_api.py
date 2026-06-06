@@ -15,6 +15,7 @@ from api.research.schemas import (
     CreateResearchRunRequest,
     HumanReviewAction,
     ReviewResult,
+    RunStatus,
     Verdict,
 )
 from research_v2_fakes import V2FakeAzure, make_v2_orchestrator
@@ -169,6 +170,120 @@ async def test_delete_waiting_run_returns_409_when_remote_cancel_fails(
     assert response.status_code == 409
     assert "Remote Deep Research cancel failed" in response.json()["detail"]
     assert status_response.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_cancel_waiting_run_returns_409_when_remote_cancel_fails(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_v2_orchestrator(
+        tmp_path,
+        V2FakeAzure(cancel_raises=RuntimeError("remote cancel unavailable")),
+    )
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs",
+            json={
+                "user_prompt": "市場調査をしてください",
+                "context_classification": "public",
+            },
+        )
+        run_id = create_response.json()["run_id"]
+
+        response = await client.post(f"/research-runs/{run_id}/cancel")
+        status_response = await client.get(f"/research-runs/{run_id}")
+        audit_response = await client.get(f"/research-runs/{run_id}/audit")
+
+    assert response.status_code == 409
+    assert "Remote Deep Research cancel failed" in response.json()["detail"]
+    status_payload = status_response.json()
+    assert status_payload["status"] == "waiting_deep_research"
+    assert status_payload["done_reason"] is None
+    assert status_payload["needs_human_review"] is False
+    assert "cancel_remote_failed" in [
+        event["step"] for event in audit_response.json()["history"]
+    ]
+
+
+def test_mark_timeout_preserves_retryable_state_when_remote_cancel_fails(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_v2_orchestrator(
+        tmp_path,
+        V2FakeAzure(cancel_raises=RuntimeError("remote cancel unavailable")),
+    )
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(
+            user_prompt="市場調査をしてください",
+            context_classification=ContextClassification.PUBLIC,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="Remote Deep Research cancel failed"):
+        orchestrator.mark_timeout(run.id)
+
+    latest = orchestrator.repository.get_run(run.id)
+    history_steps = [
+        event["step"] for event in orchestrator.repository.get_history(run.id)
+    ]
+    assert latest.status == RunStatus.COLLECTING
+    assert latest.done_reason is None
+    assert latest.needs_human_review is False
+    assert latest.deep_research_status == "queued"
+    assert "timeout_remote_cancel_failed" in history_steps
+    assert all(
+        attempt.status != "timeout"
+        for attempt in orchestrator.repository.get_attempts(run.id)
+    )
+
+
+def test_review_operation_claim_blocks_duplicate_review_workers(tmp_path: Path) -> None:
+    orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
+    run = orchestrator.repository.create_run(
+        user_prompt="市場調査をしてください",
+        context_classification=ContextClassification.PUBLIC,
+        options=CreateResearchRunRequest(
+            user_prompt="市場調査をしてください",
+            context_classification=ContextClassification.PUBLIC,
+        ).options,
+        settings=orchestrator.settings,
+    )
+    orchestrator.repository.update_run(
+        run.id,
+        status=RunStatus.REVIEWING,
+        report="draft report",
+    )
+
+    first_claim = orchestrator.repository.claim_review_operation(
+        run.id,
+        operation="review_run",
+        lease_seconds=180,
+    )
+    second_claim = orchestrator.repository.claim_review_operation(
+        run.id,
+        operation="review_run",
+        lease_seconds=180,
+    )
+
+    assert first_claim is not None
+    assert second_claim is None
+
+    _claimed_run, token = first_claim
+    assert orchestrator.repository.release_review_operation(run.id, claim_token=token)
+    assert (
+        orchestrator.repository.claim_review_operation(
+            run.id,
+            operation="review_run",
+            lease_seconds=180,
+        )
+        is not None
+    )
 
 
 @pytest.mark.anyio

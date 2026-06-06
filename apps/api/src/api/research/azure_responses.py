@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from openai import APITimeoutError, AzureOpenAI, OpenAI, OpenAIError
+from openai import APITimeoutError, AzureOpenAI, BadRequestError, OpenAI, OpenAIError
 from pydantic import ValidationError
 
 from api.config import Settings
@@ -22,6 +22,21 @@ _CITATION_COMPACT_KEYS = (
     "filename",
     "start_index",
     "end_index",
+)
+
+_PARSE_REQUEST_SHAPE_MARKERS = (
+    "text_format",
+    "response_format",
+    "json_schema",
+    "schema",
+)
+
+_REQUEST_SHAPE_ERROR_MARKERS = (
+    "unknown parameter",
+    "unsupported parameter",
+    "unrecognized request argument",
+    "unexpected request argument",
+    "extra inputs are not permitted",
 )
 
 
@@ -156,9 +171,13 @@ class AzureResponsesClient:
                 TypeError,
                 AttributeError,
                 ValidationError,
-                OpenAIError,
             ):
                 pass
+            except OpenAIError as error:
+                if not _is_parse_request_shape_error(error):
+                    raise RuntimeError(
+                        "Reviewer structured output request failed."
+                    ) from error
 
         try:
             request = {
@@ -206,9 +225,13 @@ class AzureResponsesClient:
         user_prompt: str,
         report: str,
         review: dict[str, Any],
-        enable_web_search: bool = True,
+        enable_web_search: bool = False,
     ) -> tuple[str, str | None, dict[str, Any]]:
         tools = [{"type": "web_search"}] if enable_web_search else []
+        request_client = _client_with_timeout(
+            self.reviewer_client,
+            timeout=self.settings.research_review_timeout_seconds,
+        )
         request: dict[str, Any] = {
             "model": self.reviewer_deployment,
             "input": build_finalize_prompt(
@@ -219,9 +242,14 @@ class AzureResponsesClient:
         }
         if tools:
             request["tools"] = tools
-        response = self.reviewer_client.responses.create(
-            **request,
-        )
+        try:
+            response = request_client.responses.create(
+                **request,
+            )
+        except APITimeoutError as error:
+            raise ReviewRequestTimeout("Reviewer finalize request timed out.") from error
+        except OpenAIError as error:
+            raise RuntimeError("Reviewer finalize request failed.") from error
         output_text = get_response_output_text(response)
         return output_text, get_response_id(response), response_to_jsonable(response)
 
@@ -364,6 +392,25 @@ def _client_with_timeout(client: Any, *, timeout: int) -> Any:
     if callable(with_options):
         return with_options(timeout=timeout)
     return client
+
+
+def _is_parse_request_shape_error(error: OpenAIError) -> bool:
+    if not isinstance(error, BadRequestError):
+        return False
+
+    details = " ".join(
+        str(part)
+        for part in (
+            error,
+            getattr(error, "body", None),
+            getattr(error, "code", None),
+            getattr(error, "param", None),
+        )
+        if part
+    ).lower()
+    return any(
+        marker in details for marker in _PARSE_REQUEST_SHAPE_MARKERS
+    ) and any(marker in details for marker in _REQUEST_SHAPE_ERROR_MARKERS)
 
 
 def _truncate_text(value: str, *, max_chars: int) -> tuple[str, int]:

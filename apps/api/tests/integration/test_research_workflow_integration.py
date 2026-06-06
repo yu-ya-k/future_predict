@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -15,12 +17,26 @@ from api.research.schemas import (
     ItemAssessment,
     ItemStatus,
     RecommendedAction,
+    ReviewResult,
     RunStatus,
     Severity,
     Verdict,
 )
 from api.research.service import ResearchOrchestrator
 from research_fakes import IntegrationFakeAzure
+
+
+class BlockingReviewFakeAzure(IntegrationFakeAzure):
+    def __init__(self) -> None:
+        super().__init__(verdicts=[Verdict.PASS])
+        self.review_started = threading.Event()
+        self.review_can_finish = threading.Event()
+
+    def review_report(self, **kwargs: Any) -> tuple[ReviewResult, str, dict[str, object]]:
+        self.review_started.set()
+        if not self.review_can_finish.wait(timeout=5):
+            raise TimeoutError("Timed out waiting to finish blocked review.")
+        return super().review_report(**kwargs)
 
 
 @pytest.mark.integration
@@ -68,6 +84,61 @@ async def test_api_poller_workflow_persists_v2_contract_items_and_audit(
     assert audit["research_items"]
     assert len(audit["citations"]) == 1
     assert len(audit["tool_calls"]) == 1
+
+
+@pytest.mark.integration
+def test_concurrent_review_run_is_db_claimed_across_orchestrator_instances(
+    integration_orchestrator_factory: Callable[[IntegrationFakeAzure], ResearchOrchestrator],
+) -> None:
+    first_fake = BlockingReviewFakeAzure()
+    second_fake = IntegrationFakeAzure()
+    first_orchestrator = integration_orchestrator_factory(first_fake)
+    second_orchestrator = integration_orchestrator_factory(second_fake)
+
+    run = first_orchestrator.create_run(
+        CreateResearchRunRequest(
+            user_prompt="公開情報に基づく市場調査をしてください。",
+            context_classification=ContextClassification.PUBLIC,
+        )
+    )
+
+    result: list[RunStatus] = []
+    errors: list[BaseException] = []
+
+    def collect() -> None:
+        try:
+            result.append(first_orchestrator.collect_deep_research(run.id).status)
+        except BaseException as error:  # pragma: no cover - forwarded to the test thread
+            errors.append(error)
+
+    worker = threading.Thread(target=collect)
+    worker.start()
+    try:
+        assert first_fake.review_started.wait(timeout=5)
+
+        assert (
+            second_orchestrator.repository.claim_review_operation(
+                run.id,
+                operation="llm_finalize",
+                lease_seconds=second_orchestrator.settings.research_review_timeout_seconds,
+            )
+            is None
+        )
+        duplicate = second_orchestrator.review_run(run.id)
+
+        assert duplicate.status == RunStatus.REVIEWING
+        assert len(first_fake.review_calls) == 0
+        assert second_fake.review_calls == []
+    finally:
+        first_fake.review_can_finish.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert result == [RunStatus.COMPLETED]
+    assert len(first_fake.review_calls) == 1
+    assert len(first_orchestrator.repository.get_reviews(run.id)) == 1
+    assert first_orchestrator.repository.get_run(run.id).review_claim_token is None
 
 
 @pytest.mark.integration

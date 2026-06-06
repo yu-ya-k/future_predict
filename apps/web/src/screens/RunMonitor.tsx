@@ -184,6 +184,7 @@ export function RunMonitor({ runId }: RunMonitorProps) {
   } = usePolling<ResearchRunStatusResponse>({
     fetcher: (signal) => getRunStatus(runId, signal),
     interval: (data) => statusPollInterval(data?.status),
+    key: runId,
     onData: useCallback(
       (data: ResearchRunStatusResponse) => {
         updateTrackedStatus(runId, data.status, {
@@ -209,6 +210,7 @@ export function RunMonitor({ runId }: RunMonitorProps) {
 
   const { data: reviews } = usePolling<ReviewRecord[]>({
     fetcher: (signal) => getReviews(runId, signal),
+    key: `reviews:${runId}`,
     interval: (data) => {
       if (runStatus && isTerminal(runStatus.status)) return null;
       // Slow down when in long phases
@@ -222,6 +224,7 @@ export function RunMonitor({ runId }: RunMonitorProps) {
 
   const { data: items } = usePolling<ResearchItem[]>({
     fetcher: (signal) => getItems(runId, signal),
+    key: `items:${runId}`,
     interval: () => {
       if (runStatus && isTerminal(runStatus.status)) return null;
       const s = runStatus?.status;

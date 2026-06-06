@@ -211,6 +211,7 @@ describe("Dashboard (SCR-2)", () => {
   });
 
   it("removes a tracked run from the dashboard", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     localStorage.setItem(
       "dro.trackedRuns",
       JSON.stringify([
@@ -270,6 +271,7 @@ describe("Dashboard (SCR-2)", () => {
       }),
     );
 
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining("run-remove-test"));
     await waitFor(() =>
       expect(screen.queryByText("削除対象のリサーチ")).not.toBeInTheDocument(),
     );
@@ -281,6 +283,7 @@ describe("Dashboard (SCR-2)", () => {
   });
 
   it("removes a tracked run locally when backend delete returns 404", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     localStorage.setItem(
       "dro.trackedRuns",
       JSON.stringify([
@@ -326,10 +329,169 @@ describe("Dashboard (SCR-2)", () => {
       }),
     );
 
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining("run-already-gone"));
     await waitFor(() =>
       expect(screen.queryByText("削除済みのリサーチ")).not.toBeInTheDocument(),
     );
     expect(JSON.parse(localStorage.getItem("dro.trackedRuns") ?? "[]")).toEqual([]);
+  });
+
+  it("does not delete an active tracked run when confirmation is cancelled", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    localStorage.setItem(
+      "dro.trackedRuns",
+      JSON.stringify([
+        {
+          run_id: "run-cancel-active-delete",
+          title: "削除キャンセル対象",
+          max_total_iterations: 5,
+          created_at: new Date().toISOString(),
+          last_status: "waiting_deep_research",
+        },
+      ]),
+    );
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/research-runs/human-reviews")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith("/research-runs/run-cancel-active-delete") && init?.method !== "DELETE") {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              run_id: "run-cancel-active-delete",
+              status: "waiting_deep_research",
+              done_reason: null,
+              needs_human_review: false,
+              progress: {
+                targeted_rerun_runs: 1,
+                llm_patch_runs: 0,
+                total_reviews: 0,
+                latest_verdict: null,
+                latest_score: null,
+                total_tool_calls: 0,
+                estimated_cost_usd: 0,
+              },
+            }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 204,
+        json: () => Promise.resolve({}),
+      } as Response);
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.click(
+      screen.getByRole("button", {
+        name: "停止して削除: 削除キャンセル対象",
+      }),
+    );
+
+    expect(screen.getByText("削除キャンセル対象")).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "http://localhost:8000/research-runs/run-cancel-active-delete",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(JSON.parse(localStorage.getItem("dro.trackedRuns") ?? "[]")).toHaveLength(1);
+  });
+
+  it("does not delete a terminal tracked run when confirmation is cancelled", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    localStorage.setItem(
+      "dro.trackedRuns",
+      JSON.stringify([
+        {
+          run_id: "run-cancel-terminal-delete",
+          title: "完了run削除キャンセル対象",
+          max_total_iterations: 5,
+          created_at: new Date().toISOString(),
+          last_status: "completed",
+        },
+      ]),
+    );
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve([]),
+    } as Response);
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.click(
+      screen.getByRole("button", {
+        name: "削除: 完了run削除キャンセル対象",
+      }),
+    );
+
+    expect(screen.getByText("完了run削除キャンセル対象")).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "http://localhost:8000/research-runs/run-cancel-terminal-delete",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(JSON.parse(localStorage.getItem("dro.trackedRuns") ?? "[]")).toHaveLength(1);
+  });
+
+  it("shows a visible error when tracked run deletion fails", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    localStorage.setItem(
+      "dro.trackedRuns",
+      JSON.stringify([
+        {
+          run_id: "run-delete-fails",
+          title: "削除失敗対象",
+          max_total_iterations: 5,
+          created_at: new Date().toISOString(),
+          last_status: "completed",
+        },
+      ]),
+    );
+    globalThis.fetch = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/research-runs/human-reviews")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith("/research-runs/run-delete-fails") && init?.method === "DELETE") {
+        return Promise.resolve({
+          ok: false,
+          status: 500,
+          json: () => Promise.resolve({ detail: "Delete service unavailable" }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve([]),
+      } as Response);
+    });
+
+    render(<App />);
+
+    await userEvent.click(
+      screen.getByRole("button", {
+        name: "削除: 削除失敗対象",
+      }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "run run-delete-fails の削除に失敗しました。Delete service unavailable",
+    );
+    expect(screen.getByText("削除失敗対象")).toBeInTheDocument();
+    expect(JSON.parse(localStorage.getItem("dro.trackedRuns") ?? "[]")).toHaveLength(1);
   });
 
   it("removes a stale tracked run when dashboard polling returns 404", async () => {
@@ -464,6 +626,7 @@ describe("Dashboard (SCR-2)", () => {
   });
 
   it("deletes a human-review queue item from the backend queue", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     const runId = "queue-delete-run";
     globalThis.fetch = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
@@ -517,6 +680,7 @@ describe("Dashboard (SCR-2)", () => {
       }),
     );
 
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining(runId));
     await waitFor(() => expect(screen.queryByText(runId)).not.toBeInTheDocument());
     expect(globalThis.fetch).toHaveBeenCalledWith(
       `http://localhost:8000/research-runs/${runId}`,

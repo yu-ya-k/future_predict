@@ -37,6 +37,7 @@ def build_phase_3_graph(*, checkpointer: Any | None = None) -> Any:
     builder.add_node("finalize", _terminal_node("finalize"))
     builder.add_node("human_review", node_human_review)
     builder.add_node("partial_finalize", _terminal_node("partial_finalize"))
+    builder.add_node("human_review_rejected", _terminal_node("human_review_rejected"))
 
     builder.add_edge(START, "deep_research_collect")
     builder.add_edge("deep_research_collect", "review")
@@ -69,10 +70,12 @@ def build_phase_3_graph(*, checkpointer: Any | None = None) -> Any:
             "revise_research_items": "human_review",
             "finalize_with_limitation": "partial_finalize",
             "partial_finalize": "partial_finalize",
+            "human_review_rejected": "human_review_rejected",
         },
     )
     builder.add_edge("finalize", END)
     builder.add_edge("partial_finalize", END)
+    builder.add_edge("human_review_rejected", END)
     return builder.compile(checkpointer=checkpointer)
 
 
@@ -92,6 +95,7 @@ def build_phase_4_graph(*, checkpointer: Any) -> Any:
     builder.add_node("deep_research_submit", _deep_research_submit_node)
     builder.add_node("deep_research_collect", _deep_research_collect_node)
     builder.add_node("partial_finalize", _terminal_node("partial_finalize"))
+    builder.add_node("human_review_rejected", _terminal_node("human_review_rejected"))
 
     builder.add_edge(START, "human_review")
     builder.add_conditional_edges(
@@ -107,6 +111,7 @@ def build_phase_4_graph(*, checkpointer: Any) -> Any:
             "revise_research_items": "human_review",
             "finalize_with_limitation": "partial_finalize",
             "partial_finalize": "partial_finalize",
+            "human_review_rejected": "human_review_rejected",
         },
     )
     builder.add_edge("llm_finalize", "review")
@@ -128,6 +133,7 @@ def build_phase_4_graph(*, checkpointer: Any) -> Any:
     )
     builder.add_edge("finalize", END)
     builder.add_edge("partial_finalize", END)
+    builder.add_edge("human_review_rejected", END)
     return builder.compile(checkpointer=checkpointer)
 
 
@@ -206,5 +212,5 @@ def _graph_route_after_human_review(state: GraphState) -> str:
     if action == HumanReviewAction.REQUEST_ITEM_REVISION:
         return "revise_research_items"
     if action == HumanReviewAction.REJECT:
-        return "partial_finalize"
+        return "human_review_rejected"
     raise ValueError(f"Invalid human review action: {action_value!r}")

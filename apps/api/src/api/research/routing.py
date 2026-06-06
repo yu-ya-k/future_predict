@@ -38,9 +38,6 @@ def route_after_review(state: RouteState) -> ReviewRoute:
     review = state.get("review", {})
     verdict = _string_value(review.get("verdict", Verdict.HUMAN_REVIEW))
 
-    if verdict == Verdict.PASS.value:
-        return "finalize"
-
     if verdict == Verdict.HUMAN_REVIEW.value:
         return "human_review"
 
@@ -58,6 +55,14 @@ def route_after_review(state: RouteState) -> ReviewRoute:
 
     if _hard_stop_reached(state):
         return "human_review"
+
+    if verdict == Verdict.PASS.value:
+        actions = _aggregate_actions(review.get("item_assessments"))
+        if actions and actions <= {RecommendedAction.NONE.value}:
+            return "finalize"
+        if actions:
+            return "human_review"
+        return "finalize"
 
     if verdict == Verdict.NEEDS_ITEM_REVISION.value:
         return "revise_research_items"

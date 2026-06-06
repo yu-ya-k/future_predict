@@ -67,9 +67,79 @@ def test_route_after_review_security_concern_requires_human_review() -> None:
         }
     )
 
-    # Pass is the terminal success signal; security concerns should be expressed
-    # by the reviewer as human_review rather than pass.
-    assert route == "finalize"
+    assert route == "human_review"
+
+
+def test_route_after_review_pass_with_low_confidence_requires_human_review() -> None:
+    route = route_after_review(
+        {
+            "review": {
+                "verdict": Verdict.PASS.value,
+                "reviewer_confidence": 60,
+                "high_risk_flags": [],
+                "security_concerns": [],
+            }
+        }
+    )
+
+    assert route == "human_review"
+
+
+def test_route_after_review_pass_with_high_risk_flag_requires_human_review() -> None:
+    route = route_after_review(
+        {
+            "review": {
+                "verdict": Verdict.PASS.value,
+                "reviewer_confidence": 90,
+                "high_risk_flags": ["regulated advice"],
+                "security_concerns": [],
+            }
+        }
+    )
+
+    assert route == "human_review"
+
+
+def test_route_after_review_pass_with_hard_stop_requires_human_review() -> None:
+    route = route_after_review(
+        {
+            "review": {
+                "verdict": Verdict.PASS.value,
+                "reviewer_confidence": 90,
+                "high_risk_flags": [],
+                "security_concerns": [],
+            },
+            "total_reviews": 5,
+            "max_total_iterations": 5,
+        }
+    )
+
+    assert route == "human_review"
+
+
+def test_route_after_review_pass_with_item_action_requires_human_review() -> None:
+    route = route_after_review(
+        {
+            "review": {
+                "verdict": Verdict.PASS.value,
+                "reviewer_confidence": 90,
+                "high_risk_flags": [],
+                "security_concerns": [],
+                "item_assessments": [
+                    {
+                        "item_id": "RI-001",
+                        "status": "partial",
+                        "severity": "major",
+                        "failure_mode": "needs_deeper_search",
+                        "failure_mode_confidence": 90,
+                        "recommended_action": "targeted_rerun",
+                    }
+                ],
+            }
+        }
+    )
+
+    assert route == "human_review"
 
 
 def test_route_after_review_uses_deterministic_priority_for_mixed_actions() -> None:
@@ -181,3 +251,25 @@ def test_phase_4_graph_routes_human_llm_patch_action_with_v2_route_name() -> Non
     )
 
     assert resumed["visited_llm_finalize"] is True
+
+
+def test_phase_4_graph_routes_human_reject_to_rejected_terminal() -> None:
+    checkpointer = MemorySaver()
+    graph = build_phase_4_graph(checkpointer=checkpointer)
+    config = {"configurable": {"thread_id": "thread-v2-reject"}}
+
+    initial = graph.invoke(
+        {
+            "review": {"rationale": "manual decision required"},
+            "report": "draft",
+        },
+        config=config,
+    )
+    assert "__interrupt__" in initial
+
+    resumed = graph.invoke(
+        Command(resume={"action": HumanReviewAction.REJECT.value}),
+        config=config,
+    )
+
+    assert resumed["graph_terminal"] == "human_review_rejected"

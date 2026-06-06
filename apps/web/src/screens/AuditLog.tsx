@@ -323,6 +323,7 @@ export function AuditLog({ runId }: AuditLogProps) {
 
   const { data, loading, error, refetch } = usePolling<AuditResponse>({
     fetcher: (signal) => getAudit(runId, signal),
+    key: `audit:${runId}`,
     // One-shot fetch (GAP-6: audit is append-only; refetch on tab change if needed)
     interval: () => null,
   });

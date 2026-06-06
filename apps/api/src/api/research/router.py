@@ -251,7 +251,13 @@ def cancel_run(
     orchestrator: OrchestratorDependency,
 ) -> CancelResponse:
     _get_run_or_404(orchestrator, run_id)
-    run = orchestrator.cancel_run(run_id)
+    try:
+        run = orchestrator.cancel_run(run_id)
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        ) from error
     return CancelResponse(run_id=run.id, status=run.status)
 
 

@@ -90,6 +90,9 @@ class ResearchRepository:
                     total_tool_calls INTEGER NOT NULL DEFAULT 0,
                     estimated_cost_usd REAL NOT NULL DEFAULT 0,
                     terminal_status TEXT,
+                    review_claim_token TEXT,
+                    review_claim_operation TEXT,
+                    review_claim_expires_at TEXT,
                     warnings TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -247,6 +250,9 @@ class ResearchRepository:
             "max_llm_patch_runs": "INTEGER NOT NULL DEFAULT 3",
             "max_verification_runs": "INTEGER NOT NULL DEFAULT 3",
             "terminal_status": "TEXT",
+            "review_claim_token": "TEXT",
+            "review_claim_operation": "TEXT",
+            "review_claim_expires_at": "TEXT",
         }
         for name, definition in columns.items():
             if name not in existing:
@@ -365,6 +371,70 @@ class ResearchRepository:
 
         return self.get_run(run_id)
 
+    def claim_review_operation(
+        self,
+        run_id: UUID,
+        *,
+        operation: str,
+        lease_seconds: int,
+    ) -> tuple[ResearchRunRecord, str] | None:
+        now = utc_now()
+        expires_at = now + timedelta(seconds=lease_seconds)
+        token = str(uuid4())
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE research_runs
+                SET review_claim_token = ?,
+                    review_claim_operation = ?,
+                    review_claim_expires_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status = ?
+                  AND needs_human_review = 0
+                  AND (
+                      review_claim_token IS NULL
+                      OR review_claim_expires_at IS NULL
+                      OR review_claim_expires_at <= ?
+                  )
+                """,
+                (
+                    token,
+                    operation,
+                    expires_at.isoformat(),
+                    now.isoformat(),
+                    str(run_id),
+                    RunStatus.REVIEWING.value,
+                    now.isoformat(),
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM research_runs WHERE id = ?",
+                (str(run_id),),
+            ).fetchone()
+
+        if row is None:
+            raise KeyError(str(run_id))
+        return self._row_to_run(row), token
+
+    def release_review_operation(self, run_id: UUID, *, claim_token: str) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE research_runs
+                SET review_claim_token = NULL,
+                    review_claim_operation = NULL,
+                    review_claim_expires_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                  AND review_claim_token = ?
+                """,
+                (utc_now().isoformat(), str(run_id), claim_token),
+            )
+        return cursor.rowcount == 1
+
     def list_timed_out_runs(self, *, timeout_seconds: int) -> list[ResearchRunRecord]:
         cutoff = utc_now() - timedelta(seconds=timeout_seconds)
         with self.connect() as connection:
@@ -398,6 +468,7 @@ class ResearchRepository:
 
     def list_stale_reviewing_runs(self, *, timeout_seconds: int) -> list[ResearchRunRecord]:
         cutoff = utc_now() - timedelta(seconds=timeout_seconds)
+        now = utc_now()
         with self.connect() as connection:
             rows = connection.execute(
                 """
@@ -407,6 +478,11 @@ class ResearchRepository:
                   ON h.run_id = r.id
                 WHERE r.status = ?
                   AND r.needs_human_review = 0
+                  AND (
+                      r.review_claim_token IS NULL
+                      OR r.review_claim_expires_at IS NULL
+                      OR r.review_claim_expires_at <= ?
+                  )
                   AND h.created_at <= ?
                   AND json_extract(h.event_json, '$.step') IN (
                       'review_attempt_started',
@@ -428,7 +504,7 @@ class ResearchRepository:
                 ORDER BY MIN(h.created_at) ASC
                 LIMIT 25
                 """,
-                (RunStatus.REVIEWING.value, cutoff.isoformat()),
+                (RunStatus.REVIEWING.value, now.isoformat(), cutoff.isoformat()),
             ).fetchall()
 
         return [self._row_to_run(row) for row in rows]
@@ -1239,6 +1315,13 @@ class ResearchRepository:
             total_tool_calls=row["total_tool_calls"],
             estimated_cost_usd=row["estimated_cost_usd"],
             terminal_status=row["terminal_status"],
+            review_claim_token=row["review_claim_token"],
+            review_claim_operation=row["review_claim_operation"],
+            review_claim_expires_at=(
+                _parse_dt(row["review_claim_expires_at"])
+                if row["review_claim_expires_at"]
+                else None
+            ),
             warnings=_json_load(row["warnings"], []),
             created_at=_parse_dt(row["created_at"]),
             updated_at=_parse_dt(row["updated_at"]),
