@@ -1,40 +1,368 @@
-import { render, screen } from "@testing-library/react";
+/**
+ * App-level integration tests.
+ *
+ * Covers:
+ *  1. App renders the dashboard with empty state when no tracked runs.
+ *  2. NewResearch: start button disabled until prompt is entered; enabled after.
+ *  3. HumanReview: actions not in allowed_actions are disabled; allowed actions enabled.
+ *  4. App shell renders nav links.
+ *  5. Settings page renders options and policy table.
+ *
+ * Strategy:
+ *  - Stub VITE_API_BASE_URL via vi.stubEnv.
+ *  - Mock fetch with vi.fn() returning resolved promises.
+ *  - Stub window.scrollTo to silence jsdom's "not implemented".
+ *  - Navigate by setting window.location.hash directly before rendering.
+ *  - Use real timers — no fake timers (avoids async/timeout interaction).
+ *  - Clean up with cleanup() + localStorage.clear() in afterEach.
+ */
+
+import { render, screen, cleanup, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
 
-const originalFetch = globalThis.fetch;
+// ── Global jsdom stubs ────────────────────────────────────────────────────────
 
-describe("App", () => {
-  beforeEach(() => {
-    vi.stubEnv("VITE_API_BASE_URL", "http://localhost:8000");
+// jsdom doesn't implement window.scrollTo
+Object.defineProperty(window, "scrollTo", { value: vi.fn(), writable: true });
+
+// Notification API stub
+if (!("Notification" in window)) {
+  Object.defineProperty(window, "Notification", {
+    value: class MockNotification {
+      static permission: NotificationPermission = "default";
+      static async requestPermission() {
+        return "default" as NotificationPermission;
+      }
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      constructor(title: string, options?: NotificationOptions) {}
+    },
+    writable: true,
   });
+}
 
-  afterEach(() => {
-    globalThis.fetch = originalFetch;
-    vi.unstubAllEnvs();
-    vi.restoreAllMocks();
-  });
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-  it("shows configured API base URL", () => {
-    render(<App />);
+function clearStorage() {
+  localStorage.clear();
+}
 
-    expect(screen.getByText("http://localhost:8000")).toBeInTheDocument();
-  });
+// ── Setup / teardown ──────────────────────────────────────────────────────────
 
-  it("checks API health", async () => {
+beforeEach(() => {
+  vi.stubEnv("VITE_API_BASE_URL", "http://localhost:8000");
+  clearStorage();
+  window.location.hash = "#/";
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+  cleanup();
+  clearStorage();
+});
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+describe("App shell", () => {
+  it("renders nav links for dashboard, new research and settings", () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ status: "ok", env: "test" }),
+      status: 200,
+      json: () => Promise.resolve([]),
     } as Response);
 
     render(<App />);
 
-    await userEvent.click(screen.getByRole("button", { name: /check api health/i }));
+    expect(screen.getByRole("link", { name: /ダッシュボード/i })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /新規リサーチ/i })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /設定/i })).toBeInTheDocument();
+  });
 
-    expect(await screen.findByText("ok (test)")).toBeInTheDocument();
-    expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:8000/health");
+  it("renders skip link pointing to main-content", () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve([]),
+    } as Response);
+
+    render(<App />);
+
+    const skip = screen.getByText(/メインコンテンツへスキップ/i);
+    expect(skip).toBeInTheDocument();
+    expect(skip).toHaveAttribute("href", "#main-content");
+  });
+
+  it("renders main element with id main-content", () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve([]),
+    } as Response);
+
+    render(<App />);
+    expect(document.getElementById("main-content")).toBeInTheDocument();
   });
 });
 
+describe("Dashboard (SCR-2)", () => {
+  it("shows empty state for active runs when localStorage is empty", () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve([]),
+    } as Response);
+
+    render(<App />);
+
+    expect(screen.getByText(/進行中のrunなし/i)).toBeInTheDocument();
+  });
+
+  it("shows reviewer ID prompt in the queue band when no reviewer id is set", () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve([]),
+    } as Response);
+
+    render(<App />);
+
+    expect(screen.getByText(/レビュアーIDが必要です/i)).toBeInTheDocument();
+  });
+
+  it("renders the 要対応 section heading", () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve([]),
+    } as Response);
+
+    render(<App />);
+
+    expect(screen.getByText("要対応")).toBeInTheDocument();
+  });
+});
+
+describe("NewResearch (SCR-1)", () => {
+  beforeEach(() => {
+    window.location.hash = "#/new";
+  });
+
+  it("start button is disabled when prompt is empty", () => {
+    render(<App />);
+
+    const button = screen.getByRole("button", { name: /リサーチを開始/i });
+    expect(button).toBeDisabled();
+  });
+
+  it("start button becomes enabled after entering a prompt", async () => {
+    render(<App />);
+
+    const textarea = screen.getByRole("textbox", { name: /リサーチ内容/i });
+    await userEvent.type(textarea, "日本のAI政策について調査してください");
+
+    const button = screen.getByRole("button", { name: /リサーチを開始/i });
+    expect(button).not.toBeDisabled();
+  });
+
+  it("shows character counter", () => {
+    render(<App />);
+
+    const counter = screen.getByText(/残り.*文字/i);
+    expect(counter).toBeInTheDocument();
+  });
+
+  it("renders all 4 context classification options", () => {
+    render(<App />);
+
+    expect(screen.getByText("公開情報")).toBeInTheDocument();
+    expect(screen.getByText("社内情報")).toBeInTheDocument();
+    expect(screen.getByText("機密情報")).toBeInTheDocument();
+    expect(screen.getByText("混合")).toBeInTheDocument();
+  });
+
+  it("submits a run and navigates to monitor on success", async () => {
+    const runId = "run-test-abc-123";
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 202,
+      json: () =>
+        Promise.resolve({
+          run_id: runId,
+          thread_id: "thread-1",
+          status: "queued",
+          created_at: new Date().toISOString(),
+        }),
+    } as Response);
+
+    render(<App />);
+
+    const textarea = screen.getByRole("textbox", { name: /リサーチ内容/i });
+    await userEvent.type(textarea, "テスト用プロンプト");
+
+    const button = screen.getByRole("button", { name: /リサーチを開始/i });
+    await userEvent.click(button);
+
+    await waitFor(() => {
+      expect(window.location.hash).toContain(runId);
+    });
+  });
+
+  it("shows error when API fails", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      json: () => Promise.resolve({ detail: "Internal server error" }),
+    } as Response);
+
+    render(<App />);
+
+    const textarea = screen.getByRole("textbox", { name: /リサーチ内容/i });
+    await userEvent.type(textarea, "テスト用プロンプト");
+
+    const button = screen.getByRole("button", { name: /リサーチを開始/i });
+    await userEvent.click(button);
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toBeInTheDocument();
+    });
+  });
+});
+
+describe("HumanReview (SCR-4)", () => {
+  const runId = "run-hr-test";
+
+  function makePayload(allowedActions: string[]) {
+    return {
+      run_id: runId,
+      reason: "スコアが閾値以下です",
+      latest_report: "# テストレポート\n\nサンプル内容",
+      latest_review: {
+        review_no: 1,
+        verdict: "human_review",
+        recommended_route: "human_review",
+        goal_achieved: false,
+        score: 42,
+        rationale: "要改善",
+        gaps: ["データ不足"],
+        factuality_concerns: [],
+        source_quality_concerns: [],
+        next_instructions: null,
+        can_be_fixed_by_llm: false,
+        requires_new_external_research: true,
+        reviewer_confidence: 80,
+        high_risk_flags: [],
+        public_web_search_used: false,
+      },
+      allowed_actions: allowedActions,
+      audit_summary: {
+        deep_research_runs: 2,
+        llm_fix_runs: 1,
+        total_reviews: 3,
+        no_progress_count: 1,
+        total_tool_calls: 45,
+        estimated_cost_usd: 1.23,
+      },
+      warnings: [],
+    };
+  }
+
+  beforeEach(() => {
+    window.location.hash = `#/runs/${runId}/review`;
+    localStorage.setItem("dro.reviewerId", "test-reviewer");
+  });
+
+  it("shows the stop-reason banner", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve(makePayload(["approve", "reject"])),
+    } as Response);
+
+    render(<App />);
+
+    expect(await screen.findByText("スコアが閾値以下です")).toBeInTheDocument();
+  });
+
+  it("disables actions not in allowed_actions", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve(makePayload(["approve", "reject"])),
+    } as Response);
+
+    render(<App />);
+
+    // Wait for payload to load (buttons are rendered after fetch)
+    const llmFixBtn = await screen.findByRole("button", { name: /軽微修正/i });
+    const deepResearchBtn = screen.getByRole("button", { name: /再調査/i });
+
+    expect(llmFixBtn).toBeDisabled();
+    expect(deepResearchBtn).toBeDisabled();
+  });
+
+  it("enables actions that are in allowed_actions", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve(makePayload(["approve", "reject"])),
+    } as Response);
+
+    render(<App />);
+
+    const approveBtn = await screen.findByRole("button", { name: /承認/i });
+    const rejectBtn = screen.getByRole("button", { name: /却下/i });
+
+    expect(approveBtn).not.toBeDisabled();
+    expect(rejectBtn).not.toBeDisabled();
+  });
+
+  it("shows reviewer ID setup screen when reviewer id is not set", async () => {
+    // Ensure no reviewer id — beforeEach sets it, remove it here
+    localStorage.removeItem("dro.reviewerId");
+
+    // With no reviewerId, ReviewerRequiredError is thrown client-side before fetch
+    globalThis.fetch = vi.fn();
+
+    render(<App />);
+
+    // The setup button should appear once the component detects missing reviewer id
+    const setupBtn = await screen.findByRole("button", { name: /設定して続ける/i });
+    expect(setupBtn).toBeInTheDocument();
+  });
+});
+
+describe("Settings (SCR-7)", () => {
+  beforeEach(() => {
+    window.location.hash = "#/settings";
+  });
+
+  it("renders the settings page with default option inputs", () => {
+    render(<App />);
+
+    expect(screen.getByText(/デフォルトオプション/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/最大Deep Research回数/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/最大LLM修正回数/i)).toBeInTheDocument();
+  });
+
+  it("shows web search policy table with rows for all context types", () => {
+    render(<App />);
+
+    expect(screen.getByText(/Web検索ポリシー/i)).toBeInTheDocument();
+    // Header + 4 data rows = at least 5 rows
+    const rows = screen.getAllByRole("row");
+    expect(rows.length).toBeGreaterThanOrEqual(5);
+  });
+
+  it("persists saved defaults to localStorage", async () => {
+    render(<App />);
+
+    const saveBtn = screen.getByRole("button", { name: /^保存$/i });
+    await userEvent.click(saveBtn);
+
+    const stored = localStorage.getItem("dro.defaults");
+    expect(stored).not.toBeNull();
+  });
+});

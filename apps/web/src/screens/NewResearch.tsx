@@ -1,0 +1,387 @@
+/**
+ * SCR-1: New Research — create a new research run.
+ *
+ * Integrations:
+ *  - I-1: web_search is disabled for internal/confidential; mixed → public-claim note.
+ *  - OPTION_BOUNDS: bounded numeric inputs.
+ *  - requestNotificationPermission before submit.
+ *  - createRun → trackRun → navigate to monitor.
+ *
+ * NOTE: The "auto brief preview/edit" feature requires a backend endpoint that
+ * returns a structured brief before the run starts. This is a future backend
+ * feature (SCR-1 整合注記); we go straight to the run after create.
+ */
+
+import { useEffect, useRef, useState } from "react";
+
+import { WebSearchBadge } from "../components";
+import { createRun } from "../api/research";
+import { ApiError } from "../api/client";
+import { requestNotificationPermission } from "../notifications";
+import { navigate, routes } from "../router";
+import { trackRun } from "../runStore";
+import { OPTION_BOUNDS, type ContextClassification } from "../types";
+
+const MAX_PROMPT_CHARS = 50_000;
+const DEFAULTS_STORAGE_KEY = "dro.defaults";
+
+interface Defaults {
+  max_deep_research_runs?: number;
+  max_llm_fix_runs?: number;
+  max_total_iterations?: number;
+  max_no_progress_rounds?: number;
+  max_cost_usd?: number;
+  max_total_tool_calls?: number;
+}
+
+function loadDefaults(): Defaults {
+  try {
+    const raw = localStorage.getItem(DEFAULTS_STORAGE_KEY);
+    if (!raw) return {};
+    return JSON.parse(raw) as Defaults;
+  } catch {
+    return {};
+  }
+}
+
+function deriveWebSearch(ctx: ContextClassification): boolean {
+  // I-1: only public allows web search
+  return ctx === "public";
+}
+
+const CONTEXT_OPTIONS: { value: ContextClassification; label: string; description: string }[] = [
+  { value: "public", label: "公開情報", description: "公開情報のみ。Web検索を有効化できます。" },
+  { value: "internal", label: "社内情報", description: "社内情報を含む。Web検索は無効です。" },
+  { value: "confidential", label: "機密情報", description: "機密扱い。Web検索は無効です。" },
+  { value: "mixed", label: "混合", description: "公開・社内が混在。公開主張の範囲のみ。" },
+];
+
+export function NewResearch() {
+  const defaults = useRef(loadDefaults());
+
+  const [prompt, setPrompt] = useState("");
+  const [context, setContext] = useState<ContextClassification>("public");
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Advanced options — initialised from localStorage defaults
+  const [maxDeepResearch, setMaxDeepResearch] = useState(
+    defaults.current.max_deep_research_runs ?? 3,
+  );
+  const [maxLlmFix, setMaxLlmFix] = useState(defaults.current.max_llm_fix_runs ?? 3);
+  const [maxIterations, setMaxIterations] = useState(defaults.current.max_total_iterations ?? 10);
+  const [maxNoProgress, setMaxNoProgress] = useState(
+    defaults.current.max_no_progress_rounds ?? 3,
+  );
+  const [maxCost, setMaxCost] = useState(defaults.current.max_cost_usd ?? 5.0);
+  const [maxToolCalls, setMaxToolCalls] = useState(defaults.current.max_total_tool_calls ?? 200);
+
+  // Reload defaults when storage changes (e.g. from Settings tab)
+  useEffect(() => {
+    function onStorage(e: StorageEvent) {
+      if (e.key !== DEFAULTS_STORAGE_KEY) return;
+      const d = loadDefaults();
+      if (d.max_deep_research_runs !== undefined) setMaxDeepResearch(d.max_deep_research_runs);
+      if (d.max_llm_fix_runs !== undefined) setMaxLlmFix(d.max_llm_fix_runs);
+      if (d.max_total_iterations !== undefined) setMaxIterations(d.max_total_iterations);
+      if (d.max_no_progress_rounds !== undefined) setMaxNoProgress(d.max_no_progress_rounds);
+      if (d.max_cost_usd !== undefined) setMaxCost(d.max_cost_usd);
+      if (d.max_total_tool_calls !== undefined) setMaxToolCalls(d.max_total_tool_calls);
+    }
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+
+  const webSearchAllowed = deriveWebSearch(context);
+  const promptTrimmed = prompt.trim();
+  const canSubmit = promptTrimmed.length > 0 && promptTrimmed.length <= MAX_PROMPT_CHARS && !submitting;
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!canSubmit) return;
+    setSubmitting(true);
+    setError(null);
+
+    try {
+      await requestNotificationPermission();
+
+      const response = await createRun({
+        user_prompt: promptTrimmed,
+        options: {
+          context_classification: context,
+          allow_web_search: webSearchAllowed,
+          max_deep_research_runs: maxDeepResearch,
+          max_llm_fix_runs: maxLlmFix,
+          max_total_iterations: maxIterations,
+          max_no_progress_rounds: maxNoProgress,
+          max_cost_usd: maxCost,
+          max_total_tool_calls: maxToolCalls,
+        },
+      });
+
+      // Derive title from first line of prompt
+      const title = promptTrimmed.split("\n")[0].slice(0, 120);
+
+      trackRun({
+        run_id: response.run_id,
+        title,
+        context_classification: context,
+        web_search_allowed: webSearchAllowed,
+        max_cost_usd: maxCost,
+        max_total_iterations: maxIterations,
+        created_at: response.created_at,
+        last_status: response.status,
+      });
+
+      navigate(routes().monitor(response.run_id));
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setError(err.detail ?? err.message);
+      } else if (err instanceof Error) {
+        setError(err.message);
+      } else {
+        setError("予期しないエラーが発生しました");
+      }
+      setSubmitting(false);
+    }
+  }
+
+  const remaining = MAX_PROMPT_CHARS - prompt.length;
+  const overLimit = prompt.length > MAX_PROMPT_CHARS;
+
+  return (
+    <div className="screen-new">
+      <header className="screen-header">
+        <h1 className="screen-title">新規リサーチを開始</h1>
+        <p className="screen-subtitle">
+          調査したい内容を入力してください。AIが段階的にリサーチを行い、品質レビューを経て最終レポートを生成します。
+        </p>
+      </header>
+
+      <form className="new-research-form" onSubmit={handleSubmit} noValidate>
+        {/* Prompt textarea */}
+        <section className="form-section">
+          <label className="form-label" htmlFor="prompt">
+            リサーチ内容
+            <span className="form-required" aria-hidden="true">*</span>
+          </label>
+          <textarea
+            id="prompt"
+            className={`prompt-textarea${overLimit ? " prompt-textarea--error" : ""}`}
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            placeholder="調査したいテーマや質問を入力してください..."
+            rows={10}
+            aria-describedby="prompt-count"
+            disabled={submitting}
+            required
+          />
+          <div className="prompt-meta">
+            <span
+              id="prompt-count"
+              className={`char-counter${overLimit ? " char-counter--error" : ""}`}
+              aria-live="polite"
+            >
+              {overLimit
+                ? `${Math.abs(remaining).toLocaleString()} 文字オーバー`
+                : `残り ${remaining.toLocaleString()} 文字`}
+            </span>
+          </div>
+        </section>
+
+        {/* Context classification */}
+        <section className="form-section">
+          <div className="form-label-row">
+            <span className="form-label" id="context-label">機密区分</span>
+            <WebSearchBadge
+              webSearchAllowed={webSearchAllowed}
+              context={context}
+              showReason
+              size="sm"
+            />
+          </div>
+          {context === "mixed" && (
+            <p className="mixed-note" role="note">
+              混合区分では公開情報の主張範囲のみWeb検索が許可されます。
+            </p>
+          )}
+          <div
+            className="context-cards"
+            role="radiogroup"
+            aria-labelledby="context-label"
+          >
+            {CONTEXT_OPTIONS.map((opt) => (
+              <label
+                key={opt.value}
+                className={`context-card${context === opt.value ? " context-card--selected" : ""}`}
+              >
+                <input
+                  type="radio"
+                  name="context"
+                  value={opt.value}
+                  checked={context === opt.value}
+                  onChange={() => setContext(opt.value)}
+                  disabled={submitting}
+                  className="sr-only"
+                />
+                <span className="context-card-label">{opt.label}</span>
+                <span className="context-card-desc">{opt.description}</span>
+              </label>
+            ))}
+          </div>
+        </section>
+
+        {/* Advanced options (collapsible) */}
+        <section className="form-section">
+          <button
+            type="button"
+            className="advanced-toggle"
+            aria-expanded={showAdvanced}
+            onClick={() => setShowAdvanced(!showAdvanced)}
+          >
+            <span className="advanced-toggle-icon" aria-hidden="true">
+              {showAdvanced ? "▲" : "▼"}
+            </span>
+            詳細オプション
+          </button>
+
+          {showAdvanced && (
+            <div className="advanced-options" role="group" aria-label="詳細オプション">
+              <div className="options-grid">
+                <div className="option-field">
+                  <label className="option-label" htmlFor="max-deep-research">
+                    最大Deep Research回数
+                  </label>
+                  <input
+                    id="max-deep-research"
+                    type="number"
+                    className="option-input"
+                    value={maxDeepResearch}
+                    min={OPTION_BOUNDS.max_deep_research_runs.min}
+                    max={OPTION_BOUNDS.max_deep_research_runs.max}
+                    onChange={(e) => setMaxDeepResearch(Number(e.target.value))}
+                    disabled={submitting}
+                  />
+                  <span className="option-range">
+                    {OPTION_BOUNDS.max_deep_research_runs.min}–{OPTION_BOUNDS.max_deep_research_runs.max}
+                  </span>
+                </div>
+
+                <div className="option-field">
+                  <label className="option-label" htmlFor="max-llm-fix">
+                    最大LLM修正回数
+                  </label>
+                  <input
+                    id="max-llm-fix"
+                    type="number"
+                    className="option-input"
+                    value={maxLlmFix}
+                    min={OPTION_BOUNDS.max_llm_fix_runs.min}
+                    max={OPTION_BOUNDS.max_llm_fix_runs.max}
+                    onChange={(e) => setMaxLlmFix(Number(e.target.value))}
+                    disabled={submitting}
+                  />
+                  <span className="option-range">
+                    {OPTION_BOUNDS.max_llm_fix_runs.min}–{OPTION_BOUNDS.max_llm_fix_runs.max}
+                  </span>
+                </div>
+
+                <div className="option-field">
+                  <label className="option-label" htmlFor="max-iterations">
+                    最大反復回数
+                  </label>
+                  <input
+                    id="max-iterations"
+                    type="number"
+                    className="option-input"
+                    value={maxIterations}
+                    min={OPTION_BOUNDS.max_total_iterations.min}
+                    max={OPTION_BOUNDS.max_total_iterations.max}
+                    onChange={(e) => setMaxIterations(Number(e.target.value))}
+                    disabled={submitting}
+                  />
+                  <span className="option-range">
+                    {OPTION_BOUNDS.max_total_iterations.min}–{OPTION_BOUNDS.max_total_iterations.max}
+                  </span>
+                </div>
+
+                <div className="option-field">
+                  <label className="option-label" htmlFor="max-no-progress">
+                    最大停滞許容回数
+                  </label>
+                  <input
+                    id="max-no-progress"
+                    type="number"
+                    className="option-input"
+                    value={maxNoProgress}
+                    min={OPTION_BOUNDS.max_no_progress_rounds.min}
+                    max={OPTION_BOUNDS.max_no_progress_rounds.max}
+                    onChange={(e) => setMaxNoProgress(Number(e.target.value))}
+                    disabled={submitting}
+                  />
+                  <span className="option-range">
+                    {OPTION_BOUNDS.max_no_progress_rounds.min}–{OPTION_BOUNDS.max_no_progress_rounds.max}
+                  </span>
+                </div>
+
+                <div className="option-field">
+                  <label className="option-label" htmlFor="max-cost">
+                    最大コスト (USD)
+                  </label>
+                  <input
+                    id="max-cost"
+                    type="number"
+                    className="option-input"
+                    value={maxCost}
+                    min={0.5}
+                    max={100}
+                    step={0.5}
+                    onChange={(e) => setMaxCost(Number(e.target.value))}
+                    disabled={submitting}
+                  />
+                  <span className="option-range">$0.50–$100</span>
+                </div>
+
+                <div className="option-field">
+                  <label className="option-label" htmlFor="max-tool-calls">
+                    最大ツール呼び出し数
+                  </label>
+                  <input
+                    id="max-tool-calls"
+                    type="number"
+                    className="option-input"
+                    value={maxToolCalls}
+                    min={10}
+                    max={1000}
+                    step={10}
+                    onChange={(e) => setMaxToolCalls(Number(e.target.value))}
+                    disabled={submitting}
+                  />
+                  <span className="option-range">10–1000</span>
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
+
+        {error && (
+          <div className="form-error" role="alert">
+            <strong>エラー:</strong> {error}
+          </div>
+        )}
+
+        <div className="form-actions">
+          <button
+            type="submit"
+            className="btn-primary btn-start"
+            disabled={!canSubmit}
+            aria-busy={submitting}
+          >
+            {submitting ? "開始中..." : "リサーチを開始"}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}

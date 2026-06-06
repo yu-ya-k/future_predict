@@ -1,0 +1,109 @@
+/**
+ * Typed research-run endpoint functions (ui_plan.md A2-1).
+ *
+ * One function per real endpoint in router.py. Endpoints flagged with
+ * `reviewer: true` require the X-Reviewer-Id header (GAP-4).
+ */
+
+import type {
+  AuditResponse,
+  CancelResponse,
+  Citation,
+  CostEvent,
+  CreateResearchRunRequest,
+  CreateResearchRunResponse,
+  HumanReviewDecision,
+  HumanReviewPayload,
+  HumanReviewQueueItem,
+  HumanReviewResumeAPIRequest,
+  HumanReviewResumeResponse,
+  ReportResponse,
+  ResearchAttempt,
+  ResearchRunStatusResponse,
+  ReviewRecord,
+  ToolCallSummary,
+} from "../types";
+import { apiClient } from "./client";
+
+const BASE = "/research-runs";
+
+export function createRun(
+  request: CreateResearchRunRequest,
+  signal?: AbortSignal,
+): Promise<CreateResearchRunResponse> {
+  return apiClient.request(BASE, { method: "POST", body: request, signal });
+}
+
+/** Human-review queue. Requires X-Reviewer-Id. */
+export function listHumanReviews(signal?: AbortSignal): Promise<HumanReviewQueueItem[]> {
+  return apiClient.request(`${BASE}/human-reviews`, { reviewer: true, signal });
+}
+
+export function getRunStatus(
+  runId: string,
+  signal?: AbortSignal,
+): Promise<ResearchRunStatusResponse> {
+  return apiClient.request(`${BASE}/${runId}`, { signal });
+}
+
+export function getReport(runId: string, signal?: AbortSignal): Promise<ReportResponse> {
+  return apiClient.request(`${BASE}/${runId}/report`, { signal });
+}
+
+export function getAudit(runId: string, signal?: AbortSignal): Promise<AuditResponse> {
+  return apiClient.request(`${BASE}/${runId}/audit`, { signal });
+}
+
+export function getCitations(runId: string, signal?: AbortSignal): Promise<Citation[]> {
+  return apiClient.request(`${BASE}/${runId}/citations`, { signal });
+}
+
+export function getReviews(runId: string, signal?: AbortSignal): Promise<ReviewRecord[]> {
+  return apiClient.request(`${BASE}/${runId}/reviews`, { signal });
+}
+
+export function getAttempts(runId: string, signal?: AbortSignal): Promise<ResearchAttempt[]> {
+  return apiClient.request(`${BASE}/${runId}/attempts`, { signal });
+}
+
+export function getToolCalls(runId: string, signal?: AbortSignal): Promise<ToolCallSummary[]> {
+  return apiClient.request(`${BASE}/${runId}/tool-calls`, { signal });
+}
+
+export function getCostEvents(runId: string, signal?: AbortSignal): Promise<CostEvent[]> {
+  return apiClient.request(`${BASE}/${runId}/cost-events`, { signal });
+}
+
+/** Human-review interrupt payload. Requires X-Reviewer-Id. */
+export function getHumanReviewPayload(
+  runId: string,
+  signal?: AbortSignal,
+): Promise<HumanReviewPayload> {
+  return apiClient.request(`${BASE}/${runId}/human-review`, { reviewer: true, signal });
+}
+
+/** Human-decision log. Requires X-Reviewer-Id. */
+export function getHumanDecisions(
+  runId: string,
+  signal?: AbortSignal,
+): Promise<HumanReviewDecision[]> {
+  return apiClient.request(`${BASE}/${runId}/human-decisions`, { reviewer: true, signal });
+}
+
+export function cancelRun(runId: string, signal?: AbortSignal): Promise<CancelResponse> {
+  return apiClient.request(`${BASE}/${runId}/cancel`, { method: "POST", signal });
+}
+
+/** Submit a human-review decision. Requires X-Reviewer-Id. */
+export function resumeRun(
+  runId: string,
+  request: HumanReviewResumeAPIRequest,
+  signal?: AbortSignal,
+): Promise<HumanReviewResumeResponse> {
+  return apiClient.request(`${BASE}/${runId}/resume`, {
+    method: "POST",
+    body: request,
+    reviewer: true,
+    signal,
+  });
+}

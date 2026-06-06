@@ -1,0 +1,108 @@
+/* ================================================================
+   base.css — global resets, defaults and a11y primitives (ui_plan.md D5)
+   Loaded after tokens.css. Component- and screen-level styles live with
+   their owners (components/*.css, screens styles in App.css).
+================================================================ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+:root {
+  color: var(--ink);
+  background: var(--paper);
+  font-family: var(--sans);
+  font-size: var(--text-body);
+  line-height: var(--leading-normal);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--serif);
+  font-weight: var(--weight-medium);
+  line-height: var(--leading-tight);
+  margin: 0;
+}
+
+a {
+  color: var(--info);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+}
+
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+/* ── Focus ring — the only permitted box-shadow on controls (D5-3) ── */
+:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* ── Screen-reader-only helper ── */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ── Skip link (D5-6) ── */
+.skip-link {
+  position: absolute;
+  left: var(--space-3);
+  top: -48px;
+  z-index: var(--z-toast);
+  padding: var(--inset-sm);
+  background: var(--surface);
+  border: var(--border-emphasis);
+  border-radius: var(--radius-sm);
+  transition: top var(--duration-fast) var(--ease-out);
+}
+
+.skip-link:focus {
+  top: var(--space-3);
+}
+
+/* ── Reduced motion (D5-6) ── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
