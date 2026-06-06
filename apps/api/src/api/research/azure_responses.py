@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from openai import AzureOpenAI, OpenAI, OpenAIError
+from openai import APITimeoutError, AzureOpenAI, OpenAI, OpenAIError
 from pydantic import ValidationError
 
 from api.config import Settings
@@ -14,11 +14,25 @@ from api.research.extractors import (
 )
 from api.research.schemas import REVIEW_RESULT_SCHEMA, ReviewResult
 
+_CITATION_COMPACT_KEYS = (
+    "source_type",
+    "title",
+    "url",
+    "file_id",
+    "filename",
+    "start_index",
+    "end_index",
+)
+
 
 class ReviewResponseParseError(ValueError):
     def __init__(self, message: str, raw_response: dict[str, Any]) -> None:
         super().__init__(message)
         self.raw_response = raw_response
+
+
+class ReviewRequestTimeout(RuntimeError):
+    pass
 
 
 class AzureResponsesClient:
@@ -107,21 +121,35 @@ class AzureResponsesClient:
             acceptance_criteria=acceptance_criteria,
             report=report,
             citations=citations,
+            max_report_chars=self.settings.research_review_max_report_chars,
+            max_citations=self.settings.research_review_max_citations,
         )
-        tools = [{"type": "web_search"}]
+        tools = [{"type": "web_search"}] if self.settings.research_review_web_search_enabled else []
+        request_client = _client_with_timeout(
+            self.reviewer_client,
+            timeout=self.settings.research_review_timeout_seconds,
+        )
 
-        parse_method = getattr(self.reviewer_client.responses, "parse", None)
+        parse_method = getattr(request_client.responses, "parse", None)
         if callable(parse_method):
             try:
+                request: dict[str, Any] = {
+                    "model": self.reviewer_deployment,
+                    "input": prompt,
+                    "text_format": ReviewResult,
+                }
+                if tools:
+                    request["tools"] = tools
                 response = parse_method(
-                    model=self.reviewer_deployment,
-                    input=prompt,
-                    tools=tools,
-                    text_format=ReviewResult,
+                    **request,
                 )
                 parsed = getattr(response, "output_parsed", None)
                 if isinstance(parsed, ReviewResult):
                     return parsed, get_response_id(response), response_to_jsonable(response)
+            except APITimeoutError as error:
+                raise ReviewRequestTimeout(
+                    "Reviewer structured output request timed out."
+                ) from error
             except (
                 TypeError,
                 AttributeError,
@@ -131,11 +159,10 @@ class AzureResponsesClient:
                 pass
 
         try:
-            response = self.reviewer_client.responses.create(
-                model=self.reviewer_deployment,
-                input=prompt,
-                tools=tools,
-                text={
+            request = {
+                "model": self.reviewer_deployment,
+                "input": prompt,
+                "text": {
                     "format": {
                         "type": "json_schema",
                         "name": "review_result",
@@ -143,7 +170,12 @@ class AzureResponsesClient:
                         "strict": True,
                     }
                 },
-            )
+            }
+            if tools:
+                request["tools"] = tools
+            response = request_client.responses.create(**request)
+        except APITimeoutError as error:
+            raise ReviewRequestTimeout("Reviewer structured output request timed out.") from error
         except OpenAIError as error:
             raise RuntimeError("Reviewer structured output request failed.") from error
 
@@ -194,30 +226,62 @@ def build_review_prompt(
     acceptance_criteria: list[str],
     report: str,
     citations: list[dict[str, Any]],
+    max_report_chars: int = 50000,
+    max_citations: int = 40,
 ) -> str:
-    return f"""あなたは厳格なリサーチ品質レビューアです。
+    report, omitted_report_chars = _truncate_text(report, max_chars=max_report_chars)
+    citations, omitted_citation_count = _compact_citations(
+        citations,
+        max_citations=max_citations,
+    )
+    context_note = ""
+    if omitted_report_chars or omitted_citation_count:
+        context_note = f"""
+# Review Context Limits
+- omitted_report_chars: {omitted_report_chars}
+- omitted_citation_count: {omitted_citation_count}
+"""
+    return f"""You are a strict research quality reviewer.
 
-目的:
-ユーザーの元プロンプト、optimized prompt、acceptance criteria に照らし、
-候補レポートが目的を達成しているか評価してください。
+Objective:
+Evaluate whether the candidate report satisfies the original user prompt,
+the optimized prompt, and the acceptance criteria.
 
-確認観点:
-- ユーザーの要求項目に漏れがないか
-- 主要な主張に信頼できる出典があるか
-- 最新性が必要な事実が古くないか
-- 数値、固有名詞、日付、モデル名、制度名が正確か
-- 公式情報、一次情報、信頼できるソースが優先されているか
-- 出典から結論が過剰に飛躍していないか
-- 不確実性、限界、前提が明示されているか
-- 高リスク領域で自動判断が不適切ではないか
+Review criteria:
+- How well the report achieves the objective in the original user prompt.
+- How completely the report satisfies the expected output items in the optimized prompt
+  and acceptance criteria.
+- Whether any user-requested items are missing.
+- Whether key claims are backed by trustworthy sources.
+- Whether facts that require recency are current enough.
+- Whether numbers, proper nouns, dates, model names, and policy names are accurate.
+- Whether official, primary, and otherwise reliable sources are prioritized.
+- Whether conclusions overreach beyond the cited evidence.
+- Whether uncertainty, limitations, and assumptions are explicit.
+- Whether the topic is too high-risk for automated continuation.
+
+Output policy:
+- Write all ReviewResult string fields in English, even if the user prompt or
+  candidate report is in another language.
+- In rationale, include objective coverage, expected-output coverage, and the overall judgment.
+- In gaps, list unmet user requirements, missing expected outputs, and under-verified
+  issues specifically.
+- If verdict is needs_deep_research or requires_new_external_research is true,
+  write specific next_instructions for the next Deep Research run.
+- In next_instructions, include what to investigate, which source types to prioritize,
+  and what previous failures to avoid.
+- Use null for next_instructions only when verdict is pass.
 
 verdict policy:
-- pass: 目的を達成し、重大な不足、誤り、出典問題がない。
-- needs_llm_fix: 概ね十分。軽微な不足、構成、表現、限定的事実確認のみで直せる。
-- needs_deep_research: 重大な欠落、調査範囲不足、ソース不足、矛盾、多段調査が必要。
-- human_review: 高リスク、判断不能、または自動継続が不適切。
+- pass: The report satisfies the objective and has no major gaps, errors, or source issues.
+- needs_llm_fix: The report is mostly sufficient and can be fixed with minor edits,
+  organization, wording, or limited fact checks.
+- needs_deep_research: The report has major missing work, insufficient scope, weak sources,
+  contradictions, or requires multi-step research.
+- human_review: The topic is high-risk, unclear, or automated continuation is inappropriate.
 
-必ず ReviewResult schema に厳密準拠して返してください。
+Return a response that strictly conforms to the ReviewResult schema.
+{context_note}
 
 # User Prompt
 {user_prompt}
@@ -242,10 +306,12 @@ def build_finalize_prompt(
     report: str,
     review: dict[str, Any],
 ) -> str:
-    return f"""あなたは熟練のリサーチ・エディタです。
+    return f"""You are an expert research editor.
 
-既存レポートをベースに、レビューで指摘された軽微な不足のみを補ってください。
-根拠のない新情報、出典捏造、大きな論点追加は禁止です。
+Revise the existing report only enough to address the minor gaps identified in the review.
+Do not add unsupported new information, fabricate citations, or expand the scope substantially.
+Write the final report in English, even if the user prompt or existing report is in
+another language.
 
 # User Prompt
 {user_prompt}
@@ -273,3 +339,49 @@ def _build_azure_client(*, endpoint: str, api_key: str, api_version: str) -> Any
         api_key=api_key,
         api_version=api_version,
     )
+
+
+def _client_with_timeout(client: Any, *, timeout: int) -> Any:
+    with_options = getattr(client, "with_options", None)
+    if callable(with_options):
+        return with_options(timeout=timeout)
+    return client
+
+
+def _truncate_text(value: str, *, max_chars: int) -> tuple[str, int]:
+    if max_chars <= 0 or len(value) <= max_chars:
+        return value, 0
+
+    marker = "\n\n[... review input truncated ...]\n\n"
+    available = max(max_chars - len(marker), 0)
+    head_chars = max(available * 2 // 3, 0)
+    tail_chars = max(available - head_chars, 0)
+    tail = value[-tail_chars:] if tail_chars else ""
+    truncated = value[:head_chars] + marker + tail
+    return truncated, len(value) - len(truncated)
+
+
+def _compact_citations(
+    citations: list[dict[str, Any]],
+    *,
+    max_citations: int,
+) -> tuple[list[dict[str, Any]], int]:
+    if max_citations <= 0:
+        return [], len(citations)
+
+    compacted: list[dict[str, Any]] = []
+    for citation in citations[:max_citations]:
+        compacted.append(
+            {
+                key: _truncate_scalar(citation[key])
+                for key in _CITATION_COMPACT_KEYS
+                if key in citation and citation[key] not in (None, "")
+            }
+        )
+    return compacted, max(len(citations) - len(compacted), 0)
+
+
+def _truncate_scalar(value: Any, *, max_chars: int = 1000) -> Any:
+    if not isinstance(value, str) or len(value) <= max_chars:
+        return value
+    return value[: max_chars - 1] + "…"

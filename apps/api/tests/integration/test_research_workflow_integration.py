@@ -236,7 +236,6 @@ async def test_human_review_resume_from_api_continues_workflow(
 
         resume_response = await client.post(
             f"/research-runs/{run_id}/resume",
-            headers={"X-Reviewer-Id": "integration-reviewer"},
             json={
                 "action": HumanReviewAction.REQUEST_LLM_FIX.value,
                 "comment": "章立てだけ整えてください。",
@@ -248,7 +247,7 @@ async def test_human_review_resume_from_api_continues_workflow(
     assert resume_response.status_code == 200
     assert resume_response.json()["status"] == RunStatus.COMPLETED.value
     assert status_response.json()["progress"]["total_reviews"] == 2
-    assert audit_response.json()["human_decisions"][0]["reviewer_id"] == "integration-reviewer"
+    assert audit_response.json()["human_decisions"][0]["reviewer_id"] is None
     assert "章立てだけ整えてください。" in fake.llm_finalize_prompts[-1]
 
 
@@ -280,7 +279,6 @@ async def test_human_review_request_deep_research_resume_completes_after_poller(
 
         resume_response = await client.post(
             f"/research-runs/{run_id}/resume",
-            headers={"X-Reviewer-Id": "integration-reviewer"},
             json={
                 "action": HumanReviewAction.REQUEST_DEEP_RESEARCH.value,
                 "comment": "不足している公式情報を再調査してください。",
@@ -333,19 +331,15 @@ async def test_human_review_resume_hard_stop_keeps_queue_and_records_no_decision
         assert needs_human.status == RunStatus.NEEDS_HUMAN_REVIEW
         orchestrator.repository.update_run(
             needs_human.id,
-            estimated_cost_usd=needs_human.estimated_cost_usd,
-            max_cost_usd=needs_human.estimated_cost_usd,
+            total_reviews=5,
+            max_total_iterations=5,
         )
 
         resume_response = await client.post(
             f"/research-runs/{run_id}/resume",
-            headers={"X-Reviewer-Id": "integration-reviewer"},
             json={"action": HumanReviewAction.REQUEST_LLM_FIX.value},
         )
-        queue_response = await client.get(
-            "/research-runs/human-reviews",
-            headers={"X-Reviewer-Id": "integration-reviewer"},
-        )
+        queue_response = await client.get("/research-runs/human-reviews")
         audit_response = await client.get(f"/research-runs/{run_id}/audit")
 
     audit = audit_response.json()
@@ -354,7 +348,7 @@ async def test_human_review_resume_hard_stop_keeps_queue_and_records_no_decision
     assert [item["run_id"] for item in queue_response.json()] == [run_id]
     assert audit["human_decisions"] == []
     assert audit["history"][-1]["step"] == "human_review_resume_blocked"
-    assert audit["history"][-1]["reason"] == "max_cost_usd_reached"
+    assert audit["history"][-1]["reason"] == "max_total_iterations_reached"
 
 
 @pytest.mark.integration
@@ -385,12 +379,10 @@ async def test_human_review_api_allows_only_one_resume_decision(
 
         first_response = await client.post(
             f"/research-runs/{run_id}/resume",
-            headers={"X-Reviewer-Id": "integration-reviewer-1"},
             json={"action": HumanReviewAction.APPROVE.value},
         )
         second_response = await client.post(
             f"/research-runs/{run_id}/resume",
-            headers={"X-Reviewer-Id": "integration-reviewer-2"},
             json={"action": HumanReviewAction.REJECT.value},
         )
         audit_response = await client.get(f"/research-runs/{run_id}/audit")
@@ -401,4 +393,4 @@ async def test_human_review_api_allows_only_one_resume_decision(
     assert second_response.status_code == 409
     assert len(audit["human_decisions"]) == 1
     assert audit["human_decisions"][0]["action"] == HumanReviewAction.APPROVE.value
-    assert audit["human_decisions"][0]["reviewer_id"] == "integration-reviewer-1"
+    assert audit["human_decisions"][0]["reviewer_id"] is None

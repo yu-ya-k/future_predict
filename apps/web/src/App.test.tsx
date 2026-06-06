@@ -17,7 +17,7 @@
  *  - Clean up with cleanup() + localStorage.clear() in afterEach.
  */
 
-import { render, screen, cleanup, waitFor, within } from "@testing-library/react";
+import { act, render, screen, cleanup, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -55,7 +55,6 @@ function staleSavedFactoryDefaults() {
     max_llm_fix_runs: 3,
     max_total_iterations: 10,
     max_no_progress_rounds: 3,
-    max_cost_usd: 5,
     max_total_tool_calls: 200,
   };
 }
@@ -69,6 +68,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
   cleanup();
@@ -131,7 +131,28 @@ describe("Dashboard (SCR-2)", () => {
     expect(screen.getByText(/進行中のrunなし/i)).toBeInTheDocument();
   });
 
-  it("shows reviewer ID prompt in the queue band when no reviewer id is set", () => {
+  it("fetches the human-review queue without a reviewer id", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve([]),
+    } as Response);
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    expect(await screen.findByText("要対応なし")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:8000/research-runs/human-reviews",
+      expect.objectContaining({
+        headers: {},
+      }),
+    );
+    expect(screen.queryByText(/レビュアーID/i)).not.toBeInTheDocument();
+  });
+
+  it("ignores stale reviewer id storage and does not render user identity UI", async () => {
+    localStorage.setItem("dro.reviewerId", "Yuya");
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -140,7 +161,9 @@ describe("Dashboard (SCR-2)", () => {
 
     render(<App />);
 
-    expect(screen.getByText(/レビュアーIDが必要です/i)).toBeInTheDocument();
+    expect(await screen.findByText("要対応なし")).toBeInTheDocument();
+    expect(screen.queryByText("Yuya")).not.toBeInTheDocument();
+    expect(screen.queryByText(/レビュアーID/i)).not.toBeInTheDocument();
   });
 
   it("renders the 要対応 section heading", () => {
@@ -154,6 +177,336 @@ describe("Dashboard (SCR-2)", () => {
 
     expect(screen.getByText("要対応")).toBeInTheDocument();
   });
+
+  it("uses a compact empty state for the human-review queue", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve([]),
+    } as Response);
+
+    render(<App />);
+
+    expect(await screen.findByText("要対応なし")).toBeInTheDocument();
+    expect(screen.getByText("レビュー待ちはありません。")).toBeInTheDocument();
+    expect(
+      screen.queryByText("現在、人間によるレビューが必要なrunはありません。"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("removes a tracked run from the dashboard", async () => {
+    localStorage.setItem(
+      "dro.trackedRuns",
+      JSON.stringify([
+        {
+          run_id: "run-remove-test",
+          title: "削除対象のリサーチ",
+          max_total_iterations: 5,
+          created_at: new Date().toISOString(),
+          last_status: "waiting_deep_research",
+        },
+      ]),
+    );
+    globalThis.fetch = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/research-runs/human-reviews")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith("/research-runs/run-remove-test") && init?.method === "DELETE") {
+        return Promise.resolve({
+          ok: true,
+          status: 204,
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: "run-remove-test",
+            status: "waiting_deep_research",
+            done_reason: null,
+            needs_human_review: false,
+            progress: {
+              deep_research_runs: 1,
+              llm_fix_runs: 0,
+              total_reviews: 0,
+              latest_verdict: null,
+              latest_score: null,
+              total_tool_calls: 0,
+              estimated_cost_usd: 0,
+            },
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(screen.getByText("削除対象のリサーチ")).toBeInTheDocument();
+
+    await userEvent.click(
+      screen.getByRole("button", {
+        name: "停止して削除: 削除対象のリサーチ",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(screen.queryByText("削除対象のリサーチ")).not.toBeInTheDocument(),
+    );
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      "http://localhost:8000/research-runs/run-remove-test",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(JSON.parse(localStorage.getItem("dro.trackedRuns") ?? "[]")).toEqual([]);
+  });
+
+  it("removes a tracked run locally when backend delete returns 404", async () => {
+    localStorage.setItem(
+      "dro.trackedRuns",
+      JSON.stringify([
+        {
+          run_id: "run-already-gone",
+          title: "削除済みのリサーチ",
+          max_total_iterations: 5,
+          created_at: new Date().toISOString(),
+          last_status: "completed",
+        },
+      ]),
+    );
+    globalThis.fetch = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/research-runs/human-reviews")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith("/research-runs/run-already-gone") && init?.method === "DELETE") {
+        return Promise.resolve({
+          ok: false,
+          status: 404,
+          json: () => Promise.resolve({ detail: "Run not found." }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({}),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(screen.getByText("削除済みのリサーチ")).toBeInTheDocument();
+
+    await userEvent.click(
+      screen.getByRole("button", {
+        name: "削除: 削除済みのリサーチ",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(screen.queryByText("削除済みのリサーチ")).not.toBeInTheDocument(),
+    );
+    expect(JSON.parse(localStorage.getItem("dro.trackedRuns") ?? "[]")).toEqual([]);
+  });
+
+  it("removes a stale tracked run when dashboard polling returns 404", async () => {
+    localStorage.setItem(
+      "dro.trackedRuns",
+      JSON.stringify([
+        {
+          run_id: "run-stale-poll",
+          title: "存在しないリサーチ",
+          max_total_iterations: 5,
+          created_at: new Date().toISOString(),
+          last_status: "waiting_deep_research",
+        },
+      ]),
+    );
+    globalThis.fetch = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/research-runs/human-reviews")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith("/research-runs/run-stale-poll")) {
+        return Promise.resolve({
+          ok: false,
+          status: 404,
+          json: () => Promise.resolve({ detail: "Run not found." }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({}),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(screen.getByText("存在しないリサーチ")).toBeInTheDocument();
+
+    await waitFor(() =>
+      expect(screen.queryByText("存在しないリサーチ")).not.toBeInTheDocument(),
+    );
+    expect(JSON.parse(localStorage.getItem("dro.trackedRuns") ?? "[]")).toEqual([]);
+  });
+
+  it("does not duplicate a queued human-review run in the active tracked list", async () => {
+    const runId = "queued-review-run";
+    localStorage.setItem(
+      "dro.trackedRuns",
+      JSON.stringify([
+        {
+          run_id: runId,
+          title: "要対応と重複するリサーチ",
+          max_total_iterations: 5,
+          created_at: new Date().toISOString(),
+          last_status: "needs_human_review",
+        },
+      ]),
+    );
+    globalThis.fetch = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/research-runs/human-reviews")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve([
+              {
+                run_id: runId,
+                status: "needs_human_review",
+                done_reason: "deep_research_timeout",
+                latest_verdict: "human_review",
+                latest_score: 72,
+                latest_rationale: "判断が必要です",
+                audit_summary: {
+                  deep_research_runs: 1,
+                  llm_fix_runs: 0,
+                  total_reviews: 1,
+                  no_progress_count: 0,
+                  total_tool_calls: 0,
+                  estimated_cost_usd: 0,
+                },
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            ]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              run_id: runId,
+              status: "needs_human_review",
+              done_reason: "deep_research_timeout",
+              needs_human_review: true,
+              progress: {
+                deep_research_runs: 1,
+                llm_fix_runs: 0,
+                total_reviews: 1,
+                latest_verdict: "human_review",
+                latest_score: 72,
+                total_tool_calls: 0,
+                estimated_cost_usd: 0,
+              },
+            }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({}),
+      } as Response);
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
+    expect(await screen.findByText(runId)).toBeInTheDocument();
+
+    const activeSection = screen.getByRole("heading", { name: "進行中" }).closest("section");
+    expect(activeSection).not.toBeNull();
+    expect(
+      within(activeSection as HTMLElement).queryByText("要対応と重複するリサーチ"),
+    ).not.toBeInTheDocument();
+    expect(within(activeSection as HTMLElement).getByText("進行中のrunなし")).toBeInTheDocument();
+  });
+
+  it("deletes a human-review queue item from the backend queue", async () => {
+    const runId = "queue-delete-run";
+    globalThis.fetch = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}`) && init?.method === "DELETE") {
+        return Promise.resolve({
+          ok: true,
+          status: 204,
+        } as Response);
+      }
+      if (url.endsWith("/research-runs/human-reviews")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve([
+              {
+                run_id: runId,
+                status: "needs_human_review",
+                done_reason: "deep_research_timeout",
+                latest_verdict: "human_review",
+                latest_score: 72,
+                latest_rationale: "判断が必要です",
+                audit_summary: {
+                  deep_research_runs: 1,
+                  llm_fix_runs: 0,
+                  total_reviews: 1,
+                  no_progress_count: 0,
+                  total_tool_calls: 0,
+                  estimated_cost_usd: 0,
+                },
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            ]),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({}),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText(runId)).toBeInTheDocument();
+
+    await userEvent.click(
+      screen.getByRole("button", {
+        name: `削除: ${runId}`,
+      }),
+    );
+
+    await waitFor(() => expect(screen.queryByText(runId)).not.toBeInTheDocument());
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      `http://localhost:8000/research-runs/${runId}`,
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
 });
 
 describe("NewResearch (SCR-1)", () => {
@@ -166,6 +519,16 @@ describe("NewResearch (SCR-1)", () => {
 
     const button = screen.getByRole("button", { name: /リサーチを開始/i });
     expect(button).toBeDisabled();
+  });
+
+  it("returns to the dashboard from the new research screen", async () => {
+    render(<App />);
+
+    await userEvent.click(
+      screen.getByRole("link", { name: "ダッシュボードへ戻る" }),
+    );
+
+    expect(window.location.hash).toBe("#/");
   });
 
   it("start button becomes enabled after entering a prompt", async () => {
@@ -192,7 +555,7 @@ describe("NewResearch (SCR-1)", () => {
 
     await userEvent.click(screen.getByRole("button", { name: /詳細オプション/i }));
     const advancedOptions = screen.getByRole("group", { name: /詳細オプション/i });
-    expect(within(advancedOptions).getAllByRole("spinbutton")).toHaveLength(6);
+    expect(within(advancedOptions).getAllByRole("spinbutton")).toHaveLength(5);
   });
 
   it("submits a run and navigates to monitor on success", async () => {
@@ -258,7 +621,6 @@ describe("NewResearch (SCR-1)", () => {
       max_llm_fix_runs: 3,
       max_total_iterations: 5,
       max_no_progress_rounds: 2,
-      max_cost_usd: 20,
       max_total_tool_calls: 120,
     });
   });
@@ -293,7 +655,6 @@ describe("NewResearch (SCR-1)", () => {
 
     expect(body.options.max_deep_research_runs).toBe(2);
     expect(body.options.max_total_iterations).toBe(5);
-    expect(body.options.max_cost_usd).toBe(20);
     expect(body.options.max_total_tool_calls).toBe(120);
   });
 
@@ -315,6 +676,773 @@ describe("NewResearch (SCR-1)", () => {
     await waitFor(() => {
       expect(screen.getByRole("alert")).toBeInTheDocument();
     });
+  });
+});
+
+describe("RunMonitor (SCR-3)", () => {
+  const runId = "run-prompt-panel-test";
+
+  beforeEach(() => {
+    window.location.hash = `#/runs/${runId}`;
+    localStorage.setItem(
+      "dro.trackedRuns",
+      JSON.stringify([
+        {
+          run_id: runId,
+          title: "プロンプト確認テスト",
+          max_total_iterations: 5,
+          created_at: new Date().toISOString(),
+          last_status: "waiting_deep_research",
+        },
+      ]),
+    );
+  });
+
+  it("separates total elapsed time from the current Deep Research attempt", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(
+      new Date("2026-06-06T05:00:00.000Z").getTime(),
+    );
+    localStorage.setItem(
+      "dro.trackedRuns",
+      JSON.stringify([
+        {
+          run_id: runId,
+          title: "再実行時刻テスト",
+          max_total_iterations: 5,
+          created_at: "2026-06-06T03:00:00.000Z",
+          last_status: "waiting_deep_research",
+        },
+      ]),
+    );
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/reviews`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "waiting_deep_research",
+            done_reason: null,
+            needs_human_review: false,
+            deep_research_submitted_at: "2026-06-06T04:30:00.000Z",
+            progress: {
+              deep_research_runs: 2,
+              llm_fix_runs: 0,
+              total_reviews: 1,
+              latest_verdict: null,
+              latest_score: null,
+              total_tool_calls: 78,
+              estimated_cost_usd: 5.54,
+            },
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("トータル経過時間")).toBeInTheDocument();
+    expect(screen.getByText("120:00")).toBeInTheDocument();
+    expect(screen.getByText(/今回の経過時間: 30分/)).toBeInTheDocument();
+    expect(screen.getByText(/開始時刻: 13:30/)).toBeInTheDocument();
+  });
+
+  it("shows Deep Research instructions from attempts", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve([
+              {
+                run_no: 1,
+                response_id: "resp_prompt_test",
+                status: "queued",
+                model: "o3-deep-research",
+                prompt: "# Research Objective\n実際のDeep Research指示",
+                report: "",
+                citations: [],
+                tool_calls_summary: [],
+                error: null,
+              },
+            ]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/reviews`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "waiting_deep_research",
+            done_reason: null,
+            needs_human_review: false,
+            progress: {
+              deep_research_runs: 1,
+              llm_fix_runs: 0,
+              total_reviews: 0,
+              latest_verdict: null,
+              latest_score: null,
+              total_tool_calls: 0,
+              estimated_cost_usd: 0,
+            },
+          }),
+      } as Response);
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "指示内容" }));
+
+    expect(await screen.findByText("Deep Researchへの指示内容")).toBeInTheDocument();
+    expect(screen.getByText(/実際のDeep Research指示/i)).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining(`/research-runs/${runId}/attempts`),
+      expect.any(Object),
+    );
+  });
+
+  it("returns to the dashboard from the run monitor", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve({
+          run_id: runId,
+          status: "waiting_deep_research",
+          done_reason: null,
+          needs_human_review: false,
+          progress: {
+            deep_research_runs: 1,
+            llm_fix_runs: 0,
+            total_reviews: 0,
+            latest_verdict: null,
+            latest_score: null,
+            total_tool_calls: 0,
+            estimated_cost_usd: 0,
+          },
+        }),
+    } as Response);
+
+    render(<App />);
+
+    await userEvent.click(
+      await screen.findByRole("link", { name: "ダッシュボードへ戻る" }),
+    );
+
+    expect(window.location.hash).toBe("#/");
+  });
+
+  it("links to report and review history tabs", async () => {
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/citations`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/reviews`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/report`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              run_id: runId,
+              status: "reviewing",
+              final_report: null,
+              report: "# 候補レポート",
+              warnings: [],
+            }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "reviewing",
+            done_reason: null,
+            needs_human_review: false,
+            progress: {
+              deep_research_runs: 1,
+              llm_fix_runs: 0,
+              total_reviews: 0,
+              latest_verdict: null,
+              latest_score: null,
+              total_tool_calls: 0,
+              estimated_cost_usd: 0,
+            },
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("link", { name: "レポート履歴" }))
+      .toHaveAttribute("href", `#/runs/${runId}/report`);
+
+    await userEvent.click(screen.getByRole("link", { name: "レビュー内容" }));
+
+    expect(window.location.hash).toBe(`#/runs/${runId}/report?tab=reviews`);
+  });
+});
+
+describe("ReportViewer (SCR-5)", () => {
+  const runId = "run-report-back-test";
+
+  function makeAttempt(runNo: number, report: string, status = "completed") {
+    return {
+      run_no: runNo,
+      response_id: `resp_collect_${runNo}`,
+      status,
+      model: "o3-deep-research",
+      prompt: `# 指示 ${runNo}`,
+      report,
+      citations: [],
+      tool_calls_summary: [],
+      error: null,
+    };
+  }
+
+  function makeReview(reviewNo: number, rationale: string, score = 70) {
+    return {
+      review_no: reviewNo,
+      verdict: "needs_deep_research",
+      recommended_route: "needs_deep_research",
+      goal_achieved: false,
+      score,
+      rationale,
+      gaps: [`ギャップ ${reviewNo}`],
+      factuality_concerns: [],
+      source_quality_concerns: [],
+      next_instructions: `改善指示 ${reviewNo}`,
+      can_be_fixed_by_llm: false,
+      requires_new_external_research: true,
+      reviewer_confidence: 80,
+      high_risk_flags: [],
+      public_web_search_used: false,
+      reviewer_response_id: `resp_review_${reviewNo}`,
+      report_hash: `hash${reviewNo}`,
+    };
+  }
+
+  function capturePollingTimers() {
+    const realSetTimeout = globalThis.setTimeout;
+    const pending: Array<() => void> = [];
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(
+      ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+        if (timeout === 30_000) {
+          pending.push(() => {
+            if (typeof handler === "function") {
+              handler(...args);
+            }
+          });
+          return 0 as unknown as ReturnType<typeof setTimeout>;
+        }
+        return realSetTimeout(handler, timeout, ...args);
+      }) as typeof setTimeout,
+    );
+
+    return async function flushPollingTimers() {
+      const callbacks = pending.splice(0);
+      await act(async () => {
+        callbacks.forEach((callback) => callback());
+        await Promise.resolve();
+      });
+    };
+  }
+
+  beforeEach(() => {
+    window.location.hash = `#/runs/${runId}/report`;
+  });
+
+  it("returns to the run monitor from the report screen", async () => {
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/citations`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/reviews`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "waiting_deep_research",
+            final_report: null,
+            report: null,
+            warnings: [],
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("link", { name: "Runへ戻る" }));
+
+    expect(window.location.hash).toBe(`#/runs/${runId}`);
+  });
+
+  it("defaults to the latest Deep Research output without mixed tabs", async () => {
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/citations`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/reviews`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([makeReview(1, "レビュー側の内容です", 58)]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve([
+              {
+                run_no: 1,
+                response_id: "resp_collect_1",
+                status: "completed",
+                model: "o3-deep-research",
+                prompt: "# 指示 1",
+                report: "# 1回目のDeep Research出力",
+                citations: [],
+                tool_calls_summary: [],
+                error: null,
+              },
+              {
+                run_no: 2,
+                response_id: "resp_collect_2",
+                status: "completed",
+                model: "o3-deep-research",
+                prompt: "# 指示 2",
+                report: "# 2回目のDeep Research出力",
+                citations: [],
+                tool_calls_summary: [],
+                error: null,
+              },
+            ]),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "completed",
+            final_report: "# 最新版レポート",
+            report: "# 下書き",
+            warnings: [],
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "レポート履歴" })).toBeInTheDocument();
+    expect(await screen.findByText("2回目のDeep Research出力")).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "最新版" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "レビュー履歴" })).not.toBeInTheDocument();
+    expect(screen.queryByText("レビュー側の内容です")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("品質スコア")).not.toBeInTheDocument();
+  });
+
+  it("opens Deep Research history from the report tab URL", async () => {
+    window.location.hash = `#/runs/${runId}/report?tab=research`;
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/citations`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/reviews`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve([
+              {
+                run_no: 1,
+                response_id: "resp_submit_1",
+                status: "queued",
+                model: "o3-deep-research",
+                prompt: "# 指示 1",
+                report: "",
+                citations: [],
+                tool_calls_summary: [],
+                error: null,
+              },
+              {
+                run_no: 1,
+                response_id: "resp_collect_1",
+                status: "completed",
+                model: "o3-deep-research",
+                prompt: "# 指示 1",
+                report: "# 1回目のDeep Research出力",
+                citations: [],
+                tool_calls_summary: [],
+                error: null,
+              },
+              {
+                run_no: 2,
+                response_id: "resp_collect_2",
+                status: "completed",
+                model: "o3-deep-research",
+                prompt: "# 改善指示 2",
+                report: "# 2回目のDeep Research出力",
+                citations: [],
+                tool_calls_summary: [],
+                error: null,
+              },
+            ]),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "completed",
+            final_report: "# 最新版",
+            report: "# 最新版",
+            warnings: [],
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "レポート履歴" })).toBeInTheDocument();
+    expect(await screen.findByText("2回目のDeep Research出力")).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "レビュー履歴" })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /1回目/ }));
+
+    expect(await screen.findByText("1回目のDeep Research出力")).toBeInTheDocument();
+  });
+
+  it("opens full review history from the review tab URL", async () => {
+    window.location.hash = `#/runs/${runId}/report?tab=reviews`;
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/citations`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([makeAttempt(1, "# Deep Research側の出力")]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/reviews`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve([
+              {
+                review_no: 1,
+                verdict: "needs_deep_research",
+                recommended_route: "needs_deep_research",
+                goal_achieved: false,
+                score: 58,
+                rationale: "目的達成度が不足しています",
+                gaps: ["想定出力の比較表が不足"],
+                factuality_concerns: ["数値の検証が不足"],
+                source_quality_concerns: ["一次情報が不足"],
+                next_instructions: "次回は公式資料を優先して比較表を作る",
+                can_be_fixed_by_llm: false,
+                requires_new_external_research: true,
+                reviewer_confidence: 82,
+                high_risk_flags: ["判断不能な数値"],
+                public_web_search_used: false,
+                reviewer_response_id: "resp_review_1",
+                report_hash: "hash1",
+              },
+            ]),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "needs_human_review",
+            final_report: null,
+            report: "# 候補レポート",
+            warnings: [],
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "レビュー内容" })).toBeInTheDocument();
+    expect(await screen.findByText("目的達成度が不足しています")).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Deep Research履歴" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Deep Research側の出力")).not.toBeInTheDocument();
+    expect(screen.getByText("想定出力の比較表が不足")).toBeInTheDocument();
+    expect(screen.getByText("次回は公式資料を優先して比較表を作る")).toBeInTheDocument();
+  });
+
+  it("auto-follows newly added Deep Research attempts while latest is selected", async () => {
+    const flushPollingTimers = capturePollingTimers();
+    let attemptsCalls = 0;
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/citations`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/reviews`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        attemptsCalls += 1;
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve(
+              attemptsCalls === 1
+                ? [makeAttempt(1, "# 1回目のDeep Research出力")]
+                : [
+                    makeAttempt(1, "# 1回目のDeep Research出力"),
+                    makeAttempt(2, "# 2回目のDeep Research出力"),
+                  ],
+            ),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "collecting",
+            final_report: null,
+            report: null,
+            warnings: [],
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("1回目のDeep Research出力")).toBeInTheDocument();
+
+    await flushPollingTimers();
+
+    expect(await screen.findByText("2回目のDeep Research出力")).toBeInTheDocument();
+  });
+
+  it("keeps an explicitly selected older Deep Research attempt while polling adds newer output", async () => {
+    const flushPollingTimers = capturePollingTimers();
+    let attemptsCalls = 0;
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/citations`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/reviews`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        attemptsCalls += 1;
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve(
+              attemptsCalls === 1
+                ? [
+                    makeAttempt(1, "# 1回目のDeep Research出力"),
+                    makeAttempt(2, "# 2回目のDeep Research出力"),
+                  ]
+                : [
+                    makeAttempt(1, "# 1回目のDeep Research出力"),
+                    makeAttempt(2, "# 2回目のDeep Research出力"),
+                    makeAttempt(3, "# 3回目のDeep Research出力"),
+                  ],
+            ),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "collecting",
+            final_report: null,
+            report: null,
+            warnings: [],
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("2回目のDeep Research出力")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /1回目/ }));
+    expect(await screen.findByText("1回目のDeep Research出力")).toBeInTheDocument();
+
+    await flushPollingTimers();
+
+    expect(screen.getByText("1回目のDeep Research出力")).toBeInTheDocument();
+    expect(screen.queryByText("3回目のDeep Research出力")).not.toBeInTheDocument();
+  });
+
+  it("auto-follows newly added reviews while latest review is selected", async () => {
+    const flushPollingTimers = capturePollingTimers();
+    window.location.hash = `#/runs/${runId}/report?tab=reviews`;
+    let reviewCalls = 0;
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/citations`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/reviews`)) {
+        reviewCalls += 1;
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve(
+              reviewCalls === 1
+                ? [makeReview(1, "1回目レビューの理由", 58)]
+                : [
+                    makeReview(1, "1回目レビューの理由", 58),
+                    makeReview(2, "2回目レビューの理由", 76),
+                  ],
+            ),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "reviewing",
+            final_report: null,
+            report: null,
+            warnings: [],
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("1回目レビューの理由")).toBeInTheDocument();
+
+    await flushPollingTimers();
+
+    expect(await screen.findByText("2回目レビューの理由")).toBeInTheDocument();
   });
 });
 
@@ -358,7 +1486,6 @@ describe("HumanReview (SCR-4)", () => {
 
   beforeEach(() => {
     window.location.hash = `#/runs/${runId}/review`;
-    localStorage.setItem("dro.reviewerId", "test-reviewer");
   });
 
   it("shows the stop-reason banner", async () => {
@@ -406,18 +1533,116 @@ describe("HumanReview (SCR-4)", () => {
     expect(rejectBtn).not.toBeDisabled();
   });
 
-  it("shows reviewer ID setup screen when reviewer id is not set", async () => {
-    // Ensure no reviewer id — beforeEach sets it, remove it here
-    localStorage.removeItem("dro.reviewerId");
-
-    // With no reviewerId, ReviewerRequiredError is thrown client-side before fetch
-    globalThis.fetch = vi.fn();
+  it("shows review retry only when the backend allows it", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve({
+          ...makePayload(["approve", "request_review", "reject"]),
+          reason: "review_timeout",
+          latest_review: null,
+        }),
+    } as Response);
 
     render(<App />);
 
-    // The setup button should appear once the component detects missing reviewer id
-    const setupBtn = await screen.findByRole("button", { name: /設定して続ける/i });
-    expect(setupBtn).toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", { name: /レビュー再実行/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("submits a human review decision without a reviewer header", async () => {
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/human-review`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(makePayload(["approve", "reject"])),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/resume`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              run_id: runId,
+              status: "completed",
+              done_reason: "human_approved",
+              needs_human_review: false,
+            }),
+        } as Response);
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: /承認/i }));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      `http://localhost:8000/research-runs/${runId}/resume`,
+      expect.objectContaining({
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+  });
+
+  it("submits a review retry decision", async () => {
+    const fetchMock = vi.fn().mockImplementation(
+      (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith(`/research-runs/${runId}/human-review`)) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: () =>
+              Promise.resolve({
+                ...makePayload(["approve", "request_review", "reject"]),
+                reason: "review_timeout",
+                latest_review: null,
+              }),
+          } as Response);
+        }
+        if (url.endsWith(`/research-runs/${runId}/resume`)) {
+          expect(JSON.parse(String(init?.body))).toEqual({
+            action: "request_review",
+            comment: null,
+          });
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: () =>
+              Promise.resolve({
+                run_id: runId,
+                status: "completed",
+                done_reason: "passed_review",
+                needs_human_review: false,
+              }),
+          } as Response);
+        }
+        return Promise.reject(new Error(`Unexpected request: ${url}`));
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: /レビュー再実行/i }),
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      `http://localhost:8000/research-runs/${runId}/resume`,
+      expect.objectContaining({
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
   });
 });
 
@@ -441,8 +1666,8 @@ describe("Settings (SCR-7)", () => {
     expect(screen.getByLabelText(/最大LLM修正回数/i)).toHaveValue(3);
     expect(screen.getByLabelText(/最大反復回数/i)).toHaveValue(5);
     expect(screen.getByLabelText(/最大停滞許容回数/i)).toHaveValue(2);
-    expect(screen.getByLabelText(/最大コスト/i)).toHaveValue(20);
     expect(screen.getByLabelText(/最大ツール呼び出し数/i)).toHaveValue(120);
+    expect(screen.queryByLabelText(/最大コスト/i)).not.toBeInTheDocument();
   });
 
   it("normalizes stale saved factory defaults in settings", () => {
@@ -452,22 +1677,20 @@ describe("Settings (SCR-7)", () => {
 
     expect(screen.getByLabelText(/最大Deep Research回数/i)).toHaveValue(2);
     expect(screen.getByLabelText(/最大反復回数/i)).toHaveValue(5);
-    expect(screen.getByLabelText(/最大コスト/i)).toHaveValue(20);
     expect(screen.getByLabelText(/最大ツール呼び出し数/i)).toHaveValue(120);
   });
 
   it("keeps user-modified saved defaults without normalization", () => {
     localStorage.setItem(
       "dro.defaults",
-      JSON.stringify({ ...staleSavedFactoryDefaults(), max_cost_usd: 7 }),
+      JSON.stringify({ ...staleSavedFactoryDefaults(), max_total_tool_calls: 210 }),
     );
 
     render(<App />);
 
     expect(screen.getByLabelText(/最大Deep Research回数/i)).toHaveValue(3);
     expect(screen.getByLabelText(/最大反復回数/i)).toHaveValue(10);
-    expect(screen.getByLabelText(/最大コスト/i)).toHaveValue(7);
-    expect(screen.getByLabelText(/最大ツール呼び出し数/i)).toHaveValue(200);
+    expect(screen.getByLabelText(/最大ツール呼び出し数/i)).toHaveValue(210);
   });
 
   it("renders only the default numeric editor", () => {
@@ -476,7 +1699,7 @@ describe("Settings (SCR-7)", () => {
     const heading = screen.getByRole("heading", { name: /デフォルトオプション/i });
     const section = heading.closest("section");
     expect(section).not.toBeNull();
-    expect(within(section as HTMLElement).getAllByRole("spinbutton")).toHaveLength(6);
+    expect(within(section as HTMLElement).getAllByRole("spinbutton")).toHaveLength(5);
   });
 
   it("persists saved defaults to localStorage", async () => {

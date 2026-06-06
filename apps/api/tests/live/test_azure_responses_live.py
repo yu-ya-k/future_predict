@@ -51,15 +51,17 @@ def test_live_reviewer_structured_output_smoke(
     require_live_reviewer_settings(live_settings)
 
     review, response_id, raw_response = live_azure_client.review_report(
-        user_prompt="公開情報に基づく短い調査結果をレビューしてください。",
-        optimized_prompt="目的: レポートが主張と根拠を明確に含むか確認する。",
+        user_prompt="Review a short public-information research result.",
+        optimized_prompt=(
+            "Objective: verify whether the report clearly includes claims and evidence."
+        ),
         acceptance_criteria=[
-            "ユーザー要求に直接答えている",
-            "根拠がある主張と限界が明示されている",
+            "Directly answers the user request.",
+            "States evidence-backed claims and limitations.",
         ],
         report=(
-            "OpenAI は AI 研究と製品開発を行う企業である。"
-            "この短いレポートは smoke test 用であり、詳細調査ではない。"
+            "OpenAI is a company focused on AI research and product development. "
+            "This short report is for a smoke test and is not a detailed investigation."
         ),
         citations=[],
     )
@@ -84,7 +86,7 @@ def test_live_deep_research_submit_retrieve_cancel_smoke(
     try:
         response = live_azure_client.submit_deep_research(
             prompt=(
-                "Smoke test: produce a very short Japanese note confirming this request was "
+                "Smoke test: produce a very short English note confirming this request was "
                 "received. Do not perform broad research."
             ),
             max_tool_calls=1,
@@ -122,12 +124,15 @@ def test_live_reviewer_finalize_smoke(
     require_live_reviewer_settings(live_settings)
 
     report, response_id, raw_response = live_azure_client.finalize_report(
-        user_prompt="公開情報に基づく短い調査結果を整えてください。",
-        report="OpenAI は AI 研究と製品開発を行う企業である。限界: smoke test 用。",
+        user_prompt="Polish a short public-information research result.",
+        report=(
+            "OpenAI is a company focused on AI research and product development. "
+            "Limitation: smoke test only."
+        ),
         review={
             "verdict": Verdict.NEEDS_LLM_FIX.value,
-            "rationale": "表現を簡潔に整える必要がある。",
-            "gaps": ["構成を少し整える"],
+            "rationale": "The wording should be made more concise.",
+            "gaps": ["Slightly improve the structure."],
         },
     )
 

@@ -6,11 +6,11 @@ def build_optimized_prompt(
     user_prompt: str,
 ) -> tuple[str, list[str]]:
     acceptance_criteria = [
-        "ユーザーの必須質問に直接回答している",
-        "主要な主張に出典または根拠がある",
-        "最新性が必要な事実では日付を明示している",
-        "不確実性、前提、限界を明示している",
-        "結論が根拠から過剰に飛躍していない",
+        "Directly answers the user's required questions.",
+        "Supports key claims with citations or clearly stated evidence.",
+        "States dates explicitly for facts that may change over time.",
+        "Clearly states uncertainty, assumptions, and limitations.",
+        "Keeps conclusions proportional to the evidence.",
     ]
 
     optimized_prompt = f"""# Research Objective
@@ -46,6 +46,10 @@ Identify contradictions.
 Explain confidence and limitations.
 
 # Output Language
-Japanese unless the user explicitly requests another language.
+Write the entire Deep Research output in English.
+If the user's prompt is written in another language, preserve its meaning but translate
+the deliverables into English.
+Do not switch to another output language unless this application explicitly overrides
+this instruction.
 """
     return optimized_prompt, acceptance_criteria

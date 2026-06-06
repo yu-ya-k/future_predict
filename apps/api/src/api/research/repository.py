@@ -77,7 +77,6 @@ class ResearchRepository:
                     max_total_iterations INTEGER NOT NULL DEFAULT 5,
                     max_no_progress_rounds INTEGER NOT NULL DEFAULT 2,
                     max_total_tool_calls INTEGER NOT NULL DEFAULT 120,
-                    max_cost_usd REAL NOT NULL DEFAULT 20,
                     total_tool_calls INTEGER NOT NULL DEFAULT 0,
                     estimated_cost_usd REAL NOT NULL DEFAULT 0,
                     warnings TEXT NOT NULL DEFAULT '[]',
@@ -195,7 +194,6 @@ class ResearchRepository:
         now = utc_now()
         run_id = uuid4()
         thread_id = str(uuid4())
-        max_cost = options.max_cost_usd or settings.default_max_cost_usd
         max_tool_calls = options.max_total_tool_calls or settings.default_max_total_tool_calls
 
         with self.connect() as connection:
@@ -204,10 +202,10 @@ class ResearchRepository:
                 INSERT INTO research_runs (
                     id, thread_id, user_prompt, status, needs_human_review,
                     max_deep_research_runs, max_llm_fix_runs, max_total_iterations,
-                    max_no_progress_rounds, max_total_tool_calls, max_cost_usd,
+                    max_no_progress_rounds, max_total_tool_calls,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(run_id),
@@ -219,7 +217,6 @@ class ResearchRepository:
                     options.max_total_iterations or settings.default_max_total_iterations,
                     options.max_no_progress_rounds or settings.default_max_no_progress_rounds,
                     max_tool_calls,
-                    max_cost,
                     now.isoformat(),
                     now.isoformat(),
                 ),
@@ -239,6 +236,14 @@ class ResearchRepository:
             raise KeyError(str(run_id))
 
         return self._row_to_run(row)
+
+    def delete_run(self, run_id: UUID) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM research_runs WHERE id = ?",
+                (str(run_id),),
+            )
+            return cursor.rowcount == 1
 
     def list_waiting_runs(self, *, timeout_seconds: int) -> list[ResearchRunRecord]:
         with self.connect() as connection:
@@ -310,6 +315,86 @@ class ResearchRepository:
             ).fetchall()
 
         return [self._row_to_run(row) for row in rows]
+
+    def list_stale_reviewing_runs(self, *, timeout_seconds: int) -> list[ResearchRunRecord]:
+        cutoff = utc_now() - timedelta(seconds=timeout_seconds)
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT r.*
+                FROM research_runs r
+                JOIN research_history h
+                  ON h.run_id = r.id
+                WHERE r.status = ?
+                  AND r.needs_human_review = 0
+                  AND h.created_at <= ?
+                  AND json_extract(h.event_json, '$.step') IN (
+                      'review_attempt_started',
+                      'llm_finalize_attempt_started'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM research_history done
+                      WHERE done.run_id = r.id
+                        AND done.created_at > h.created_at
+                        AND json_extract(done.event_json, '$.step') IN (
+                            'review_attempt_completed',
+                            'review_attempt_failed',
+                            'llm_finalize_attempt_completed',
+                            'llm_finalize_attempt_failed'
+                        )
+                  )
+                GROUP BY r.id
+                ORDER BY MIN(h.created_at) ASC
+                LIMIT 25
+                """,
+                (RunStatus.REVIEWING.value, cutoff.isoformat()),
+            ).fetchall()
+
+        return [self._row_to_run(row) for row in rows]
+
+    def count_billable_web_search_tool_calls(
+        self,
+        run_id: UUID,
+        *,
+        step: str,
+        response_id: str | None,
+    ) -> int | None:
+        response_filter = (
+            "response_id IS NULL" if response_id is None else "response_id = ?"
+        )
+        values: list[Any] = [str(run_id), step]
+        if response_id is not None:
+            values.append(response_id)
+
+        with self.connect() as connection:
+            total_row = connection.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM research_tool_calls
+                WHERE run_id = ?
+                  AND step = ?
+                  AND {response_filter}
+                """,
+                values,
+            ).fetchone()
+            total = int(total_row["count"] if total_row is not None else 0)
+            if total == 0:
+                return None
+
+            billable_row = connection.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM research_tool_calls
+                WHERE run_id = ?
+                  AND step = ?
+                  AND {response_filter}
+                  AND tool_type LIKE '%web_search%'
+                """,
+                values,
+            ).fetchone()
+
+        return int(billable_row["count"] if billable_row is not None else 0)
 
     def list_human_review_runs(self) -> list[ResearchRunRecord]:
         with self.connect() as connection:
@@ -536,6 +621,29 @@ class ResearchRepository:
             ).fetchall()
 
         return [self._row_to_attempt(row) for row in rows]
+
+    def get_deep_research_submitted_at(self, run_id: UUID) -> datetime | None:
+        run = self.get_run(run_id)
+        response_id = run.pending_deep_research_response_id
+        if not response_id:
+            return None
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT created_at
+                FROM research_attempts
+                WHERE run_id = ?
+                  AND response_id = ?
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (str(run_id), response_id),
+            ).fetchone()
+
+        if row is None:
+            return None
+        return _parse_dt(row["created_at"])
 
     def get_reviews(self, run_id: UUID) -> list[ReviewRecord]:
         with self.connect() as connection:
@@ -784,7 +892,6 @@ class ResearchRepository:
             max_total_iterations=row["max_total_iterations"],
             max_no_progress_rounds=row["max_no_progress_rounds"],
             max_total_tool_calls=row["max_total_tool_calls"],
-            max_cost_usd=row["max_cost_usd"],
             total_tool_calls=row["total_tool_calls"],
             estimated_cost_usd=row["estimated_cost_usd"],
             warnings=_json_load(row["warnings"], []),

@@ -32,15 +32,26 @@ export type RouteName =
   | "settings"
   | "not-found";
 
+export type ReportTab = "research" | "reviews";
+
 export interface Route {
   name: RouteName;
   /** run id for run-scoped routes. */
   runId?: string;
+  /** Optional report viewer tab. */
+  reportTab?: ReportTab;
   path: string;
 }
 
+function parseReportTab(value: string | null): ReportTab {
+  if (value === "reviews") return value;
+  return "research";
+}
+
 function parseHash(hash: string): Route {
-  const path = hash.replace(/^#/, "") || "/";
+  const rawPath = hash.replace(/^#/, "") || "/";
+  const [path, query = ""] = rawPath.split("?", 2);
+  const params = new URLSearchParams(query);
   const segments = path.split("/").filter(Boolean);
 
   if (segments.length === 0) return { name: "dashboard", path };
@@ -52,7 +63,14 @@ function parseHash(hash: string): Route {
     const sub = segments[2];
     if (!sub) return { name: "monitor", runId, path };
     if (sub === "review") return { name: "review", runId, path };
-    if (sub === "report") return { name: "report", runId, path };
+    if (sub === "report") {
+      return {
+        name: "report",
+        runId,
+        reportTab: parseReportTab(params.get("tab")),
+        path: rawPath,
+      };
+    }
     if (sub === "audit") return { name: "audit", runId, path };
   }
 
@@ -71,7 +89,10 @@ export function routes() {
     new: "/new",
     monitor: (runId: string) => `/runs/${encodeURIComponent(runId)}`,
     review: (runId: string) => `/runs/${encodeURIComponent(runId)}/review`,
-    report: (runId: string) => `/runs/${encodeURIComponent(runId)}/report`,
+    report: (runId: string, tab: ReportTab = "research") => {
+      const base = `/runs/${encodeURIComponent(runId)}/report`;
+      return tab === "research" ? base : `${base}?tab=${tab}`;
+    },
     audit: (runId: string) => `/runs/${encodeURIComponent(runId)}/audit`,
     settings: "/settings",
   };

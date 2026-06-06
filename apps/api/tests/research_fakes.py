@@ -140,7 +140,7 @@ class IntegrationFakeAzure:
                 requires_new_external_research=verdict == Verdict.NEEDS_DEEP_RESEARCH,
                 reviewer_confidence=90,
                 high_risk_flags=[],
-                public_web_search_used=True,
+                public_web_search_used=False,
             ),
             response_id,
             {"id": response_id, "status": "completed", "usage": self.review_usage},
@@ -173,7 +173,7 @@ def make_integration_orchestrator(
         research_db_path=tmp_path / "research.sqlite3",
         research_artifact_dir=tmp_path / "artifacts",
         research_poller_enabled=False,
-        research_deep_research_timeout_seconds=1800,
+        research_deep_research_timeout_seconds=7200,
     )
     return ResearchOrchestrator(
         settings=settings,

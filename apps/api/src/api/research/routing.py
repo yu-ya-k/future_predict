@@ -18,8 +18,6 @@ class RouteState(TypedDict, total=False):
     max_deep_research_runs: int
     max_llm_fix_runs: int
     max_no_progress_rounds: int
-    estimated_cost_usd: float
-    max_cost_usd: float
     total_tool_calls: int
     max_total_tool_calls: int
 
@@ -60,8 +58,6 @@ def route_after_review(state: RouteState) -> ReviewRoute:
     max_llm_fix = state.get("max_llm_fix_runs", 3)
     max_no_progress = state.get("max_no_progress_rounds", 2)
 
-    estimated_cost = state.get("estimated_cost_usd", 0.0)
-    max_cost = state.get("max_cost_usd", 999.0)
     total_tool_calls = state.get("total_tool_calls", 0)
     max_total_tool_calls = state.get("max_total_tool_calls", 999)
 
@@ -69,9 +65,6 @@ def route_after_review(state: RouteState) -> ReviewRoute:
         return "human_review"
 
     if no_progress >= max_no_progress:
-        return "human_review"
-
-    if estimated_cost >= max_cost:
         return "human_review"
 
     if total_tool_calls >= max_total_tool_calls:

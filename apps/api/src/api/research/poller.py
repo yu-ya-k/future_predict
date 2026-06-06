@@ -52,6 +52,15 @@ class ResearchPoller:
             except Exception:
                 logger.exception("Failed to mark research run %s as timed out", run.id)
 
+        stale_reviews = self.orchestrator.repository.list_stale_reviewing_runs(
+            timeout_seconds=settings.research_review_timeout_seconds,
+        )
+        for run in stale_reviews:
+            try:
+                await asyncio.to_thread(self.orchestrator.mark_review_timeout, run.id)
+            except Exception:
+                logger.exception("Failed to mark review run %s as timed out", run.id)
+
         waiting = self.orchestrator.repository.list_waiting_runs(
             timeout_seconds=settings.research_deep_research_timeout_seconds,
         )

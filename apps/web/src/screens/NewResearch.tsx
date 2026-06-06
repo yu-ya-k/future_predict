@@ -13,6 +13,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { BackLink } from "../components";
 import { createRun } from "../api/research";
 import { ApiError } from "../api/client";
 import { requestNotificationPermission } from "../notifications";
@@ -48,9 +49,6 @@ export function NewResearch() {
   const [maxNoProgress, setMaxNoProgress] = useState(
     defaults.current.max_no_progress_rounds ?? FACTORY_RESEARCH_DEFAULTS.max_no_progress_rounds,
   );
-  const [maxCost, setMaxCost] = useState(
-    defaults.current.max_cost_usd ?? FACTORY_RESEARCH_DEFAULTS.max_cost_usd,
-  );
   const [maxToolCalls, setMaxToolCalls] = useState(
     defaults.current.max_total_tool_calls ?? FACTORY_RESEARCH_DEFAULTS.max_total_tool_calls,
   );
@@ -64,7 +62,6 @@ export function NewResearch() {
       setMaxLlmFix(d.max_llm_fix_runs);
       setMaxIterations(d.max_total_iterations);
       setMaxNoProgress(d.max_no_progress_rounds);
-      setMaxCost(d.max_cost_usd);
       setMaxToolCalls(d.max_total_tool_calls);
     }
     window.addEventListener("storage", onStorage);
@@ -90,7 +87,6 @@ export function NewResearch() {
           max_llm_fix_runs: maxLlmFix,
           max_total_iterations: maxIterations,
           max_no_progress_rounds: maxNoProgress,
-          max_cost_usd: maxCost,
           max_total_tool_calls: maxToolCalls,
         },
       });
@@ -101,7 +97,6 @@ export function NewResearch() {
       trackRun({
         run_id: response.run_id,
         title,
-        max_cost_usd: maxCost,
         max_total_iterations: maxIterations,
         created_at: response.created_at,
         last_status: response.status,
@@ -126,6 +121,7 @@ export function NewResearch() {
   return (
     <div className="screen-new">
       <header className="screen-header">
+        <BackLink to={routes().dashboard} label="ダッシュボードへ戻る" />
         <h1 className="screen-title">新規リサーチを開始</h1>
         <p className="screen-subtitle">
           調査したい内容を入力してください。AIが段階的にリサーチを行い、品質レビューを経て最終レポートを生成します。
@@ -254,24 +250,6 @@ export function NewResearch() {
                   <span className="option-range">
                     {OPTION_BOUNDS.max_no_progress_rounds.min}–{OPTION_BOUNDS.max_no_progress_rounds.max}
                   </span>
-                </div>
-
-                <div className="option-field">
-                  <label className="option-label" htmlFor="max-cost">
-                    最大コスト (USD)
-                  </label>
-                  <input
-                    id="max-cost"
-                    type="number"
-                    className="option-input"
-                    value={maxCost}
-                    min={0.5}
-                    max={100}
-                    step={0.5}
-                    onChange={(e) => setMaxCost(Number(e.target.value))}
-                    disabled={submitting}
-                  />
-                  <span className="option-range">$0.50–$100</span>
                 </div>
 
                 <div className="option-field">

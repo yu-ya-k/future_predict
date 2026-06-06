@@ -20,10 +20,11 @@ import {
   Skeleton,
   StatusPill,
   WaitBanner,
+  BackLink,
   EmptyState,
   type PipelineStep,
 } from "../components";
-import { getRunStatus, getReviews, cancelRun } from "../api/research";
+import { getRunStatus, getReviews, getAttempts, cancelRun } from "../api/research";
 import { ApiError } from "../api/client";
 import { usePolling } from "../hooks/usePolling";
 import { useElapsed, formatElapsed } from "../hooks/useElapsed";
@@ -34,6 +35,7 @@ import { notify } from "../notifications";
 import {
   isTerminal,
   type ResearchRunStatusResponse,
+  type ResearchAttempt,
   type ReviewRecord,
   type RunStatus,
 } from "../types";
@@ -93,6 +95,10 @@ export function RunMonitor({ runId }: RunMonitorProps) {
 
   const [cancelling, setCancelling] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
+  const [promptPanelOpen, setPromptPanelOpen] = useState(false);
+  const [attempts, setAttempts] = useState<ResearchAttempt[] | null>(null);
+  const [attemptsLoading, setAttemptsLoading] = useState(false);
+  const [attemptsError, setAttemptsError] = useState<string | null>(null);
 
   // ── Status polling ────────────────────────────────────────────────────────
 
@@ -148,22 +154,20 @@ export function RunMonitor({ runId }: RunMonitorProps) {
     : [];
 
   const elapsed = useElapsed(tracked?.created_at, !isTerminal(status));
+  const currentDeepResearchStartedAt =
+    runStatus?.deep_research_submitted_at ?? tracked?.created_at;
+  const currentDeepResearchElapsed = useElapsed(
+    currentDeepResearchStartedAt,
+    !isTerminal(status),
+  );
 
   const isWaiting =
     status === "waiting_deep_research" || status === "collecting";
-
-  // Only estimate remaining time when we actually know the start time. For a
-  // direct-URL run with no tracked entry, `elapsed` is 0 and a "残り約30分"
-  // figure would be misleading (GAP-1), so leave it undefined.
-  const estimatedRemaining = tracked?.created_at
-    ? Math.max(0, 30 - elapsed)
-    : undefined;
 
   const showHumanReviewBanner = status === "needs_human_review";
   const showNoProgressNote =
     !!runStatus && hasNoProgressSignal(runStatus.status, sortedReviews);
 
-  const maxCost = tracked?.max_cost_usd ?? 10;
   const estimatedCost = progress?.estimated_cost_usd ?? 0;
 
   // ── Cancel action ─────────────────────────────────────────────────────────
@@ -186,10 +190,31 @@ export function RunMonitor({ runId }: RunMonitorProps) {
     }
   }
 
+  async function handleTogglePromptPanel() {
+    const nextOpen = !promptPanelOpen;
+    setPromptPanelOpen(nextOpen);
+    if (!nextOpen || attempts || attemptsLoading) return;
+
+    setAttemptsLoading(true);
+    setAttemptsError(null);
+    try {
+      setAttempts(await getAttempts(runId));
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setAttemptsError(err.detail ?? err.message);
+      } else {
+        setAttemptsError("指示内容を取得できませんでした");
+      }
+    } finally {
+      setAttemptsLoading(false);
+    }
+  }
+
   // Initial loading state
   if (statusLoading && !runStatus) {
     return (
       <div className="screen-monitor">
+        <BackLink to={routes().dashboard} label="ダッシュボードへ戻る" />
         <div className="monitor-skeleton">
           <Skeleton width="60%" height="28px" />
           <Skeleton width="100%" height="120px" />
@@ -202,6 +227,7 @@ export function RunMonitor({ runId }: RunMonitorProps) {
   if (statusError && !runStatus) {
     return (
       <div className="screen-monitor">
+        <BackLink to={routes().dashboard} label="ダッシュボードへ戻る" />
         <div className="monitor-error" role="alert">
           <p>runの状態を取得できませんでした。</p>
           <button type="button" className="btn-secondary" onClick={refetch}>
@@ -216,6 +242,7 @@ export function RunMonitor({ runId }: RunMonitorProps) {
     <div className="screen-monitor">
       {/* ── Header ───────────────────────────────────── */}
       <header className="monitor-header">
+        <BackLink to={routes().dashboard} label="ダッシュボードへ戻る" />
         <div className="monitor-header-top">
           <div className="monitor-title-row">
             <StatusPill status={status} />
@@ -227,8 +254,20 @@ export function RunMonitor({ runId }: RunMonitorProps) {
           </div>
 
           <div className="monitor-actions">
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={handleTogglePromptPanel}
+              aria-expanded={promptPanelOpen}
+              aria-controls="deep-research-prompts"
+            >
+              指示内容
+            </button>
             <Link to={routes().report(runId)} className="btn-secondary btn-sm">
-              最新レポートを見る
+              レポート履歴
+            </Link>
+            <Link to={routes().report(runId, "reviews")} className="btn-secondary btn-sm">
+              レビュー内容
             </Link>
             <Link to={routes().audit(runId)} className="btn-secondary btn-sm">
               監査ログ
@@ -256,6 +295,59 @@ export function RunMonitor({ runId }: RunMonitorProps) {
         <div className="monitor-error-banner" role="alert">
           {cancelError}
         </div>
+      )}
+
+      {promptPanelOpen && (
+        <section
+          id="deep-research-prompts"
+          className="prompt-panel"
+          aria-labelledby="deep-research-prompts-heading"
+        >
+          <div className="prompt-panel-header">
+            <div>
+              <h2 id="deep-research-prompts-heading" className="prompt-panel-title">
+                Deep Researchへの指示内容
+              </h2>
+              <p className="prompt-panel-description">
+                実際にDeep Researchへ送信したブリーフと再調査指示です。
+              </p>
+            </div>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() => setPromptPanelOpen(false)}
+            >
+              閉じる
+            </button>
+          </div>
+
+          {attemptsLoading ? (
+            <div className="prompt-panel-loading">
+              <Skeleton width="100%" height="140px" />
+            </div>
+          ) : attemptsError ? (
+            <div className="monitor-error-banner" role="alert">
+              {attemptsError}
+            </div>
+          ) : attempts && attempts.length > 0 ? (
+            <div className="prompt-attempt-list">
+              {attempts.map((attempt) => (
+                <article key={`${attempt.run_no}-${attempt.response_id ?? "pending"}`} className="prompt-attempt">
+                  <div className="prompt-attempt-header">
+                    <span className="prompt-attempt-title">Deep Research {attempt.run_no}回目</span>
+                    <span className="prompt-attempt-status">{attempt.status}</span>
+                  </div>
+                  <pre className="prompt-attempt-body">{attempt.prompt}</pre>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <EmptyState
+              title="指示内容なし"
+              description="Deep Researchへの送信記録がまだありません。"
+            />
+          )}
+        </section>
       )}
 
       {/* ── Human review banner ───────────────────────── */}
@@ -288,7 +380,7 @@ export function RunMonitor({ runId }: RunMonitorProps) {
       {/* ── Metrics row ───────────────────────────────── */}
       <div className="metrics-row">
         <MetricCard
-          label="経過時間"
+          label="トータル経過時間"
           value={formatElapsed(elapsed)}
           icon="ti-clock"
         />
@@ -303,7 +395,7 @@ export function RunMonitor({ runId }: RunMonitorProps) {
           </div>
         )}
         <div className="metric-cost-wrap">
-          <CostMeter estimated={estimatedCost} max={maxCost} />
+          <CostMeter estimated={estimatedCost} />
         </div>
       </div>
 
@@ -320,14 +412,9 @@ export function RunMonitor({ runId }: RunMonitorProps) {
       {/* ── Wait banner ───────────────────────────────── */}
       {isWaiting && (
         <WaitBanner
-          elapsedMinutes={elapsed}
-          // WaitBanner's `estimatedRemainingMinutes` is required and always
-          // renders the "残り約N分" line, so when the start time is unknown we
-          // pass 0 (clamped by the component) — the elapsed clock reads 0 too in
-          // that case, so the banner just shows tool-call progress meaningfully.
-          estimatedRemainingMinutes={estimatedRemaining ?? 0}
+          elapsedMinutes={currentDeepResearchElapsed}
+          startedAt={currentDeepResearchStartedAt}
           totalToolCalls={progress?.total_tool_calls ?? 0}
-          canLeave
         />
       )}
 

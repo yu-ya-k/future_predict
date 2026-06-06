@@ -27,7 +27,11 @@ The repository and artifact store create parent directories as needed.
 | --- | --- | --- |
 | `RESEARCH_POLLER_ENABLED` | `true` | Starts `ResearchPoller` during FastAPI lifespan. |
 | `RESEARCH_POLLER_INTERVAL_SECONDS` | `5` | Delay between poller ticks. |
-| `RESEARCH_DEEP_RESEARCH_TIMEOUT_SECONDS` | `1800` | Marks waiting Deep Research runs as timed out after this many seconds. |
+| `RESEARCH_DEEP_RESEARCH_TIMEOUT_SECONDS` | `7200` | Marks waiting Deep Research runs as timed out after this many seconds. |
+| `RESEARCH_REVIEW_TIMEOUT_SECONDS` | `180` | Bounds GPT-5.5 review calls and marks stale `reviewing` runs as `review_timeout`. |
+| `RESEARCH_REVIEW_MAX_REPORT_CHARS` | `50000` | Caps report text sent to the reviewer. Long reports are truncated with a marker. |
+| `RESEARCH_REVIEW_MAX_CITATIONS` | `40` | Caps citation metadata sent to the reviewer. |
+| `RESEARCH_REVIEW_WEB_SEARCH_ENABLED` | `false` | Enables reviewer Web Search when explicitly needed. The default review uses the report and collected citations only. |
 
 When the poller is disabled, submitted runs can remain `waiting_deep_research`
 until code explicitly calls `collect_deep_research`.
@@ -43,21 +47,23 @@ override in `options`.
 | `DEFAULT_MAX_LLM_FIX_RUNS` | `3` | Maximum LLM finalization/fix attempts. |
 | `DEFAULT_MAX_TOTAL_ITERATIONS` | `5` | Maximum total review loop iterations. |
 | `DEFAULT_MAX_NO_PROGRESS_ROUNDS` | `2` | Maximum repeated no-progress rounds before human review. |
-| `DEFAULT_MAX_COST_USD` | `20` | Estimated-cost ceiling before human review or resume block. |
 | `DEFAULT_MAX_TOTAL_TOOL_CALLS` | `120` | Tool-call ceiling before human review or resume block. |
 
 ## Cost Estimation
 
 | Variable | Default | Used for |
 | --- | --- | --- |
-| `RESEARCH_DEEP_RESEARCH_INPUT_COST_PER_1M` | `0` | Deep Research input token cost per one million tokens. |
-| `RESEARCH_DEEP_RESEARCH_OUTPUT_COST_PER_1M` | `0` | Deep Research output token cost per one million tokens. |
-| `RESEARCH_REVIEWER_INPUT_COST_PER_1M` | `0` | Reviewer/finalizer input token cost per one million tokens. |
-| `RESEARCH_REVIEWER_OUTPUT_COST_PER_1M` | `0` | Reviewer/finalizer output token cost per one million tokens. |
-| `RESEARCH_WEB_SEARCH_COST_PER_CALL` | `0` | Cost added per billable web-search tool call. |
+| `RESEARCH_DEEP_RESEARCH_INPUT_COST_PER_1M` | `10` | `o3-deep-research` input token cost per one million tokens. |
+| `RESEARCH_DEEP_RESEARCH_OUTPUT_COST_PER_1M` | `40` | `o3-deep-research` output token cost per one million tokens. |
+| `RESEARCH_REVIEWER_INPUT_COST_PER_1M` | `5` | `gpt-5.5` reviewer/finalizer input token cost per one million tokens. |
+| `RESEARCH_REVIEWER_OUTPUT_COST_PER_1M` | `30` | `gpt-5.5` reviewer/finalizer output token cost per one million tokens. |
+| `RESEARCH_WEB_SEARCH_COST_PER_CALL` | `0.01` | Cost added per billable web-search tool call. |
 
 Cost events are estimates based on response usage metadata and extracted tool
-calls. Defaults are zero so local tests do not create artificial costs.
+calls. When explicit rate environment variables are zero or omitted, known Azure
+deployment names are matched back to `o3-deep-research` or `gpt-5.5` and priced
+with the built-in defaults above. Unknown models remain at zero unless explicit
+rates are configured.
 
 ## Azure OpenAI: Deep Research
 

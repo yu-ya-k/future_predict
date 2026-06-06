@@ -3,14 +3,11 @@
  *
  * Responsibilities:
  *  - Prefix requests with VITE_API_BASE_URL (env.ts).
- *  - Auto-inject the `X-Reviewer-Id` header on endpoints that require it
- *    (GAP-4). Throws ReviewerRequiredError before the request if missing.
  *  - Normalise non-2xx responses into a typed ApiError carrying the status,
  *    so callers can branch on 401 / 404 / 409 (GAP-4, A4 guards).
  */
 
 import { env } from "../env";
-import { getReviewerId } from "../reviewer";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -36,36 +33,18 @@ export class ApiError extends Error {
   }
 }
 
-/** Raised client-side when a reviewer-scoped endpoint is called without an id. */
-export class ReviewerRequiredError extends ApiError {
-  constructor() {
-    super(401, "Reviewer identity is required.");
-    this.name = "ReviewerRequiredError";
-  }
-}
-
 interface RequestOptions {
-  method?: "GET" | "POST";
+  method?: "DELETE" | "GET" | "POST";
   body?: unknown;
-  /** Require + inject the X-Reviewer-Id header (GAP-4). */
-  reviewer?: boolean;
   signal?: AbortSignal;
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { method = "GET", body, reviewer = false, signal } = options;
+  const { method = "GET", body, signal } = options;
 
   const headers: Record<string, string> = {};
   if (body !== undefined) {
     headers["Content-Type"] = "application/json";
-  }
-
-  if (reviewer) {
-    const reviewerId = getReviewerId();
-    if (!reviewerId) {
-      throw new ReviewerRequiredError();
-    }
-    headers["X-Reviewer-Id"] = reviewerId;
   }
 
   let response: Response;

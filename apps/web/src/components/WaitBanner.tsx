@@ -20,12 +20,11 @@ function LoaderIcon() {
 
 export function WaitBanner({
   elapsedMinutes,
-  estimatedRemainingMinutes,
+  startedAt,
   totalToolCalls,
-  canLeave = true,
 }: WaitBannerProps) {
-  const remaining = Math.max(0, Math.round(estimatedRemainingMinutes));
   const elapsed = Math.round(elapsedMinutes);
+  const startedLabel = formatStartedAt(startedAt);
 
   return (
     // INVARIANT I-2: always visible during long-running jobs
@@ -34,24 +33,31 @@ export function WaitBanner({
       <div className="wait-banner__body">
         <p className="wait-banner__main">
           Deep Research をバックグラウンド実行中。
-          残り約{" "}
-          <strong className="wait-banner__highlight">{remaining}分</strong>
           {totalToolCalls > 0 && (
             <>
-              、これまでに{" "}
+              {" "}これまでに{" "}
               <strong className="wait-banner__highlight">{totalToolCalls} 件</strong>
-              の処理ステップ完了
+              の処理ステップが完了しています。
             </>
           )}
-          。
         </p>
         <p className="wait-banner__sub">
-          経過時間: {elapsed}分
-          {canLeave && (
-            <> — 完了したら通知します。この画面は閉じても大丈夫です。</>
+          今回の経過時間: {elapsed}分
+          {startedLabel && (
+            <> ・ 開始時刻: {startedLabel}</>
           )}
         </p>
       </div>
     </div>
   );
+}
+
+function formatStartedAt(value: string | undefined): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return new Intl.DateTimeFormat("ja-JP", {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
 }

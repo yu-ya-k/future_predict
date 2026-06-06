@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from api.research.dependencies import get_research_orchestrator
 from api.research.schemas import (
@@ -32,21 +32,6 @@ router = APIRouter(prefix="/research-runs", tags=["research-runs"])
 OrchestratorDependency = Annotated[ResearchOrchestrator, Depends(get_research_orchestrator)]
 
 
-def require_reviewer_id(
-    x_reviewer_id: Annotated[str | None, Header(alias="X-Reviewer-Id")] = None,
-) -> str:
-    reviewer_id = (x_reviewer_id or "").strip()
-    if not reviewer_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Reviewer identity is required.",
-        )
-    return reviewer_id
-
-
-ReviewerIdentityDependency = Annotated[str, Depends(require_reviewer_id)]
-
-
 @router.post("", response_model=CreateResearchRunResponse, status_code=status.HTTP_202_ACCEPTED)
 def create_research_run(
     request: CreateResearchRunRequest,
@@ -64,7 +49,6 @@ def create_research_run(
 @router.get("/human-reviews", response_model=list[HumanReviewQueueItem])
 def list_human_reviews(
     orchestrator: OrchestratorDependency,
-    _reviewer_id: ReviewerIdentityDependency,
 ) -> list[HumanReviewQueueItem]:
     return orchestrator.list_human_reviews()
 
@@ -85,11 +69,18 @@ def _status_response(
     run = orchestrator.repository.get_run(run_id)
     reviews = orchestrator.repository.get_reviews(run.id)
     latest = reviews[-1] if reviews else None
+    estimated_cost_usd = orchestrator.estimate_run_cost_usd(
+        run.id,
+        fallback=run.estimated_cost_usd,
+    )
     return ResearchRunStatusResponse(
         run_id=run.id,
         status=run.status,
         done_reason=run.done_reason,
         needs_human_review=run.needs_human_review,
+        deep_research_submitted_at=orchestrator.repository.get_deep_research_submitted_at(
+            run.id
+        ),
         progress=RunProgress(
             deep_research_runs=run.deep_research_runs,
             llm_fix_runs=run.llm_fix_runs,
@@ -97,7 +88,7 @@ def _status_response(
             latest_verdict=latest.verdict if latest else None,
             latest_score=latest.score if latest else None,
             total_tool_calls=run.total_tool_calls,
-            estimated_cost_usd=run.estimated_cost_usd,
+            estimated_cost_usd=estimated_cost_usd,
         ),
     )
 
@@ -129,7 +120,7 @@ def get_audit(
         reviews=orchestrator.repository.get_reviews(run.id),
         citations=orchestrator.repository.get_citations(run.id),
         tool_calls=orchestrator.repository.get_tool_calls(run.id),
-        cost_events=orchestrator.repository.get_cost_events(run.id),
+        cost_events=orchestrator.get_cost_events(run.id),
         human_decisions=orchestrator.repository.get_human_decisions(run.id),
         history=orchestrator.repository.get_history(run.id),
     )
@@ -177,14 +168,13 @@ def get_cost_events(
     orchestrator: OrchestratorDependency,
 ) -> list[CostEvent]:
     run = _get_run_or_404(orchestrator, run_id)
-    return orchestrator.repository.get_cost_events(run.id)
+    return orchestrator.get_cost_events(run.id)
 
 
 @router.get("/{run_id}/human-review", response_model=HumanReviewPayload)
 def get_human_review_payload(
     run_id: UUID,
     orchestrator: OrchestratorDependency,
-    _reviewer_id: ReviewerIdentityDependency,
 ) -> HumanReviewPayload:
     _get_run_or_404(orchestrator, run_id)
     try:
@@ -200,7 +190,6 @@ def get_human_review_payload(
 def get_human_decisions(
     run_id: UUID,
     orchestrator: OrchestratorDependency,
-    _reviewer_id: ReviewerIdentityDependency,
 ) -> list[HumanReviewDecision]:
     run = _get_run_or_404(orchestrator, run_id)
     return orchestrator.repository.get_human_decisions(run.id)
@@ -216,12 +205,29 @@ def cancel_run(
     return CancelResponse(run_id=run.id, status=run.status)
 
 
+@router.delete("/{run_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_research_run(
+    run_id: UUID,
+    orchestrator: OrchestratorDependency,
+) -> None:
+    try:
+        orchestrator.delete_run(run_id)
+    except KeyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Run not found."
+        ) from error
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        ) from error
+
+
 @router.post("/{run_id}/resume", response_model=HumanReviewResumeResponse)
 def resume_run(
     run_id: UUID,
     request: HumanReviewResumeAPIRequest,
     orchestrator: OrchestratorDependency,
-    reviewer_id: ReviewerIdentityDependency,
 ) -> HumanReviewResumeResponse:
     _get_run_or_404(orchestrator, run_id)
     try:
@@ -231,7 +237,6 @@ def resume_run(
                 action=request.action,
                 comment=request.comment,
             ),
-            reviewer_id=reviewer_id,
         )
     except ValueError as error:
         raise HTTPException(

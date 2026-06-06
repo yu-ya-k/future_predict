@@ -2,9 +2,8 @@
  * Locally tracked runs (ui_plan.md A2 GAP-1, A5).
  *
  * There is no `GET /research-runs` list endpoint, and the status response does
- * not carry `max_cost_usd`. So when a run is created (SCR-1) we persist the run
- * id plus the request-time metadata the UI needs (cost ceiling, dashboard title)
- * to localStorage.
+ * not carry the dashboard title. So when a run is created (SCR-1) we persist
+ * the run id plus the request-time metadata the UI needs to localStorage.
  * The dashboard (SCR-2) reconstructs its "in progress / done" lists from here.
  */
 
@@ -14,8 +13,6 @@ export interface TrackedRun {
   run_id: string;
   /** First line / summary of the user prompt, for list display. */
   title: string;
-  /** Cost ceiling from the create request options (CostMeter max). */
-  max_cost_usd: number;
   /**
    * Iteration ceiling from the create request options
    * (`max_total_iterations`). The status response does not carry it, so the

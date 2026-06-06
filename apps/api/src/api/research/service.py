@@ -7,8 +7,16 @@ from pydantic import ValidationError
 
 from api.config import Settings
 from api.research.artifacts import ArtifactStore
-from api.research.azure_responses import AzureResponsesClient, ReviewResponseParseError
-from api.research.costing import build_cost_event, count_billable_web_search_calls
+from api.research.azure_responses import (
+    AzureResponsesClient,
+    ReviewRequestTimeout,
+    ReviewResponseParseError,
+)
+from api.research.costing import (
+    build_cost_event,
+    count_billable_web_search_calls,
+    estimate_usage_cost_usd,
+)
 from api.research.extractors import (
     extract_citations,
     extract_tool_calls,
@@ -22,6 +30,7 @@ from api.research.progress import compute_no_progress_count, report_hash
 from api.research.repository import ResearchRepository
 from api.research.routing import MIN_REVIEWER_CONFIDENCE_FOR_AUTO_FINALIZE, route_after_review
 from api.research.schemas import (
+    CostEvent,
     CreateResearchRunRequest,
     HumanReviewAction,
     HumanReviewAuditSummary,
@@ -52,6 +61,7 @@ class ResearchOrchestrator:
         self.repository = repository
         self.artifacts = artifacts
         self.azure = azure
+        self._active_review_run_ids: set[UUID] = set()
 
     def create_run(self, request: CreateResearchRunRequest) -> ResearchRunRecord:
         run = self.repository.create_run(
@@ -379,17 +389,34 @@ class ResearchOrchestrator:
         previous_reviews = self.repository.get_reviews(run.id)
         acceptance_criteria = _acceptance_criteria_from_history(self.repository.get_history(run.id))
         try:
-            review_result, response_id, raw_response = self._review_with_retry(
-                run=run,
-                acceptance_criteria=acceptance_criteria,
-            )
+            self._active_review_run_ids.add(run.id)
+            try:
+                review_result, response_id, raw_response = self._review_with_retry(
+                    run=run,
+                    acceptance_criteria=acceptance_criteria,
+                )
+            finally:
+                self._active_review_run_ids.discard(run.id)
             run = self.repository.get_run(run.id)
-            if _is_terminal_run_status(run.status):
+            if run.status != RunStatus.REVIEWING or run.needs_human_review:
+                if raw_response:
+                    self.artifacts.save_json(
+                        run.id,
+                        f"raw-responses/review_resp_ignored_{run.total_reviews + 1:03d}.json",
+                        raw_response,
+                    )
+                    self._record_review_response_cost(
+                        run_id=run.id,
+                        response_id=response_id,
+                        raw_response=raw_response,
+                        step="review_ignored",
+                    )
                 self.repository.append_history_event(
                     run.id,
                     {
-                        "step": "review_ignored_terminal_run",
+                        "step": "review_ignored_status_changed",
                         "status": run.status.value,
+                        "needs_human_review": run.needs_human_review,
                         "response_id": response_id,
                     },
                 )
@@ -407,6 +434,16 @@ class ResearchOrchestrator:
             return self._enter_human_review(
                 run.id,
                 done_reason="review_schema_or_request_failed",
+                allowed_statuses={RunStatus.REVIEWING},
+            )
+        except ReviewRequestTimeout as error:
+            self.repository.append_history_event(
+                run.id,
+                {"step": "review_failed", "error": repr(error)},
+            )
+            return self._enter_human_review(
+                run.id,
+                done_reason="review_timeout",
                 allowed_statuses={RunStatus.REVIEWING},
             )
         except (ValueError, ValidationError, RuntimeError) as error:
@@ -482,8 +519,6 @@ class ResearchOrchestrator:
                 "max_deep_research_runs": run.max_deep_research_runs,
                 "max_llm_fix_runs": run.max_llm_fix_runs,
                 "max_no_progress_rounds": run.max_no_progress_rounds,
-                "estimated_cost_usd": next_estimated_cost,
-                "max_cost_usd": run.max_cost_usd,
                 "total_tool_calls": next_total_tool_calls,
                 "max_total_tool_calls": run.max_total_tool_calls,
             }
@@ -599,17 +634,61 @@ class ResearchOrchestrator:
             human_comment=human_comment,
         )
         try:
-            revised_report, response_id, raw_response = self._call_llm_finalize(
-                prompt=prompt,
-                run=run,
+            self._active_review_run_ids.add(run.id)
+            self.repository.append_history_event(
+                run.id,
+                {
+                    "step": "llm_finalize_attempt_started",
+                    "run_no": run_no,
+                    "review_timeout_seconds": self.settings.research_review_timeout_seconds,
+                },
             )
+            try:
+                revised_report, response_id, raw_response = self._call_llm_finalize(
+                    prompt=prompt,
+                    run=run,
+                )
+            except Exception as error:
+                self.repository.append_history_event(
+                    run.id,
+                    {
+                        "step": "llm_finalize_attempt_failed",
+                        "run_no": run_no,
+                        "error": repr(error),
+                    },
+                )
+                raise
+            else:
+                self.repository.append_history_event(
+                    run.id,
+                    {
+                        "step": "llm_finalize_attempt_completed",
+                        "run_no": run_no,
+                        "response_id": response_id,
+                    },
+                )
+            finally:
+                self._active_review_run_ids.discard(run.id)
             latest_run = self.repository.get_run(run.id)
-            if _is_terminal_run_status(latest_run.status):
+            if latest_run.status != RunStatus.REVIEWING or latest_run.needs_human_review:
+                if raw_response:
+                    self.artifacts.save_json(
+                        run.id,
+                        f"raw-responses/llm_finalize_resp_ignored_{run_no:03d}.json",
+                        raw_response,
+                    )
+                    self._record_review_response_cost(
+                        run_id=latest_run.id,
+                        response_id=response_id,
+                        raw_response=raw_response,
+                        step="llm_finalize_ignored",
+                    )
                 self.repository.append_history_event(
                     latest_run.id,
                     {
-                        "step": "llm_finalize_ignored_terminal_run",
+                        "step": "llm_finalize_ignored_status_changed",
                         "status": latest_run.status.value,
+                        "needs_human_review": latest_run.needs_human_review,
                         "response_id": response_id,
                     },
                 )
@@ -720,14 +799,25 @@ class ResearchOrchestrator:
             warnings=run.warnings,
         )
 
+    def get_cost_events(self, run_id: UUID) -> list[CostEvent]:
+        return [
+            event.model_copy(
+                update={"estimated_cost_usd": self._estimate_cost_event(run_id, event)}
+            )
+            for event in self.repository.get_cost_events(run_id)
+        ]
+
+    def estimate_run_cost_usd(self, run_id: UUID, fallback: float = 0.0) -> float:
+        cost_events = self.get_cost_events(run_id)
+        if not cost_events:
+            return fallback
+        return sum(event.estimated_cost_usd for event in cost_events)
+
     def resume_run(
         self,
         run_id: UUID,
         request: HumanReviewResumeRequest,
-        *,
-        reviewer_id: str | None = None,
     ) -> ResearchRunRecord:
-        decision_reviewer_id = reviewer_id or request.reviewer_id
         pending_run = self.repository.get_run(run_id)
         if not _is_waiting_for_human_review(pending_run):
             raise ValueError("Run is not waiting for human review.")
@@ -741,7 +831,6 @@ class ResearchOrchestrator:
                     "action": request.action.value,
                     "reason": blocked_reason,
                     "comment": request.comment,
-                    "reviewer_id": decision_reviewer_id,
                 },
             )
             raise ValueError(
@@ -752,7 +841,7 @@ class ResearchOrchestrator:
             run_id,
             action=request.action,
             comment=request.comment,
-            reviewer_id=decision_reviewer_id,
+            reviewer_id=None,
         )
         if claimed is None:
             raise ValueError("Run is not waiting for human review.")
@@ -786,6 +875,16 @@ class ResearchOrchestrator:
                 needs_human_review=False,
             )
             return completed or self.repository.get_run(run.id)
+
+        if request.action == HumanReviewAction.REQUEST_REVIEW:
+            self.repository.append_history_event(
+                run.id,
+                {
+                    "step": "review_retry_requested_by_human",
+                    "comment": request.comment,
+                },
+            )
+            return self.review_run(run.id)
 
         if request.action == HumanReviewAction.REQUEST_LLM_FIX:
             return self.llm_finalize(run.id, human_comment=request.comment)
@@ -841,6 +940,35 @@ class ResearchOrchestrator:
             deep_research_status="timeout",
         )
 
+    def mark_review_timeout(self, run_id: UUID) -> ResearchRunRecord:
+        run = self.repository.get_run(run_id)
+        if run.status != RunStatus.REVIEWING:
+            return run
+        if run.id in self._active_review_run_ids:
+            self.repository.append_history_event(
+                run.id,
+                {
+                    "step": "review_timeout_skipped_active_operation",
+                    "timeout_seconds": self.settings.research_review_timeout_seconds,
+                    "total_reviews": run.total_reviews,
+                },
+            )
+            return run
+
+        self.repository.append_history_event(
+            run.id,
+            {
+                "step": "review_timeout",
+                "timeout_seconds": self.settings.research_review_timeout_seconds,
+                "total_reviews": run.total_reviews,
+            },
+        )
+        return self._enter_human_review(
+            run.id,
+            done_reason="review_timeout",
+            allowed_statuses={RunStatus.REVIEWING},
+        )
+
     def cancel_run(self, run_id: UUID) -> ResearchRunRecord:
         run = self.repository.get_run(run_id)
         if _is_terminal_run_status(run.status):
@@ -880,12 +1008,25 @@ class ResearchOrchestrator:
 
         return updated
 
+    def delete_run(self, run_id: UUID) -> None:
+        run = self.repository.get_run(run_id)
+        if not _is_terminal_run_status(run.status) and _has_pending_remote_deep_research(run):
+            if not self._cancel_remote_response(
+                run,
+                history_step_prefix="delete_remote_cancel",
+            ):
+                raise RuntimeError("Remote Deep Research cancel failed; run was not deleted.")
+        deleted = self.repository.delete_run(run.id)
+        if not deleted:
+            raise KeyError(str(run.id))
+        self.artifacts.delete_run(run.id)
+
     def _cancel_remote_response(
         self,
         run: ResearchRunRecord,
         *,
         history_step_prefix: str,
-    ) -> None:
+    ) -> bool:
         response_id = run.pending_deep_research_response_id
         if not response_id:
             self.repository.append_history_event(
@@ -895,7 +1036,7 @@ class ResearchOrchestrator:
                     "reason": "missing_response_id",
                 },
             )
-            return
+            return True
 
         try:
             self.azure.cancel_response(response_id)
@@ -908,7 +1049,7 @@ class ResearchOrchestrator:
                     "error": repr(error),
                 },
             )
-            return
+            return False
 
         self.repository.append_history_event(
             run.id,
@@ -917,6 +1058,15 @@ class ResearchOrchestrator:
                 "response_id": response_id,
             },
         )
+        if history_step_prefix == "delete_remote_cancel":
+            self.repository.append_history_event(
+                run.id,
+                {
+                    "step": "delete_remote_cancel_confirmed",
+                    "response_id": response_id,
+                },
+            )
+        return True
 
     def _cancel_submitted_response_after_status_change(
         self,
@@ -953,15 +1103,68 @@ class ResearchOrchestrator:
     ) -> tuple[Any, str | None, dict[str, Any]]:
         last_error: Exception | None = None
         citations = [citation.model_dump() for citation in self.repository.get_citations(run.id)]
+        omitted_report_chars = max(
+            len(run.report or "") - self.settings.research_review_max_report_chars,
+            0,
+        )
+        omitted_citations = max(
+            len(citations) - self.settings.research_review_max_citations,
+            0,
+        )
+        if omitted_report_chars or omitted_citations:
+            self.repository.append_history_event(
+                run.id,
+                {
+                    "step": "review_context_bounded",
+                    "omitted_report_chars": omitted_report_chars,
+                    "omitted_citation_count": omitted_citations,
+                    "max_report_chars": self.settings.research_review_max_report_chars,
+                    "max_citations": self.settings.research_review_max_citations,
+                },
+            )
         for attempt_no in range(2):
+            self.repository.append_history_event(
+                run.id,
+                {
+                    "step": "review_attempt_started",
+                    "attempt_no": attempt_no + 1,
+                    "review_timeout_seconds": self.settings.research_review_timeout_seconds,
+                    "report_chars": len(run.report or ""),
+                    "user_prompt_chars": len(run.user_prompt),
+                    "optimized_prompt_chars": len(run.optimized_prompt or run.user_prompt),
+                    "citations_count": len(citations),
+                    "max_report_chars": self.settings.research_review_max_report_chars,
+                    "max_citations": self.settings.research_review_max_citations,
+                    "web_search_enabled": self.settings.research_review_web_search_enabled,
+                },
+            )
             try:
-                return self.azure.review_report(
+                result = self.azure.review_report(
                     user_prompt=run.user_prompt,
                     optimized_prompt=run.optimized_prompt or run.user_prompt,
                     acceptance_criteria=acceptance_criteria,
                     report=run.report or "",
                     citations=citations,
                 )
+                self.repository.append_history_event(
+                    run.id,
+                    {
+                        "step": "review_attempt_completed",
+                        "attempt_no": attempt_no + 1,
+                        "response_id": result[1],
+                    },
+                )
+                return result
+            except ReviewRequestTimeout as error:
+                self.repository.append_history_event(
+                    run.id,
+                    {
+                        "step": "review_attempt_failed",
+                        "attempt_no": attempt_no + 1,
+                        "error": repr(error),
+                    },
+                )
+                raise
             except ReviewResponseParseError as error:
                 last_error = error
                 raw_response = error.raw_response
@@ -1093,7 +1296,34 @@ class ResearchOrchestrator:
             total_reviews=run.total_reviews,
             no_progress_count=run.no_progress_count,
             total_tool_calls=run.total_tool_calls,
-            estimated_cost_usd=run.estimated_cost_usd,
+            estimated_cost_usd=self.estimate_run_cost_usd(
+                run.id,
+                fallback=run.estimated_cost_usd,
+            ),
+        )
+
+    def _estimate_cost_event(self, run_id: UUID, event: CostEvent) -> float:
+        if event.step == "deep_research":
+            input_cost_per_1m = self.settings.research_deep_research_input_cost_per_1m
+            output_cost_per_1m = self.settings.research_deep_research_output_cost_per_1m
+        else:
+            input_cost_per_1m = self.settings.research_reviewer_input_cost_per_1m
+            output_cost_per_1m = self.settings.research_reviewer_output_cost_per_1m
+        billable_tool_calls = self.repository.count_billable_web_search_tool_calls(
+            run_id,
+            step=event.step,
+            response_id=event.response_id,
+        )
+        return estimate_usage_cost_usd(
+            model=event.model,
+            input_tokens=event.input_tokens,
+            output_tokens=event.output_tokens,
+            billable_tool_calls=(
+                event.tool_calls if billable_tool_calls is None else billable_tool_calls
+            ),
+            input_cost_per_1m=input_cost_per_1m,
+            output_cost_per_1m=output_cost_per_1m,
+            tool_call_cost=self.settings.research_web_search_cost_per_call,
         )
 
     def _build_human_review_queue_item(
@@ -1138,8 +1368,12 @@ rationale: {latest_review.rationale}"""
         source_quality_concerns = (
             [] if latest_review is None else latest_review.source_quality_concerns
         )
-        next_instructions = None if latest_review is None else latest_review.next_instructions
-        human_block = human_comment or "なし"
+        next_instructions = (
+            "None."
+            if latest_review is None or latest_review.next_instructions is None
+            else latest_review.next_instructions
+        )
+        human_block = human_comment or "None."
         return f"""# Original User Prompt
 {run.user_prompt}
 
@@ -1170,8 +1404,11 @@ rationale: {latest_review.rationale}"""
 # Rerun Policy
 Do not merely rewrite the previous report.
 Re-investigate weak areas.
+Treat # Next Instructions as the primary guidance for the next Deep Research run.
 Focus on missing evidence, outdated facts, contradictions, and insufficient sources.
 Return a complete revised report with citations.
+Write the entire Deep Research output in English, even if the original prompt,
+previous report, review, or human comment is in another language.
 """
 
     def _build_llm_finalize_prompt(
@@ -1181,18 +1418,20 @@ Return a complete revised report with citations.
         review: ReviewRecord,
         human_comment: str | None,
     ) -> str:
-        human_block = human_comment or "なし"
-        return f"""あなたは熟練のリサーチ・エディタです。
+        human_block = human_comment or "None."
+        return f"""You are an expert research editor.
 
-既存レポートをベースに、レビューで指摘された軽微な不足のみを補ってください。
-必要に応じて限定的な事実確認をしてください。
+Use the existing report as the base and address only the minor gaps identified in the review.
+Perform limited fact checks if needed.
 
-禁止:
-- 根拠のない新情報を追加しない
-- 出典を捏造しない
-- 大きな論点を新規に広げない
-- Deep Research が必要な不足を LLM だけで埋めたふりをしない
-- 不確実な点を断定しない
+Rules:
+- Do not add unsupported new information.
+- Do not fabricate citations.
+- Do not substantially expand the scope.
+- Do not pretend to resolve gaps that require another Deep Research run.
+- Do not state uncertain points as facts.
+- Write the final report in English, even if the prompt, report, review, or human
+  comment is in another language.
 
 # User Prompt
 {run.user_prompt}
@@ -1213,7 +1452,7 @@ next_instructions: {review.next_instructions}
 {human_block}
 
 # Output
-完成版レポート本文のみを返してください。
+Return only the final report body.
 """
 
     def _call_llm_finalize(
@@ -1262,6 +1501,13 @@ def _is_terminal_run_status(status: RunStatus) -> bool:
     return status in TERMINAL_RUN_STATUSES
 
 
+def _has_pending_remote_deep_research(run: ResearchRunRecord) -> bool:
+    return (
+        run.status in {RunStatus.WAITING_DEEP_RESEARCH, RunStatus.COLLECTING}
+        and bool(run.pending_deep_research_response_id)
+    )
+
+
 def _human_review_route_reason(review: ReviewRecord) -> str:
     if review.high_risk_flags:
         return "review_route_high_risk"
@@ -1282,14 +1528,21 @@ def _blocked_human_resume_reason(
     run: ResearchRunRecord,
     action: HumanReviewAction,
 ) -> str | None:
+    if action == HumanReviewAction.REQUEST_REVIEW:
+        if run.done_reason not in {
+            "review_timeout",
+            "review_schema_or_request_failed",
+        }:
+            return "review_retry_available_only_after_review_error"
+        if not run.report:
+            return "missing_report_for_review_retry"
+        return None
+
     if action not in {
         HumanReviewAction.REQUEST_LLM_FIX,
         HumanReviewAction.REQUEST_DEEP_RESEARCH,
     }:
         return None
-
-    if run.estimated_cost_usd >= run.max_cost_usd:
-        return "max_cost_usd_reached"
 
     if run.total_tool_calls >= run.max_total_tool_calls:
         return "max_total_tool_calls_reached"

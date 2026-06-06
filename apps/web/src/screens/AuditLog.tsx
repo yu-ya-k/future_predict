@@ -14,6 +14,7 @@
 import { useState } from "react";
 
 import {
+  BackLink,
   EmptyState,
   FlagChip,
   ScoreChip,
@@ -22,6 +23,7 @@ import {
 } from "../components";
 import { getAudit } from "../api/research";
 import { usePolling } from "../hooks/usePolling";
+import { routes } from "../router";
 import type { AuditResponse } from "../types";
 
 type TabId = "attempts" | "reviews" | "tool-calls" | "citations" | "cost" | "human-decisions";
@@ -247,7 +249,6 @@ function HumanDecisionsTab({ data }: { data: AuditResponse }) {
           <tr>
             <th>#</th>
             <th>アクション</th>
-            <th>レビュアーID</th>
             <th>コメント</th>
             <th>日時</th>
           </tr>
@@ -257,7 +258,6 @@ function HumanDecisionsTab({ data }: { data: AuditResponse }) {
             <tr key={d.decision_no}>
               <td className="mono">{d.decision_no}</td>
               <td>{d.action}</td>
-              <td className="mono">{d.reviewer_id ?? "—"}</td>
               <td>{d.comment ?? "—"}</td>
               <td className="audit-date">{d.created_at}</td>
             </tr>
@@ -282,6 +282,7 @@ export function AuditLog({ runId }: AuditLogProps) {
   if (loading && !data) {
     return (
       <div className="screen-audit">
+        <BackLink to={routes().monitor(runId)} label="Runへ戻る" />
         <div className="audit-skeleton">
           <Skeleton width="50%" height="28px" />
           <Skeleton width="100%" height="40px" />
@@ -294,6 +295,7 @@ export function AuditLog({ runId }: AuditLogProps) {
   if (error && !data) {
     return (
       <div className="screen-audit">
+        <BackLink to={routes().monitor(runId)} label="Runへ戻る" />
         <div className="audit-error" role="alert">
           <p>監査ログの取得に失敗しました。</p>
           <button type="button" className="btn-secondary" onClick={refetch}>
@@ -309,6 +311,7 @@ export function AuditLog({ runId }: AuditLogProps) {
   return (
     <div className="screen-audit">
       <header className="audit-header">
+        <BackLink to={routes().monitor(runId)} label="Runへ戻る" />
         <h1 className="screen-title">監査ログ</h1>
         <p className="audit-run-id mono">{runId}</p>
       </header>

@@ -2,16 +2,15 @@
  * SCR-2: Dashboard — run overview.
  *
  * Two data sources:
- *  1. listHumanReviews() — "要対応" band (reviewer-scoped, polled at HUMAN_REVIEW_QUEUE_INTERVAL).
+ *  1. listHumanReviews() — "要対応" band (polled at HUMAN_REVIEW_QUEUE_INTERVAL).
  *  2. getTrackedRuns() from localStorage — "進行中" / "完了/終了" sections.
  *     Non-terminal runs are individually polled at TRACKED_RUN_INTERVAL.
  *     Terminal runs render statically from last_status.
  *
  * GAP-1: No GET /research-runs list endpoint — localStorage-based fallback.
- * ReviewerRequiredError on the queue section shows a prompt instead of crashing.
  */
 
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import {
   EmptyState,
@@ -19,7 +18,7 @@ import {
   Skeleton,
   StatusPill,
 } from "../components";
-import { listHumanReviews, getRunStatus } from "../api/research";
+import { deleteRun, listHumanReviews, getRunStatus } from "../api/research";
 import { ApiError } from "../api/client";
 import { usePolling } from "../hooks/usePolling";
 import { useElapsed, formatElapsed } from "../hooks/useElapsed";
@@ -31,21 +30,15 @@ import { navigate, routes, Link } from "../router";
 import {
   getTrackedRuns,
   subscribeRuns,
+  untrackRun,
   updateTrackedStatus,
   type TrackedRun,
 } from "../runStore";
-import { getReviewerId, subscribeReviewer } from "../reviewer";
 import {
   isTerminal,
   type HumanReviewQueueItem,
   type ResearchRunStatusResponse,
 } from "../types";
-
-// ── Reviewer-ID setup ─────────────────────────────────────────────────────────
-
-function useReviewerId() {
-  return useSyncExternalStore(subscribeReviewer, getReviewerId);
-}
 
 // ── Tracked runs from localStorage (manual subscription to avoid snapshot cache issue) ──
 
@@ -66,69 +59,123 @@ function useTrackedRuns() {
 interface RunCardProps {
   tracked: TrackedRun;
   liveStatus?: ResearchRunStatusResponse;
+  deleting: boolean;
+  onDelete: (runId: string) => void;
 }
 
-function RunCard({ tracked, liveStatus }: RunCardProps) {
+function RunCard({ tracked, liveStatus, deleting, onDelete }: RunCardProps) {
   const status = liveStatus?.status ?? tracked.last_status ?? "queued";
   const score =
     liveStatus?.progress.latest_score ?? tracked.last_latest_score ?? null;
   const totalReviews = liveStatus?.progress.total_reviews ?? 0;
   const elapsed = useElapsed(tracked.created_at, !isTerminal(status));
+  const deleteLabel = isTerminal(status)
+    ? `削除: ${tracked.title}`
+    : `停止して削除: ${tracked.title}`;
 
   return (
-    <Link
-      to={routes().monitor(tracked.run_id)}
-      className="run-card"
-      aria-label={`${tracked.title} — ${status}`}
-    >
-      <div className="run-card-header">
-        <div className="run-card-badges">
-          <StatusPill status={status} />
+    <article className="run-card">
+      <Link
+        to={routes().monitor(tracked.run_id)}
+        className="run-card-link"
+        aria-label={`${tracked.title} — ${status}`}
+      >
+        <div className="run-card-header">
+          <div className="run-card-badges">
+            <StatusPill status={status} />
+          </div>
+          {score !== null && <ScoreChip score={score} />}
         </div>
-        {score !== null && <ScoreChip score={score} />}
-      </div>
 
-      <p className="run-card-title">{tracked.title}</p>
+        <p className="run-card-title">{tracked.title}</p>
 
-      <div className="run-card-meta">
-        <span className="run-card-id">{tracked.run_id}</span>
-        <span className="run-card-elapsed">{formatElapsed(elapsed)}</span>
-        {totalReviews > 0 && (
-          <span className="run-card-reviews">レビュー {totalReviews}回</span>
-        )}
-      </div>
-    </Link>
+        <div className="run-card-meta">
+          <span className="run-card-id">{tracked.run_id}</span>
+          <span className="run-card-elapsed">{formatElapsed(elapsed)}</span>
+          {totalReviews > 0 && (
+            <span className="run-card-reviews">レビュー {totalReviews}回</span>
+          )}
+        </div>
+      </Link>
+      <button
+        type="button"
+        className="run-card-remove"
+        aria-label={deleteLabel}
+        title={isTerminal(status) ? "削除" : "停止して削除"}
+        disabled={deleting}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onDelete(tracked.run_id);
+        }}
+      >
+        ×
+      </button>
+    </article>
   );
 }
 
 // ── Queue item card (reviewer-scoped) ─────────────────────────────────────────
 
-function QueueCard({ item }: { item: HumanReviewQueueItem }) {
+interface QueueCardProps {
+  item: HumanReviewQueueItem;
+  deleting: boolean;
+  onDelete: (runId: string) => void;
+}
+
+function QueueCard({ item, deleting, onDelete }: QueueCardProps) {
   const elapsed = useElapsed(item.updated_at, false);
 
   return (
-    <Link
-      to={routes().review(item.run_id)}
-      className="queue-card"
-      aria-label={`要対応: ${item.run_id}`}
-    >
-      <div className="queue-card-header">
-        <StatusPill status={item.status} />
-        {item.latest_score !== null && <ScoreChip score={item.latest_score} />}
-      </div>
-      <p className="queue-card-id">{item.run_id}</p>
-      {item.latest_rationale && (
-        <p className="queue-card-rationale">{item.latest_rationale}</p>
-      )}
-      <div className="queue-card-meta">
-        <span>更新 {formatElapsed(elapsed)} 前</span>
-        {item.audit_summary.no_progress_count >= 2 && (
-          <span className="queue-card-stall" role="note">
-            改善停滞 {item.audit_summary.no_progress_count}回
-          </span>
+    <article className="queue-card">
+      <Link
+        to={routes().review(item.run_id)}
+        className="queue-card-link"
+        aria-label={`要対応: ${item.run_id}`}
+      >
+        <div className="queue-card-header">
+          <StatusPill status={item.status} />
+          {item.latest_score !== null && <ScoreChip score={item.latest_score} />}
+        </div>
+        <p className="queue-card-id">{item.run_id}</p>
+        {item.latest_rationale && (
+          <p className="queue-card-rationale">{item.latest_rationale}</p>
         )}
-      </div>
-    </Link>
+        <div className="queue-card-meta">
+          <span>更新 {formatElapsed(elapsed)} 前</span>
+          {item.audit_summary.no_progress_count >= 2 && (
+            <span className="queue-card-stall" role="note">
+              改善停滞 {item.audit_summary.no_progress_count}回
+            </span>
+          )}
+        </div>
+      </Link>
+      <button
+        type="button"
+        className="run-card-remove queue-card-remove"
+        aria-label={`削除: ${item.run_id}`}
+        title="削除"
+        disabled={deleting}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onDelete(item.run_id);
+        }}
+      >
+        ×
+      </button>
+    </article>
+  );
+}
+
+function QueueEmptyCompact() {
+  return (
+    <div className="queue-empty-compact" role="status">
+      <span className="queue-empty-compact__title">要対応なし</span>
+      <span className="queue-empty-compact__description">
+        レビュー待ちはありません。
+      </span>
+    </div>
   );
 }
 
@@ -147,13 +194,15 @@ function useTrackedRunStatuses(trackedRuns: TrackedRun[]) {
 
       const updates = new Map<string, ResearchRunStatusResponse>();
       results.forEach((result, i) => {
+        const run = activeRuns[i];
         if (result.status === "fulfilled") {
-          const run = activeRuns[i];
           updates.set(run.run_id, result.value);
           updateTrackedStatus(run.run_id, result.value.status, {
             estimated_cost_usd: result.value.progress.estimated_cost_usd,
             latest_score: result.value.progress.latest_score,
           });
+        } else if (result.reason instanceof ApiError && result.reason.isNotFound) {
+          untrackRun(run.run_id);
         }
       });
 
@@ -180,18 +229,42 @@ function useTrackedRunStatuses(trackedRuns: TrackedRun[]) {
 // ── Main Dashboard component ──────────────────────────────────────────────────
 
 export function Dashboard() {
-  const reviewerId = useReviewerId();
   const trackedRuns = useTrackedRuns();
+  const [deletingRunIds, setDeletingRunIds] = useState<Set<string>>(() => new Set());
+  const [hiddenQueueRunIds, setHiddenQueueRunIds] = useState<Set<string>>(() => new Set());
 
-  // Human review queue (reviewer-scoped)
+  const removeRun = useCallback(async (runId: string) => {
+    setDeletingRunIds((current) => new Set(current).add(runId));
+    let shouldRemoveLocally = false;
+    try {
+      await deleteRun(runId);
+      shouldRemoveLocally = true;
+    } catch (error) {
+      if (error instanceof ApiError && error.isNotFound) {
+        shouldRemoveLocally = true;
+      } else {
+        console.error("Failed to delete research run", error);
+      }
+    } finally {
+      if (shouldRemoveLocally) {
+        untrackRun(runId);
+        setHiddenQueueRunIds((current) => new Set(current).add(runId));
+      }
+      setDeletingRunIds((current) => {
+        const next = new Set(current);
+        next.delete(runId);
+        return next;
+      });
+    }
+  }, []);
+
+  // Human review queue
   const {
     data: queueItems,
     loading: queueLoading,
-    error: queueError,
   } = usePolling<HumanReviewQueueItem[]>({
     fetcher: (signal) => listHumanReviews(signal),
     interval: () => HUMAN_REVIEW_QUEUE_INTERVAL,
-    enabled: !!reviewerId,
   });
 
   // Live statuses for non-terminal tracked runs
@@ -212,52 +285,57 @@ export function Dashboard() {
     );
   }, 0);
 
-  const isQueueReviewerError =
-    queueError instanceof ApiError && queueError.isUnauthorized;
+  const visibleQueueItems = (queueItems ?? []).filter(
+    (item) => !hiddenQueueRunIds.has(item.run_id),
+  );
+  const visibleQueueRunIds = new Set(visibleQueueItems.map((item) => item.run_id));
+  const isQueueEmpty =
+    !queueLoading && visibleQueueItems.length === 0;
+
+  const visibleActiveRuns = activeRuns.filter(
+    (run) => !visibleQueueRunIds.has(run.run_id),
+  );
 
   return (
     <div className="screen-dashboard">
       {/* ── 要対応バンド ───────────────────────────── */}
-      <section className="dashboard-section dashboard-section--urgent" aria-labelledby="queue-heading">
+      <section
+        className={[
+          "dashboard-section",
+          "dashboard-section--urgent",
+          isQueueEmpty ? "dashboard-section--urgent-empty" : "",
+        ].join(" ")}
+        aria-labelledby="queue-heading"
+      >
         <div className="section-header">
           <h2 id="queue-heading" className="section-title">
             要対応
-            {queueItems && queueItems.length > 0 && (
-              <span className="badge-count" aria-label={`${queueItems.length}件`}>
-                {queueItems.length}
+            {visibleQueueItems.length > 0 && (
+              <span className="badge-count" aria-label={`${visibleQueueItems.length}件`}>
+                {visibleQueueItems.length}
               </span>
             )}
           </h2>
         </div>
 
-        {!reviewerId ? (
-          <div className="reviewer-prompt">
-            <p>要対応キューを表示するにはレビュアーIDが必要です。</p>
-            <p className="reviewer-prompt-hint">
-              画面右上の「レビュアーID」から設定してください。
-            </p>
-          </div>
-        ) : isQueueReviewerError ? (
-          <div className="reviewer-prompt">
-            <p>レビュアーIDが無効です。再設定してください。</p>
-          </div>
-        ) : queueLoading && !queueItems ? (
+        {queueLoading && !queueItems ? (
           <div className="queue-skeleton">
             <Skeleton width="100%" height="80px" />
             <Skeleton width="100%" height="80px" />
           </div>
-        ) : queueItems && queueItems.length > 0 ? (
+        ) : visibleQueueItems.length > 0 ? (
           <div className="queue-list">
-            {queueItems.map((item) => (
-              <QueueCard key={item.run_id} item={item} />
+            {visibleQueueItems.map((item) => (
+              <QueueCard
+                key={item.run_id}
+                item={item}
+                deleting={deletingRunIds.has(item.run_id)}
+                onDelete={removeRun}
+              />
             ))}
           </div>
         ) : (
-          <EmptyState
-            title="要対応なし"
-            description="現在、人間によるレビューが必要なrunはありません。"
-            icon="ti-check"
-          />
+          <QueueEmptyCompact />
         )}
       </section>
 
@@ -276,7 +354,7 @@ export function Dashboard() {
           </button>
         </div>
 
-        {activeRuns.length === 0 ? (
+        {visibleActiveRuns.length === 0 ? (
           <EmptyState
             title="進行中のrunなし"
             description="新規リサーチを開始すると、ここに表示されます。"
@@ -284,11 +362,13 @@ export function Dashboard() {
           />
         ) : (
           <div className="run-list">
-            {activeRuns.map((tracked) => (
+            {visibleActiveRuns.map((tracked) => (
               <RunCard
                 key={tracked.run_id}
                 tracked={tracked}
                 liveStatus={liveStatuses.get(tracked.run_id)}
+                deleting={deletingRunIds.has(tracked.run_id)}
+                onDelete={removeRun}
               />
             ))}
           </div>
@@ -309,7 +389,12 @@ export function Dashboard() {
 
           <div className="run-list">
             {terminalRuns.map((tracked) => (
-              <RunCard key={tracked.run_id} tracked={tracked} />
+              <RunCard
+                key={tracked.run_id}
+                tracked={tracked}
+                deleting={deletingRunIds.has(tracked.run_id)}
+                onDelete={removeRun}
+              />
             ))}
           </div>
         </section>

@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import httpx
 import pytest
-from openai import OpenAIError
+from openai import APITimeoutError, OpenAIError
 
 from api.config import Settings
 from api.research import azure_responses
-from api.research.azure_responses import AzureResponsesClient
+from api.research.azure_responses import (
+    AzureResponsesClient,
+    ReviewRequestTimeout,
+    build_review_prompt,
+)
 from api.research.extractors import extract_citations, extract_tool_calls
 
 
@@ -47,6 +52,11 @@ class _FakeResponses:
 class _FakeClient:
     def __init__(self) -> None:
         self.responses = _FakeResponses()
+        self.with_options_calls: list[dict[str, Any]] = []
+
+    def with_options(self, **kwargs: Any) -> _FakeClient:
+        self.with_options_calls.append(kwargs)
+        return self
 
 
 def _settings() -> Settings:
@@ -84,9 +94,36 @@ def test_deep_research_submit_always_includes_public_web_search_tool() -> None:
     assert tools_by_call == [[{"type": "web_search_preview"}]] * 2
 
 
+def test_review_report_falls_back_to_strict_schema_after_parse_helper_error() -> None:
+    fake_client = _FakeClient()
+    fake_client.responses.parse_error = TypeError("parse helper unavailable")
+    fake_client.responses.create_response = _Response(
+        response_id="resp_strict",
+        output_text=_valid_review_payload(),
+    )
+    client = AzureResponsesClient(settings=_settings(), client=fake_client)
+
+    review, response_id, raw_response = client.review_report(
+        user_prompt="prompt",
+        optimized_prompt="optimized",
+        acceptance_criteria=[],
+        report="report",
+        citations=[],
+    )
+
+    assert review.verdict == "pass"
+    assert response_id == "resp_strict"
+    assert raw_response["id"] == "resp_strict"
+    assert fake_client.with_options_calls == [{"timeout": 180}]
+    assert fake_client.responses.parse_calls
+    assert fake_client.responses.create_calls
+    assert "tools" not in fake_client.responses.parse_calls[0]
+    assert "tools" not in fake_client.responses.create_calls[0]
+
+
 def test_review_report_falls_back_to_strict_schema_after_parse_api_error() -> None:
     fake_client = _FakeClient()
-    fake_client.responses.parse_error = OpenAIError("parse helper unavailable")
+    fake_client.responses.parse_error = OpenAIError("service unavailable")
     fake_client.responses.create_response = _Response(
         response_id="resp_strict",
         output_text=_valid_review_payload(),
@@ -106,8 +143,79 @@ def test_review_report_falls_back_to_strict_schema_after_parse_api_error() -> No
     assert raw_response["id"] == "resp_strict"
     assert fake_client.responses.parse_calls
     assert fake_client.responses.create_calls
+
+
+def test_review_report_does_not_fallback_after_parse_timeout() -> None:
+    fake_client = _FakeClient()
+    fake_client.responses.parse_error = APITimeoutError(
+        request=httpx.Request("POST", "https://example.test/responses")
+    )
+    client = AzureResponsesClient(settings=_settings(), client=fake_client)
+
+    with pytest.raises(ReviewRequestTimeout):
+        client.review_report(
+            user_prompt="prompt",
+            optimized_prompt="optimized",
+            acceptance_criteria=[],
+            report="report",
+            citations=[],
+        )
+
+    assert fake_client.responses.parse_calls
+    assert fake_client.responses.create_calls == []
+
+
+def test_review_report_can_enable_web_search_by_setting() -> None:
+    fake_client = _FakeClient()
+    fake_client.responses.parse_error = TypeError("parse helper unavailable")
+    fake_client.responses.create_response = _Response(
+        response_id="resp_strict",
+        output_text=_valid_review_payload(),
+    )
+    client = AzureResponsesClient(
+        settings=Settings(
+            research_poller_enabled=False,
+            research_review_web_search_enabled=True,
+        ),
+        client=fake_client,
+    )
+
+    client.review_report(
+        user_prompt="prompt",
+        optimized_prompt="optimized",
+        acceptance_criteria=[],
+        report="report",
+        citations=[],
+    )
+
     assert fake_client.responses.parse_calls[0]["tools"] == [{"type": "web_search"}]
     assert fake_client.responses.create_calls[0]["tools"] == [{"type": "web_search"}]
+
+
+def test_review_prompt_compacts_large_report_and_citations() -> None:
+    prompt = build_review_prompt(
+        user_prompt="prompt",
+        optimized_prompt="optimized",
+        acceptance_criteria=[],
+        report="A" * 200,
+        citations=[
+            {
+                "title": f"title {index}",
+                "url": f"https://example.com/{index}",
+                "irrelevant": "x" * 200,
+            }
+            for index in range(5)
+        ],
+        max_report_chars=80,
+        max_citations=2,
+    )
+
+    assert "[... review input truncated ...]" in prompt
+    assert "omitted_report_chars" in prompt
+    assert "omitted_citation_count: 3" in prompt
+    assert "title 0" in prompt
+    assert "title 2" not in prompt
+    assert "irrelevant" not in prompt
 
 
 def test_finalize_report_always_includes_web_search_tool() -> None:

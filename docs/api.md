@@ -15,7 +15,6 @@ curl -sS -X POST http://127.0.0.1:8000/research-runs \
       "max_llm_fix_runs": 3,
       "max_total_iterations": 5,
       "max_no_progress_rounds": 2,
-      "max_cost_usd": 20,
       "max_total_tool_calls": 120
     }
   }'
@@ -34,8 +33,10 @@ Response status is `202 Accepted`:
 
 `options` is optional. Defaults come from the API settings. The MVP product
 supports public Web Research only; Web Search is always enabled for research,
-review, and finalization. The create API does not accept source-category or
-search-toggle fields such as `context_classification` or `allow_web_search`.
+and finalization. GPT-5.5 review uses the generated report and collected
+citations by default to keep the quality gate bounded. The create API does not
+accept source-category or search-toggle fields such as `context_classification`
+or `allow_web_search`.
 
 ## Status And Progress
 
@@ -43,8 +44,8 @@ search-toggle fields such as `context_classification` or `allow_web_search`.
 curl -sS http://127.0.0.1:8000/research-runs/{run_id}
 ```
 
-The response includes `status`, `done_reason`, `needs_human_review`, and
-progress counters:
+The response includes `status`, `done_reason`, `needs_human_review`, the
+current Deep Research submission timestamp, and progress counters:
 
 ```json
 {
@@ -52,6 +53,7 @@ progress counters:
   "status": "completed",
   "done_reason": "passed_review",
   "needs_human_review": false,
+  "deep_research_submitted_at": "2026-06-06T04:30:00Z",
   "progress": {
     "deep_research_runs": 1,
     "llm_fix_runs": 0,
@@ -89,19 +91,10 @@ The audit response contains:
 - `human_decisions`
 - `history`
 
-## Human Review Authentication
-
-Human-review endpoints require the `X-Reviewer-Id` header. The reviewer id is
-recorded with the decision. Supplying `reviewer_id` in the JSON body is rejected
-by the resume API.
-
-Missing `X-Reviewer-Id` returns `401`.
-
 ## Human Review Queue
 
 ```sh
-curl -sS http://127.0.0.1:8000/research-runs/human-reviews \
-  -H 'X-Reviewer-Id: reviewer-1'
+curl -sS http://127.0.0.1:8000/research-runs/human-reviews
 ```
 
 Each queue item includes the run id, latest verdict and score, rationale,
@@ -110,14 +103,14 @@ created/updated timestamps, and an audit summary.
 ## Human Review Payload
 
 ```sh
-curl -sS http://127.0.0.1:8000/research-runs/{run_id}/human-review \
-  -H 'X-Reviewer-Id: reviewer-1'
+curl -sS http://127.0.0.1:8000/research-runs/{run_id}/human-review
 ```
 
 The payload includes the latest report, latest review, audit summary, warnings,
 reason, and allowed actions:
 
 - `approve`
+- `request_review`
 - `request_llm_fix`
 - `request_deep_research`
 - `reject`
@@ -129,7 +122,6 @@ If the run is not waiting for human review, the endpoint returns `409`.
 ```sh
 curl -sS -X POST http://127.0.0.1:8000/research-runs/{run_id}/resume \
   -H 'Content-Type: application/json' \
-  -H 'X-Reviewer-Id: reviewer-1' \
   -d '{
     "action": "approve",
     "comment": "Reviewed and approved."
@@ -140,6 +132,9 @@ Actions:
 
 - `approve`: finalize the latest report and complete the run with
   `done_reason=human_approved`.
+- `request_review`: retry the GPT-5.5 review against the latest saved report.
+  This is allowed only for review execution failures such as `review_timeout`
+  or `review_schema_or_request_failed`.
 - `request_llm_fix`: run the reviewer deployment as an editor, then review the
   revised report.
 - `request_deep_research`: submit another Deep Research run and wait for the
@@ -160,6 +155,17 @@ If the run is waiting on a remote Deep Research response, the orchestrator tries
 to cancel that response. The local run is marked `cancelled` with
 `done_reason=cancelled_by_user`.
 
+## Delete
+
+```sh
+curl -sS -X DELETE http://127.0.0.1:8000/research-runs/{run_id}
+```
+
+Successful deletion returns `204 No Content`. If the run is not terminal, the
+orchestrator first runs the same best-effort remote cancellation used by
+`/cancel`, then physically deletes the run, related audit rows, and local
+artifacts. After deletion, run-specific endpoints return `404`.
+
 ## Diagnostic Endpoints
 
 The audit endpoint is the broadest diagnostic API. Narrow endpoints also exist:
@@ -171,8 +177,6 @@ The audit endpoint is the broadest diagnostic API. Narrow endpoints also exist:
 - `GET /research-runs/{run_id}/cost-events`
 - `GET /research-runs/{run_id}/human-decisions`
 
-`human-decisions` also requires `X-Reviewer-Id`.
-
 ## Public Interface Summary
 
 - `POST /research-runs`
@@ -183,3 +187,4 @@ The audit endpoint is the broadest diagnostic API. Narrow endpoints also exist:
 - `GET /research-runs/{run_id}/human-review`
 - `POST /research-runs/{run_id}/resume`
 - `POST /research-runs/{run_id}/cancel`
+- `DELETE /research-runs/{run_id}`

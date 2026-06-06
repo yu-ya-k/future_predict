@@ -2,7 +2,7 @@
  * Typed research-run endpoint functions (ui_plan.md A2-1).
  *
  * One function per real endpoint in router.py. Endpoints flagged with
- * `reviewer: true` require the X-Reviewer-Id header (GAP-4).
+ * human-review behavior are local MVP endpoints and do not require identity.
  */
 
 import type {
@@ -34,9 +34,8 @@ export function createRun(
   return apiClient.request(BASE, { method: "POST", body: request, signal });
 }
 
-/** Human-review queue. Requires X-Reviewer-Id. */
 export function listHumanReviews(signal?: AbortSignal): Promise<HumanReviewQueueItem[]> {
-  return apiClient.request(`${BASE}/human-reviews`, { reviewer: true, signal });
+  return apiClient.request(`${BASE}/human-reviews`, { signal });
 }
 
 export function getRunStatus(
@@ -74,27 +73,28 @@ export function getCostEvents(runId: string, signal?: AbortSignal): Promise<Cost
   return apiClient.request(`${BASE}/${runId}/cost-events`, { signal });
 }
 
-/** Human-review interrupt payload. Requires X-Reviewer-Id. */
 export function getHumanReviewPayload(
   runId: string,
   signal?: AbortSignal,
 ): Promise<HumanReviewPayload> {
-  return apiClient.request(`${BASE}/${runId}/human-review`, { reviewer: true, signal });
+  return apiClient.request(`${BASE}/${runId}/human-review`, { signal });
 }
 
-/** Human-decision log. Requires X-Reviewer-Id. */
 export function getHumanDecisions(
   runId: string,
   signal?: AbortSignal,
 ): Promise<HumanReviewDecision[]> {
-  return apiClient.request(`${BASE}/${runId}/human-decisions`, { reviewer: true, signal });
+  return apiClient.request(`${BASE}/${runId}/human-decisions`, { signal });
 }
 
 export function cancelRun(runId: string, signal?: AbortSignal): Promise<CancelResponse> {
   return apiClient.request(`${BASE}/${runId}/cancel`, { method: "POST", signal });
 }
 
-/** Submit a human-review decision. Requires X-Reviewer-Id. */
+export function deleteRun(runId: string, signal?: AbortSignal): Promise<void> {
+  return apiClient.request(`${BASE}/${runId}`, { method: "DELETE", signal });
+}
+
 export function resumeRun(
   runId: string,
   request: HumanReviewResumeAPIRequest,
@@ -103,7 +103,6 @@ export function resumeRun(
   return apiClient.request(`${BASE}/${runId}/resume`, {
     method: "POST",
     body: request,
-    reviewer: true,
     signal,
   });
 }

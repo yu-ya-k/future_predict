@@ -38,7 +38,6 @@ export interface ScoreChipProps {
 // 3-6 CostMeter
 export interface CostMeterProps {
   estimated: number;
-  max: number;
   /** Compact bar for header (I-5). */
   compact?: boolean;
 }
@@ -87,9 +86,8 @@ export interface DecisionButtonProps {
 // 3-11 WaitBanner
 export interface WaitBannerProps {
   elapsedMinutes: number;
-  estimatedRemainingMinutes: number;
+  startedAt?: string;
   totalToolCalls: number;
-  canLeave?: boolean;
 }
 
 // 3-12 SourceListItem

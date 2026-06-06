@@ -25,6 +25,7 @@ export type Verdict = "pass" | "needs_llm_fix" | "needs_deep_research" | "human_
 
 export type HumanReviewAction =
   | "approve"
+  | "request_review"
   | "request_llm_fix"
   | "request_deep_research"
   | "reject";
@@ -36,7 +37,6 @@ export interface ResearchRunOptions {
   max_llm_fix_runs?: number | null; // 0-10
   max_total_iterations?: number | null; // 1-20
   max_no_progress_rounds?: number | null; // 1-10
-  max_cost_usd?: number | null;
   max_total_tool_calls?: number | null;
 }
 
@@ -67,6 +67,7 @@ export interface ResearchRunStatusResponse {
   status: RunStatus;
   done_reason: string | null;
   needs_human_review: boolean;
+  deep_research_submitted_at?: string | null;
   progress: RunProgress;
 }
 

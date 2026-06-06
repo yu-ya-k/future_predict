@@ -30,6 +30,7 @@ class Verdict(StrEnum):
 
 class HumanReviewAction(StrEnum):
     APPROVE = "approve"
+    REQUEST_REVIEW = "request_review"
     REQUEST_LLM_FIX = "request_llm_fix"
     REQUEST_DEEP_RESEARCH = "request_deep_research"
     REJECT = "reject"
@@ -42,7 +43,6 @@ class ResearchRunOptions(BaseModel):
     max_llm_fix_runs: int | None = Field(default=None, ge=0, le=10)
     max_total_iterations: int | None = Field(default=None, ge=1, le=20)
     max_no_progress_rounds: int | None = Field(default=None, ge=1, le=10)
-    max_cost_usd: float | None = Field(default=None, ge=0)
     max_total_tool_calls: int | None = Field(default=None, ge=1)
 
 
@@ -84,6 +84,7 @@ class ResearchRunStatusResponse(BaseModel):
     status: RunStatus
     done_reason: str | None
     needs_human_review: bool
+    deep_research_submitted_at: datetime | None = None
     progress: RunProgress
 
 
@@ -189,7 +190,6 @@ class CancelResponse(BaseModel):
 class HumanReviewResumeRequest(BaseModel):
     action: HumanReviewAction
     comment: str | None = Field(default=None, max_length=10000)
-    reviewer_id: str | None = Field(default=None, max_length=255)
 
 
 class HumanReviewResumeAPIRequest(BaseModel):
@@ -259,7 +259,6 @@ class ResearchRunRecord(BaseModel):
     max_total_iterations: int
     max_no_progress_rounds: int
     max_total_tool_calls: int
-    max_cost_usd: float
     total_tool_calls: int
     estimated_cost_usd: float
     deep_research_submitted_at: datetime | None = None

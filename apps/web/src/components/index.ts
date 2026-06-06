@@ -18,5 +18,6 @@ export { EmptyState } from "./EmptyState";
 export { Markdown } from "./Markdown";
 export { Skeleton } from "./Skeleton";
 export { FlagChip } from "./FlagChip";
+export { BackLink } from "./BackLink";
 
 export type * from "./types";

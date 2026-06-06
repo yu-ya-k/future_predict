@@ -3,7 +3,6 @@ export interface ResearchDefaults {
   max_llm_fix_runs: number;
   max_total_iterations: number;
   max_no_progress_rounds: number;
-  max_cost_usd: number;
   max_total_tool_calls: number;
 }
 
@@ -14,7 +13,6 @@ export const FACTORY_RESEARCH_DEFAULTS: ResearchDefaults = {
   max_llm_fix_runs: 3,
   max_total_iterations: 5,
   max_no_progress_rounds: 2,
-  max_cost_usd: 20.0,
   max_total_tool_calls: 120,
 };
 
@@ -23,7 +21,6 @@ const STALE_SAVED_FACTORY_DEFAULTS: ResearchDefaults = {
   max_llm_fix_runs: 3,
   max_total_iterations: 10,
   max_no_progress_rounds: 3,
-  max_cost_usd: 5.0,
   max_total_tool_calls: 200,
 };
 
@@ -38,7 +35,7 @@ export function loadResearchDefaults(): ResearchDefaults {
       return { ...FACTORY_RESEARCH_DEFAULTS };
     }
 
-    return { ...FACTORY_RESEARCH_DEFAULTS, ...parsed };
+    return normalizeResearchDefaults(parsed);
   } catch {
     return { ...FACTORY_RESEARCH_DEFAULTS };
   }
@@ -58,7 +55,21 @@ function isStaleSavedFactoryDefaults(defaults: Partial<ResearchDefaults>): boole
     defaults.max_llm_fix_runs === STALE_SAVED_FACTORY_DEFAULTS.max_llm_fix_runs &&
     defaults.max_total_iterations === STALE_SAVED_FACTORY_DEFAULTS.max_total_iterations &&
     defaults.max_no_progress_rounds === STALE_SAVED_FACTORY_DEFAULTS.max_no_progress_rounds &&
-    defaults.max_cost_usd === STALE_SAVED_FACTORY_DEFAULTS.max_cost_usd &&
     defaults.max_total_tool_calls === STALE_SAVED_FACTORY_DEFAULTS.max_total_tool_calls
   );
+}
+
+function normalizeResearchDefaults(defaults: Partial<ResearchDefaults>): ResearchDefaults {
+  return {
+    max_deep_research_runs:
+      defaults.max_deep_research_runs ?? FACTORY_RESEARCH_DEFAULTS.max_deep_research_runs,
+    max_llm_fix_runs:
+      defaults.max_llm_fix_runs ?? FACTORY_RESEARCH_DEFAULTS.max_llm_fix_runs,
+    max_total_iterations:
+      defaults.max_total_iterations ?? FACTORY_RESEARCH_DEFAULTS.max_total_iterations,
+    max_no_progress_rounds:
+      defaults.max_no_progress_rounds ?? FACTORY_RESEARCH_DEFAULTS.max_no_progress_rounds,
+    max_total_tool_calls:
+      defaults.max_total_tool_calls ?? FACTORY_RESEARCH_DEFAULTS.max_total_tool_calls,
+  };
 }

@@ -10,14 +10,20 @@ from langgraph.types import Command
 
 from api.config import Settings
 from api.research.artifacts import ArtifactStore
-from api.research.azure_responses import AzureResponsesClient
+from api.research.azure_responses import (
+    AzureResponsesClient,
+    ReviewRequestTimeout,
+    build_review_prompt,
+)
 from api.research.graph import build_phase_3_graph, build_phase_4_graph
+from api.research.nodes import build_optimized_prompt
 from api.research.poller import ResearchPoller
 from api.research.progress import compute_no_progress_count
 from api.research.repository import ResearchRepository
 from api.research.routing import route_after_review
 from api.research.schemas import (
     REVIEW_RESULT_SCHEMA,
+    CostEvent,
     CreateResearchRunRequest,
     HumanReviewAction,
     HumanReviewResumeRequest,
@@ -25,6 +31,7 @@ from api.research.schemas import (
     ReviewRecord,
     ReviewResult,
     RunStatus,
+    ToolCallSummary,
     Verdict,
     utc_now,
 )
@@ -143,7 +150,7 @@ class FakeAzure:
         }
 
     def review_report(self, **kwargs: Any) -> tuple[ReviewResult, str, dict[str, object]]:
-        self.review_web_search_enabled = True
+        self.review_web_search_enabled = False
         verdict = (
             self.verdicts[self.review_calls]
             if self.review_calls < len(self.verdicts)
@@ -170,7 +177,7 @@ class FakeAzure:
                 requires_new_external_research=verdict == Verdict.NEEDS_DEEP_RESEARCH,
                 reviewer_confidence=self.reviewer_confidence,
                 high_risk_flags=self.high_risk_flags,
-                public_web_search_used=True,
+                public_web_search_used=False,
             ),
             f"resp_review_{self.review_calls}",
             {
@@ -203,7 +210,7 @@ def make_orchestrator(tmp_path: Path, fake: FakeAzure) -> ResearchOrchestrator:
         research_db_path=tmp_path / "research.sqlite3",
         research_artifact_dir=tmp_path / "artifacts",
         research_poller_enabled=False,
-        research_deep_research_timeout_seconds=1800,
+        research_deep_research_timeout_seconds=7200,
     )
     return ResearchOrchestrator(
         settings=settings,
@@ -261,6 +268,39 @@ def test_strict_review_schema_is_phase_1_2_compatible() -> None:
     assert "requires_new_external_research" in required
     next_instructions = REVIEW_RESULT_SCHEMA["properties"]["next_instructions"]
     assert next_instructions == {"type": ["string", "null"]}
+
+
+def test_review_prompt_emphasizes_objective_coverage_and_rerun_guidance() -> None:
+    prompt = build_review_prompt(
+        user_prompt="Research objective A and provide a comparison table and next actions.",
+        optimized_prompt="# Research Objective\nResearch objective A.",
+        acceptance_criteria=["Include a comparison table.", "Include next actions."],
+        report="Candidate report.",
+        citations=[],
+    )
+
+    assert "How well the report achieves the objective" in prompt
+    assert "expected output items in the optimized prompt" in prompt
+    assert "Write all ReviewResult string fields in English" in prompt
+    assert "In rationale, include objective coverage" in prompt
+    assert "In gaps, list unmet user requirements" in prompt
+    assert "write specific next_instructions for the next Deep Research run" in prompt
+
+
+def test_optimized_prompt_requires_english_deep_research_output() -> None:
+    optimized_prompt, acceptance_criteria = build_optimized_prompt(
+        user_prompt="市場調査をしてください"
+    )
+
+    assert "Write the entire Deep Research output in English." in optimized_prompt
+    assert "If the user's prompt is written in another language" in optimized_prompt
+    assert acceptance_criteria == [
+        "Directly answers the user's required questions.",
+        "Supports key claims with citations or clearly stated evidence.",
+        "States dates explicitly for facts that may change over time.",
+        "Clearly states uncertainty, assumptions, and limitations.",
+        "Keeps conclusions proportional to the evidence.",
+    ]
 
 
 def test_route_pass_wins_over_hard_stop() -> None:
@@ -482,7 +522,7 @@ def test_completed_deep_research_is_reviewed_and_finalized(tmp_path: Path) -> No
     assert completed.status == RunStatus.COMPLETED
     assert completed.done_reason == "passed_review"
     assert completed.final_report == "調査レポート本文"
-    assert fake.review_web_search_enabled is True
+    assert fake.review_web_search_enabled is False
     assert len(orchestrator.repository.get_citations(run.id)) == 1
     assert len(orchestrator.repository.get_tool_calls(run.id)) == 1
     with orchestrator.repository.connect() as connection:
@@ -495,6 +535,75 @@ def test_completed_deep_research_is_reviewed_and_finalized(tmp_path: Path) -> No
     reviews = orchestrator.repository.get_reviews(run.id)
     assert reviews[0].can_be_fixed_by_llm is False
     assert reviews[0].requires_new_external_research is False
+
+
+def test_review_timeout_enters_human_review_without_retry(tmp_path: Path) -> None:
+    class TimeoutAzure(FakeAzure):
+        def review_report(self, **kwargs: Any) -> tuple[ReviewResult, str, dict[str, object]]:
+            self.review_calls += 1
+            raise ReviewRequestTimeout("review timed out")
+
+    fake = TimeoutAzure()
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(CreateResearchRunRequest(user_prompt="市場調査をしてください"))
+    timed_out = orchestrator.collect_deep_research(run.id)
+
+    assert timed_out.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert timed_out.done_reason == "review_timeout"
+    assert fake.review_calls == 1
+
+
+def test_human_review_payload_allows_review_retry_after_review_timeout(
+    tmp_path: Path,
+) -> None:
+    class TimeoutThenPassAzure(FakeAzure):
+        def review_report(self, **kwargs: Any) -> tuple[ReviewResult, str, dict[str, object]]:
+            if self.review_calls == 0:
+                self.review_calls += 1
+                raise ReviewRequestTimeout("review timed out")
+            return super().review_report(**kwargs)
+
+    fake = TimeoutThenPassAzure()
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(CreateResearchRunRequest(user_prompt="市場調査をしてください"))
+    needs_human = orchestrator.collect_deep_research(run.id)
+    payload = orchestrator.get_human_review_payload(needs_human.id)
+
+    assert needs_human.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert needs_human.done_reason == "review_timeout"
+    assert HumanReviewAction.REQUEST_REVIEW in payload.allowed_actions
+
+    resumed = orchestrator.resume_run(
+        needs_human.id,
+        HumanReviewResumeRequest(
+            action=HumanReviewAction.REQUEST_REVIEW,
+            comment="レビューだけ再実行してください。",
+        ),
+    )
+    decisions = orchestrator.repository.get_human_decisions(run.id)
+    history = orchestrator.repository.get_history(run.id)
+
+    assert resumed.status == RunStatus.COMPLETED
+    assert resumed.done_reason == "passed_review"
+    assert fake.review_calls == 2
+    assert decisions[0].action == HumanReviewAction.REQUEST_REVIEW
+    assert any(event["step"] == "review_retry_requested_by_human" for event in history)
+
+
+def test_human_review_payload_hides_review_retry_for_quality_review(
+    tmp_path: Path,
+) -> None:
+    fake = FakeAzure(verdict=Verdict.HUMAN_REVIEW)
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(CreateResearchRunRequest(user_prompt="市場調査をしてください"))
+    needs_human = orchestrator.collect_deep_research(run.id)
+    payload = orchestrator.get_human_review_payload(needs_human.id)
+
+    assert needs_human.done_reason == "review_route_human_review"
+    assert HumanReviewAction.REQUEST_REVIEW not in payload.allowed_actions
 
 
 def test_high_risk_pass_enters_human_review(tmp_path: Path) -> None:
@@ -543,6 +652,28 @@ def test_review_does_not_overwrite_cancelled_run_after_review_response(
     assert cancelled.final_report is None
 
 
+def test_review_timeout_does_not_claim_active_review_call(tmp_path: Path) -> None:
+    fake = FakeAzure()
+    orchestrator = make_orchestrator(tmp_path, fake)
+    run = orchestrator.create_run(CreateResearchRunRequest(user_prompt="市場調査をしてください"))
+    original_review = fake.review_report
+
+    def review_and_trigger_timeout(**kwargs: Any) -> tuple[ReviewResult, str, dict[str, object]]:
+        timed_out = orchestrator.mark_review_timeout(run.id)
+        assert timed_out.status == RunStatus.REVIEWING
+        return original_review(**kwargs)
+
+    fake.review_report = review_and_trigger_timeout  # type: ignore[method-assign]
+
+    completed = orchestrator.collect_deep_research(run.id)
+    history = orchestrator.repository.get_history(run.id)
+
+    assert completed.status == RunStatus.COMPLETED
+    assert completed.done_reason == "passed_review"
+    assert fake.review_calls == 1
+    assert any(event["step"] == "review_timeout_skipped_active_operation" for event in history)
+
+
 def test_needs_llm_fix_runs_finalize_and_returns_to_review(tmp_path: Path) -> None:
     fake = FakeAzure(verdicts=[Verdict.NEEDS_LLM_FIX, Verdict.PASS])
     orchestrator = make_orchestrator(tmp_path, fake)
@@ -583,6 +714,34 @@ def test_llm_finalize_does_not_overwrite_cancelled_run_after_response(
     assert cancelled.status == RunStatus.CANCELLED
     assert cancelled.done_reason == "cancelled_by_user"
     assert cancelled.final_report is None
+
+
+def test_review_timeout_does_not_claim_active_llm_finalize_call(tmp_path: Path) -> None:
+    fake = FakeAzure(verdicts=[Verdict.NEEDS_LLM_FIX, Verdict.PASS])
+    orchestrator = make_orchestrator(tmp_path, fake)
+    original_finalize = fake.llm_finalize_report
+
+    run = orchestrator.create_run(CreateResearchRunRequest(user_prompt="技術調査をしてください"))
+
+    def finalize_and_trigger_timeout(
+        *,
+        prompt: str,
+        run: object,
+    ) -> tuple[str, str, dict[str, object]]:
+        timed_out = orchestrator.mark_review_timeout(cast(Any, run).id)
+        assert timed_out.status == RunStatus.REVIEWING
+        return original_finalize(prompt=prompt, run=run)
+
+    fake.llm_finalize_report = finalize_and_trigger_timeout  # type: ignore[method-assign]
+
+    completed = orchestrator.collect_deep_research(run.id)
+    history = orchestrator.repository.get_history(run.id)
+
+    assert completed.status == RunStatus.COMPLETED
+    assert completed.done_reason == "passed_review"
+    assert len(fake.llm_finalize_prompts) == 1
+    assert any(event["step"] == "review_timeout_skipped_active_operation" for event in history)
+    assert any(event["step"] == "llm_finalize_attempt_completed" for event in history)
 
 
 def test_repeated_needs_llm_fix_stops_at_max_llm_fix_runs(tmp_path: Path) -> None:
@@ -653,6 +812,8 @@ def test_needs_deep_research_submits_rerun_brief(tmp_path: Path) -> None:
     assert "# Source Quality Concerns" in rerun_brief
     assert "# Next Instructions" in rerun_brief
     assert "# Rerun Policy" in rerun_brief
+    assert "Treat # Next Instructions as the primary guidance" in rerun_brief
+    assert "Write the entire Deep Research output in English" in rerun_brief
     assert "主要競合の価格比較が不足" in rerun_brief
     assert "2025年の市場規模が未検証" in rerun_brief
     assert "公式発表ではなくブログに依存" in rerun_brief
@@ -675,7 +836,7 @@ def test_deep_research_rerun_uses_remaining_tool_call_budget(tmp_path: Path) -> 
     assert fake.submitted_max_tool_calls == [2, 1]
 
 
-def test_over_budget_needs_deep_research_stops_before_rerun_submit(
+def test_estimated_usage_cost_does_not_block_deep_research_rerun(
     tmp_path: Path,
 ) -> None:
     fake = FakeAzure(
@@ -687,7 +848,7 @@ def test_over_budget_needs_deep_research_stops_before_rerun_submit(
         research_db_path=tmp_path / "research.sqlite3",
         research_artifact_dir=tmp_path / "artifacts",
         research_poller_enabled=False,
-        research_deep_research_timeout_seconds=1800,
+        research_deep_research_timeout_seconds=7200,
         research_deep_research_input_cost_per_1m=1.0,
         research_deep_research_output_cost_per_1m=1.0,
         research_reviewer_input_cost_per_1m=1.0,
@@ -701,23 +862,110 @@ def test_over_budget_needs_deep_research_stops_before_rerun_submit(
     )
 
     run = orchestrator.create_run(
-        CreateResearchRunRequest(
-            user_prompt="技術調査をしてください",
-            options=ResearchRunOptions(max_cost_usd=0.5),
-        )
+        CreateResearchRunRequest(user_prompt="技術調査をしてください")
     )
-    guarded = orchestrator.collect_deep_research(run.id)
+    rerun = orchestrator.collect_deep_research(run.id)
 
-    assert guarded.status == RunStatus.NEEDS_HUMAN_REVIEW
-    assert guarded.done_reason == "review_route_needs_deep_research"
-    assert guarded.estimated_cost_usd >= guarded.max_cost_usd
-    assert guarded.deep_research_runs == 1
-    assert len(fake.submitted_prompts) == 1
+    assert rerun.status == RunStatus.WAITING_DEEP_RESEARCH
+    assert rerun.done_reason is None
+    assert rerun.estimated_cost_usd > 0
+    assert rerun.deep_research_runs == 2
+    assert len(fake.submitted_prompts) == 2
 
 
-def test_estimated_usage_cost_guard_stops_before_llm_fix(tmp_path: Path) -> None:
+def test_default_model_pricing_is_resolved_from_deployment_names(tmp_path: Path) -> None:
     fake = FakeAzure(
-        verdict=Verdict.NEEDS_LLM_FIX,
+        verdict=Verdict.PASS,
+        deep_research_usage={"input_tokens": 1_000_000, "output_tokens": 500_000},
+        review_usage={"input_tokens": 250_000, "output_tokens": 1_000_000},
+    )
+    fake.deep_research_deployment = (
+        "azure-oaimodel-lma-npd-norwayeast-o3-deep-research-20250626-01"
+    )
+    fake.reviewer_deployment = (
+        "azure-oaimodel-lma-npd-polandcentral-gpt5.5-global-20260424-01"
+    )
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="技術調査をしてください")
+    )
+    completed = orchestrator.collect_deep_research(run.id)
+    cost_events = orchestrator.get_cost_events(run.id)
+
+    assert completed.status == RunStatus.COMPLETED
+    assert {event.step: event.model for event in cost_events} == {
+        "deep_research": fake.deep_research_deployment,
+        "review": fake.reviewer_deployment,
+    }
+    costs_by_step = {event.step: event.estimated_cost_usd for event in cost_events}
+    assert round(costs_by_step["deep_research"], 2) == 30.01
+    assert round(costs_by_step["review"], 2) == 31.25
+    assert round(orchestrator.estimate_run_cost_usd(run.id), 2) == 61.26
+
+
+def test_stored_zero_cost_events_are_repriced_from_model_and_usage(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_orchestrator(tmp_path, FakeAzure())
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="技術調査をしてください")
+    )
+    assert orchestrator.repository.add_cost_event(
+        run.id,
+        CostEvent(
+            step="deep_research",
+            model="azure-oaimodel-o3-deep-research-20250626",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            tool_calls=1,
+            estimated_cost_usd=0.0,
+        ),
+    )
+
+    cost_events = orchestrator.get_cost_events(run.id)
+
+    assert round(cost_events[0].estimated_cost_usd, 2) == 50.01
+    assert round(orchestrator.estimate_run_cost_usd(run.id), 2) == 50.01
+
+
+def test_cost_repricing_uses_only_billable_web_search_tool_calls(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_orchestrator(tmp_path, FakeAzure())
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="技術調査をしてください")
+    )
+    orchestrator.repository.add_tool_calls(
+        run.id,
+        response_id="resp_cost",
+        step="deep_research",
+        tool_calls=[
+            ToolCallSummary(type="web_search_call", status="completed"),
+            ToolCallSummary(type="code_interpreter_call", status="completed"),
+        ],
+    )
+    assert orchestrator.repository.add_cost_event(
+        run.id,
+        CostEvent(
+            step="deep_research",
+            model="azure-oaimodel-o3-deep-research-20250626",
+            response_id="resp_cost",
+            input_tokens=0,
+            output_tokens=0,
+            tool_calls=2,
+            estimated_cost_usd=0.0,
+        ),
+    )
+
+    cost_events = orchestrator.get_cost_events(run.id)
+
+    assert round(cost_events[0].estimated_cost_usd, 2) == 0.01
+
+
+def test_estimated_usage_cost_does_not_block_llm_fix(tmp_path: Path) -> None:
+    fake = FakeAzure(
+        verdicts=[Verdict.NEEDS_LLM_FIX, Verdict.PASS],
         deep_research_usage={"input_tokens": 1_000_000, "output_tokens": 1_000_000},
         review_usage={"input_tokens": 1_000_000, "output_tokens": 1_000_000},
     )
@@ -725,7 +973,7 @@ def test_estimated_usage_cost_guard_stops_before_llm_fix(tmp_path: Path) -> None
         research_db_path=tmp_path / "research.sqlite3",
         research_artifact_dir=tmp_path / "artifacts",
         research_poller_enabled=False,
-        research_deep_research_timeout_seconds=1800,
+        research_deep_research_timeout_seconds=7200,
         research_deep_research_input_cost_per_1m=1.0,
         research_deep_research_output_cost_per_1m=1.0,
         research_reviewer_input_cost_per_1m=1.0,
@@ -739,20 +987,17 @@ def test_estimated_usage_cost_guard_stops_before_llm_fix(tmp_path: Path) -> None
     )
 
     run = orchestrator.create_run(
-        CreateResearchRunRequest(
-            user_prompt="技術調査をしてください",
-            options=ResearchRunOptions(max_cost_usd=0.5),
-        )
+        CreateResearchRunRequest(user_prompt="技術調査をしてください")
     )
-    guarded = orchestrator.collect_deep_research(run.id)
+    completed = orchestrator.collect_deep_research(run.id)
 
-    assert guarded.status == RunStatus.NEEDS_HUMAN_REVIEW
-    assert guarded.done_reason == "review_route_needs_llm_fix"
-    assert guarded.estimated_cost_usd >= guarded.max_cost_usd
-    assert guarded.llm_fix_runs == 0
-    assert not fake.llm_finalize_prompts
+    assert completed.status == RunStatus.COMPLETED
+    assert completed.done_reason == "passed_review"
+    assert completed.estimated_cost_usd > 0
+    assert completed.llm_fix_runs == 1
+    assert fake.llm_finalize_prompts
     cost_events = orchestrator.repository.get_cost_events(run.id)
-    assert {event.step for event in cost_events} >= {"deep_research", "review"}
+    assert {event.step for event in cost_events} >= {"deep_research", "review", "llm_finalize"}
 
 
 def test_failed_deep_research_records_attempt_error_and_human_review(tmp_path: Path) -> None:
@@ -777,7 +1022,7 @@ def test_failed_deep_research_records_usage_cost_and_tool_calls(tmp_path: Path) 
         research_db_path=tmp_path / "research.sqlite3",
         research_artifact_dir=tmp_path / "artifacts",
         research_poller_enabled=False,
-        research_deep_research_timeout_seconds=1800,
+        research_deep_research_timeout_seconds=7200,
         research_deep_research_input_cost_per_1m=1.0,
         research_deep_research_output_cost_per_1m=2.0,
         research_web_search_cost_per_call=0.25,
@@ -814,6 +1059,47 @@ async def test_poller_collects_waiting_runs(tmp_path: Path) -> None:
     assert completed.status == RunStatus.COMPLETED
 
 
+@pytest.mark.anyio
+async def test_poller_marks_stale_reviewing_run_for_human_review(tmp_path: Path) -> None:
+    orchestrator = make_orchestrator(tmp_path, FakeAzure())
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    old = (utc_now() - timedelta(seconds=1000)).isoformat()
+    with orchestrator.repository.connect() as connection:
+        connection.execute(
+            """
+            UPDATE research_runs
+            SET status = ?, report = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (RunStatus.REVIEWING.value, "draft report", old, str(run.id)),
+        )
+    orchestrator.repository.append_history_event(
+        run.id,
+        {"step": "review_attempt_started", "attempt_no": 1},
+    )
+    with orchestrator.repository.connect() as connection:
+        connection.execute(
+            """
+            UPDATE research_history
+            SET created_at = ?
+            WHERE run_id = ?
+              AND event_json LIKE '%review_attempt_started%'
+            """,
+            (old, str(run.id)),
+        )
+    poller = ResearchPoller(orchestrator=orchestrator, interval_seconds=0.01)
+
+    await poller.tick()
+
+    timed_out = orchestrator.repository.get_run(run.id)
+    assert timed_out.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert timed_out.done_reason == "review_timeout"
+    history = orchestrator.repository.get_history(run.id)
+    assert any(event["step"] == "review_timeout" for event in history)
+
+
 def test_deep_research_timeout_uses_attempt_created_at_not_run_updated_at(
     tmp_path: Path,
 ) -> None:
@@ -821,7 +1107,7 @@ def test_deep_research_timeout_uses_attempt_created_at_not_run_updated_at(
     run = orchestrator.create_run(
         CreateResearchRunRequest(user_prompt="公開情報を調査してください")
     )
-    old = (utc_now() - timedelta(seconds=3600)).isoformat()
+    old = (utc_now() - timedelta(seconds=9000)).isoformat()
     now = utc_now().isoformat()
     with orchestrator.repository.connect() as connection:
         connection.execute(
@@ -833,7 +1119,7 @@ def test_deep_research_timeout_uses_attempt_created_at_not_run_updated_at(
             (now, str(run.id)),
         )
 
-    timed_out = orchestrator.repository.list_timed_out_runs(timeout_seconds=1800)
+    timed_out = orchestrator.repository.list_timed_out_runs(timeout_seconds=7200)
 
     assert [item.id for item in timed_out] == [run.id]
 
@@ -885,6 +1171,93 @@ def test_cancel_waiting_run_cancels_remote_response(tmp_path: Path) -> None:
     assert cancelled.done_reason == "cancelled_by_user"
     assert fake.cancelled == ["resp_deep_1"]
     assert history[-1]["step"] == "cancel_remote_succeeded"
+
+
+def test_delete_completed_run_removes_record_related_rows_and_artifacts(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_orchestrator(tmp_path, FakeAzure())
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    completed = orchestrator.collect_deep_research(run.id)
+    artifact_dir = orchestrator.artifacts.root / str(completed.id)
+
+    assert artifact_dir.exists()
+    assert orchestrator.repository.get_attempts(completed.id)
+    assert orchestrator.repository.get_reviews(completed.id)
+    assert orchestrator.repository.get_citations(completed.id)
+    assert orchestrator.repository.get_history(completed.id)
+
+    orchestrator.delete_run(completed.id)
+
+    assert not artifact_dir.exists()
+    with pytest.raises(KeyError):
+        orchestrator.repository.get_run(completed.id)
+    assert orchestrator.repository.get_attempts(completed.id) == []
+    assert orchestrator.repository.get_reviews(completed.id) == []
+    assert orchestrator.repository.get_citations(completed.id) == []
+    assert orchestrator.repository.get_history(completed.id) == []
+
+
+def test_delete_human_review_run_removes_it_from_queue(tmp_path: Path) -> None:
+    orchestrator = make_orchestrator(tmp_path, FakeAzure(verdict=Verdict.HUMAN_REVIEW))
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    needs_human = orchestrator.collect_deep_research(run.id)
+
+    assert [item.run_id for item in orchestrator.list_human_reviews()] == [needs_human.id]
+
+    orchestrator.delete_run(needs_human.id)
+
+    assert orchestrator.list_human_reviews() == []
+    with pytest.raises(KeyError):
+        orchestrator.repository.get_run(needs_human.id)
+
+
+def test_delete_waiting_run_cancels_remote_response(tmp_path: Path) -> None:
+    fake = FakeAzure(retrieve_status="in_progress")
+    orchestrator = make_orchestrator(tmp_path, fake)
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+
+    orchestrator.delete_run(run.id)
+
+    assert fake.cancelled == ["resp_deep_1"]
+    with pytest.raises(KeyError):
+        orchestrator.repository.get_run(run.id)
+
+
+def test_delete_waiting_run_keeps_local_data_when_remote_cancel_fails(
+    tmp_path: Path,
+) -> None:
+    fake = FakeAzure(
+        retrieve_status="in_progress",
+        cancel_raises=RuntimeError("remote cancel unavailable"),
+    )
+    orchestrator = make_orchestrator(tmp_path, fake)
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    artifact_dir = orchestrator.artifacts.root / str(run.id)
+
+    with pytest.raises(RuntimeError, match="Remote Deep Research cancel failed"):
+        orchestrator.delete_run(run.id)
+
+    persisted = orchestrator.repository.get_run(run.id)
+    history = orchestrator.repository.get_history(run.id)
+    assert persisted.status == RunStatus.WAITING_DEEP_RESEARCH
+    assert artifact_dir.exists()
+    assert any(event["step"] == "delete_remote_cancel_failed" for event in history)
+
+
+def test_delete_unknown_run_raises_key_error(tmp_path: Path) -> None:
+    orchestrator = make_orchestrator(tmp_path, FakeAzure())
+
+    with pytest.raises(KeyError):
+        orchestrator.delete_run(cast(Any, "00000000-0000-0000-0000-000000000000"))
 
 
 def test_cancel_waiting_run_continues_when_remote_cancel_fails(tmp_path: Path) -> None:
@@ -1177,14 +1550,6 @@ def test_human_review_queue_and_payload_include_latest_context(tmp_path: Path) -
     ("limit_fields", "blocked_actions", "allowed_actions"),
     [
         (
-            {"estimated_cost_usd": 20.0, "max_cost_usd": 20.0},
-            {
-                HumanReviewAction.REQUEST_LLM_FIX,
-                HumanReviewAction.REQUEST_DEEP_RESEARCH,
-            },
-            set[HumanReviewAction](),
-        ),
-        (
             {"total_tool_calls": 120, "max_total_tool_calls": 120},
             {
                 HumanReviewAction.REQUEST_LLM_FIX,
@@ -1271,7 +1636,6 @@ def test_human_resume_records_decision_for_audit(tmp_path: Path) -> None:
             action=HumanReviewAction.APPROVE,
             comment="承認します。",
         ),
-        reviewer_id="reviewer-1",
     )
 
     decisions = orchestrator.repository.get_human_decisions(run.id)
@@ -1280,17 +1644,12 @@ def test_human_resume_records_decision_for_audit(tmp_path: Path) -> None:
     assert decisions[0].decision_no == 1
     assert decisions[0].action == HumanReviewAction.APPROVE
     assert decisions[0].comment == "承認します。"
-    assert decisions[0].reviewer_id == "reviewer-1"
+    assert decisions[0].reviewer_id is None
 
 
 @pytest.mark.parametrize(
     ("action", "limit_fields", "blocked_reason"),
     [
-        (
-            HumanReviewAction.REQUEST_DEEP_RESEARCH,
-            {"estimated_cost_usd": 20.0, "max_cost_usd": 20.0},
-            "max_cost_usd_reached",
-        ),
         (
             HumanReviewAction.REQUEST_LLM_FIX,
             {"total_reviews": 5, "max_total_iterations": 5},
@@ -1327,7 +1686,6 @@ def test_human_resume_request_actions_do_not_bypass_hard_stops(
         orchestrator.resume_run(
             needs_human.id,
             HumanReviewResumeRequest(action=action, comment="続行してください。"),
-            reviewer_id="reviewer-guard",
         )
 
     still_waiting = orchestrator.repository.get_run(needs_human.id)
@@ -1360,10 +1718,14 @@ def test_human_resume_request_llm_fix_continues_workflow(tmp_path: Path) -> None
     assert resumed.status == RunStatus.COMPLETED
     assert resumed.llm_fix_runs == 1
     assert "章立てを直してください。" in fake.llm_finalize_prompts[-1]
+    assert "Write the final report in English" in fake.llm_finalize_prompts[-1]
 
 
 def test_human_resume_request_deep_research_submits_rerun(tmp_path: Path) -> None:
-    fake = FakeAzure(verdict=Verdict.HUMAN_REVIEW)
+    fake = FakeAzure(
+        verdict=Verdict.HUMAN_REVIEW,
+        review_next_instructions="次回は公的統計を優先してください。",
+    )
     orchestrator = make_orchestrator(tmp_path, fake)
 
     run = orchestrator.create_run(
@@ -1381,6 +1743,8 @@ def test_human_resume_request_deep_research_submits_rerun(tmp_path: Path) -> Non
     assert resumed.status == RunStatus.WAITING_DEEP_RESEARCH
     assert resumed.deep_research_runs == 2
     assert "一次情報を追加してください。" in fake.submitted_prompts[-1]
+    assert "次回は公的統計を優先してください。" in fake.submitted_prompts[-1]
+    assert "Write the entire Deep Research output in English" in fake.submitted_prompts[-1]
 
 
 def test_human_resume_claim_prevents_second_resume(tmp_path: Path) -> None:

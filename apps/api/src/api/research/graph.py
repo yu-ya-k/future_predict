@@ -57,6 +57,7 @@ def build_phase_3_graph(*, checkpointer: Any | None = None) -> Any:
         _graph_route_after_human_review,
         {
             "finalize": "finalize",
+            "review": "review",
             "llm_finalize": "llm_finalize",
             "deep_research_submit": "deep_research_submit",
             "partial_finalize": "partial_finalize",
@@ -90,6 +91,7 @@ def build_phase_4_graph(*, checkpointer: Any) -> Any:
         _graph_route_after_human_review,
         {
             "finalize": "finalize",
+            "review": "review",
             "llm_finalize": "llm_finalize",
             "deep_research_submit": "deep_research_submit",
             "partial_finalize": "partial_finalize",
@@ -176,6 +178,8 @@ def _graph_route_after_human_review(state: GraphState) -> str:
 
     if action == HumanReviewAction.APPROVE:
         return "finalize"
+    if action == HumanReviewAction.REQUEST_REVIEW:
+        return "review"
     if action == HumanReviewAction.REQUEST_LLM_FIX:
         return "llm_finalize"
     if action == HumanReviewAction.REQUEST_DEEP_RESEARCH:

@@ -8,12 +8,14 @@
 
 import { useEffect, useState } from "react";
 
+import { BackLink } from "../components";
 import {
   FACTORY_RESEARCH_DEFAULTS,
   loadResearchDefaults,
   saveResearchDefaults,
   type ResearchDefaults,
 } from "../researchDefaults";
+import { routes } from "../router";
 import { OPTION_BOUNDS } from "../types";
 
 export function Settings() {
@@ -44,6 +46,7 @@ export function Settings() {
   return (
     <div className="screen-settings">
       <header className="screen-header">
+        <BackLink to={routes().dashboard} label="ダッシュボードへ戻る" />
         <h1 className="screen-title">設定</h1>
         <p className="screen-subtitle">
           新規リサーチのデフォルト値を設定します。変更はこのブラウザにのみ保存されます。
@@ -133,23 +136,6 @@ export function Settings() {
             <span className="settings-range">
               {OPTION_BOUNDS.max_no_progress_rounds.min}–{OPTION_BOUNDS.max_no_progress_rounds.max}
             </span>
-          </div>
-
-          <div className="settings-field">
-            <label className="settings-label" htmlFor="s-max-cost">
-              最大コスト (USD)
-            </label>
-            <input
-              id="s-max-cost"
-              type="number"
-              className="settings-input"
-              value={defaults.max_cost_usd}
-              min={0.5}
-              max={100}
-              step={0.5}
-              onChange={(e) => handleChange("max_cost_usd", Number(e.target.value))}
-            />
-            <span className="settings-range">$0.50–$100</span>
           </div>
 
           <div className="settings-field">

@@ -43,8 +43,10 @@ testable workflow shapes for the same route decisions.
 ## MVP Scope
 
 The MVP treats every run as public Web Research. Web Search is required for
-Deep Research, reviewer checks, and finalization. The app does not accept or
-route on source categories or a per-run search-toggle policy.
+Deep Research and remains available for finalization. GPT-5.5 review uses the
+report and collected citations by default, with reviewer Web Search available
+only through explicit configuration. The app does not accept or route on source
+categories or a per-run search-toggle policy.
 
 ## Statuses
 
@@ -82,15 +84,17 @@ guard:
 - `max_deep_research_runs`
 - `max_llm_fix_runs`
 - `max_no_progress_rounds`
-- `max_cost_usd`
 - `max_total_tool_calls`
 - malformed or failed review output
 - missing report or missing response id
 - Deep Research terminal failure, unknown status, timeout, or submit failure
 
 The same guards also block human resume actions that would continue automated
-work (`request_llm_fix` or `request_deep_research`) after a hard stop. `approve`
-and `reject` remain terminal reviewer actions.
+work (`request_llm_fix` or `request_deep_research`) after a hard stop.
+`request_review` retries only the GPT-5.5 review step and is exposed when the
+review itself failed, for example `review_timeout` or
+`review_schema_or_request_failed`. `approve` and `reject` remain terminal
+reviewer actions.
 
 ## No-Progress Handling
 
@@ -103,8 +107,11 @@ run enters human review instead of continuing the loop.
 
 The orchestrator records cost events for Deep Research, review, failed review
 responses with billable metadata, and LLM finalization. Estimated cost is derived
-from the configured per-token and per-web-search rates. Tool calls are counted
-from extracted response tool-call summaries and stored for audit.
+from each cost event's model, token usage, and billable web-search calls.
+`o3-deep-research` and Azure deployment names containing `o3-deep-research`
+use the Deep Research rate, while `gpt-5.5` and deployment names containing
+`gpt5.5` use the reviewer/finalizer rate. Tool calls are counted from extracted
+response tool-call summaries and stored for audit.
 
 Defaults come from `.env.example` and the limit values can be overridden per
 run through `ResearchRunOptions`.

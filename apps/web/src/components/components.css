@@ -204,63 +204,12 @@
   color: var(--ink);
 }
 
-.cost-meter__label--warn {
-  color: var(--human);
-}
-
-.cost-meter__label--critical {
-  color: var(--error);
-}
-
-.cost-meter__max {
-  font-size: var(--text-caption);
-  color: var(--ink-faint);
-  font-weight: var(--weight-regular);
-}
-
-.cost-meter__track {
-  height: 6px;
-  border-radius: var(--radius-full);
-  background: var(--rule);
-  overflow: hidden;
-}
-
-.cost-meter__fill {
-  height: 100%;
-  border-radius: inherit;
-  background: var(--accent);
-  transition:
-    width var(--duration-normal) var(--ease-out),
-    background var(--duration-normal) var(--ease-out);
-}
-
-.cost-meter__fill--warn,
-.cost-meter__fill[data-warn="true"] {
-  background: var(--human);
-}
-
-.cost-meter__fill--critical,
-.cost-meter__fill[data-critical="true"] {
-  background: var(--error);
-}
-
-.cost-meter__warning {
-  font-size: var(--text-caption);
-  color: var(--human);
-  margin: 0;
-}
-
-/* Compact variant — inline bar + value for header */
+/* Compact variant — inline value for header */
 .cost-meter--compact {
   display: inline-flex;
   flex-direction: row;
   align-items: center;
   gap: var(--space-2);
-}
-
-.cost-meter--compact .cost-meter__track {
-  width: 80px;
-  flex-shrink: 0;
 }
 
 .cost-meter--compact .cost-meter__label {

@@ -1,14 +1,8 @@
 /**
- * App shell — sticky header, skip link, router switch, reviewer-id inline editor.
- *
- * Reviewer-scoped screens (review, dashboard queue) receive a prompt when no
- * reviewer id is set, rather than throwing an error.
+ * App shell — sticky header, skip link, and router switch.
  */
 
-import { useState, useSyncExternalStore } from "react";
-
 import { Link, navigate, routes, useRoute } from "./router";
-import { getReviewerId, setReviewerId, clearReviewerId, subscribeReviewer } from "./reviewer";
 import {
   NewResearch,
   Dashboard,
@@ -19,83 +13,6 @@ import {
   Settings,
 } from "./screens";
 import "./App.css";
-
-// ── Reviewer-ID indicator + inline editor ─────────────────────────────────────
-
-function ReviewerIdControl() {
-  const reviewerId = useSyncExternalStore(subscribeReviewer, getReviewerId);
-  const [editing, setEditing] = useState(false);
-  const [input, setInput] = useState("");
-
-  function startEdit() {
-    setInput(reviewerId ?? "");
-    setEditing(true);
-  }
-
-  function handleSave() {
-    const trimmed = input.trim();
-    if (trimmed) {
-      setReviewerId(trimmed);
-    } else {
-      clearReviewerId();
-    }
-    setEditing(false);
-  }
-
-  function handleKeyDown(e: React.KeyboardEvent) {
-    if (e.key === "Enter") handleSave();
-    if (e.key === "Escape") setEditing(false);
-  }
-
-  if (editing) {
-    return (
-      <div className="reviewer-editor" role="group" aria-label="レビュアーID設定">
-        <input
-          type="text"
-          className="reviewer-editor-input"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="レビュアーIDを入力"
-          aria-label="レビュアーID"
-          autoFocus
-        />
-        <button type="button" className="reviewer-editor-save" onClick={handleSave}>
-          保存
-        </button>
-        <button
-          type="button"
-          className="reviewer-editor-cancel"
-          onClick={() => setEditing(false)}
-        >
-          キャンセル
-        </button>
-      </div>
-    );
-  }
-
-  return (
-    <button
-      type="button"
-      className={`reviewer-id-btn${reviewerId ? " reviewer-id-btn--set" : ""}`}
-      onClick={startEdit}
-      aria-label={reviewerId ? `レビュアーID: ${reviewerId}` : "レビュアーIDを設定"}
-      title={reviewerId ? `レビュアーID: ${reviewerId}` : "レビュアーIDを設定"}
-    >
-      {reviewerId ? (
-        <>
-          <span className="reviewer-id-icon" aria-hidden="true">●</span>
-          <span className="reviewer-id-label">{reviewerId}</span>
-        </>
-      ) : (
-        <>
-          <span className="reviewer-id-icon" aria-hidden="true">○</span>
-          <span className="reviewer-id-label">レビュアーID</span>
-        </>
-      )}
-    </button>
-  );
-}
 
 // ── Not found ─────────────────────────────────────────────────────────────────
 
@@ -131,7 +48,11 @@ export function App() {
       case "review":
         return route.runId ? <HumanReview runId={route.runId} /> : <NotFound />;
       case "report":
-        return route.runId ? <ReportViewer runId={route.runId} /> : <NotFound />;
+        return route.runId ? (
+          <ReportViewer runId={route.runId} initialTab={route.reportTab} />
+        ) : (
+          <NotFound />
+        );
       case "audit":
         return route.runId ? <AuditLog runId={route.runId} /> : <NotFound />;
       case "settings":
@@ -177,10 +98,6 @@ export function App() {
               設定
             </Link>
           </nav>
-
-          <div className="app-header-controls">
-            <ReviewerIdControl />
-          </div>
         </div>
       </header>
 

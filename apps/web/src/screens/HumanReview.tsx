@@ -2,19 +2,19 @@
  * SCR-4: Human Review — reviewer-scoped decision screen.
  *
  * Invariant I-4: one-screen decision. All judgment material is presented
- * on a single screen. 4 DecisionButtons map 1:1 to HumanReviewAction.
+ * on a single screen. DecisionButtons map 1:1 to HumanReviewAction.
  *
  * Guard rules (A4 / A8 Q-4):
  *  - Any action not in payload.allowed_actions → disabled.
  *  - request_deep_research shows a warning when audit_summary.no_progress_count >= 2
  *    so reviewers see the loop-risk context before resuming.
  *  - 409 conflict → show detail + refetch payload.
- *  - ReviewerRequiredError → prompt for reviewer id.
  */
 
 import { useEffect, useRef, useState } from "react";
 
 import {
+  BackLink,
   DecisionButton,
   FlagChip,
   Markdown,
@@ -24,9 +24,8 @@ import {
   VerdictBadge,
 } from "../components";
 import { getHumanReviewPayload, resumeRun } from "../api/research";
-import { ApiError, ReviewerRequiredError } from "../api/client";
+import { ApiError } from "../api/client";
 import { navigate, routes } from "../router";
-import { setReviewerId } from "../reviewer";
 import { type HumanReviewAction, type HumanReviewPayload } from "../types";
 
 const NO_PROGRESS_WARN_THRESHOLD = 2;
@@ -40,8 +39,6 @@ export function HumanReview({ runId }: HumanReviewProps) {
   const [payload, setPayload] = useState<HumanReviewPayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [needsReviewerId, setNeedsReviewerId] = useState(false);
-  const [reviewerIdInput, setReviewerIdInput] = useState("");
 
   const [comment, setComment] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -52,7 +49,6 @@ export function HumanReview({ runId }: HumanReviewProps) {
   async function fetchPayload() {
     setLoading(true);
     setLoadError(null);
-    setNeedsReviewerId(false);
 
     abortRef.current?.abort();
     const controller = new AbortController();
@@ -63,9 +59,7 @@ export function HumanReview({ runId }: HumanReviewProps) {
       setPayload(data);
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") return;
-      if (err instanceof ReviewerRequiredError) {
-        setNeedsReviewerId(true);
-      } else if (err instanceof ApiError) {
+      if (err instanceof ApiError) {
         setLoadError(err.detail ?? err.message);
       } else if (err instanceof Error) {
         setLoadError(err.message);
@@ -81,14 +75,6 @@ export function HumanReview({ runId }: HumanReviewProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId]);
 
-  function handleSetReviewerId() {
-    const trimmed = reviewerIdInput.trim();
-    if (!trimmed) return;
-    setReviewerId(trimmed);
-    setReviewerIdInput("");
-    void fetchPayload();
-  }
-
   async function handleDecision(action: HumanReviewAction) {
     setSubmitting(true);
     setSubmitError(null);
@@ -99,9 +85,7 @@ export function HumanReview({ runId }: HumanReviewProps) {
       });
       navigate(routes().monitor(runId));
     } catch (err) {
-      if (err instanceof ApiError && err.isUnauthorized) {
-        setNeedsReviewerId(true);
-      } else if (err instanceof ApiError && err.isConflict) {
+      if (err instanceof ApiError && err.isConflict) {
         setSubmitError(
           `操作が競合しました: ${err.detail ?? "詳細不明"}。最新の状態を確認します。`,
         );
@@ -117,47 +101,12 @@ export function HumanReview({ runId }: HumanReviewProps) {
     }
   }
 
-  // ── Reviewer ID setup screen ──────────────────────────────────────────────
-
-  if (needsReviewerId) {
-    return (
-      <div className="screen-review">
-        <div className="reviewer-setup">
-          <h1 className="reviewer-setup-title">レビュアーIDが必要です</h1>
-          <p className="reviewer-setup-desc">
-            人間レビュー画面にアクセスするにはレビュアーIDが必要です。
-          </p>
-          <div className="reviewer-setup-form">
-            <input
-              type="text"
-              className="reviewer-id-input"
-              value={reviewerIdInput}
-              onChange={(e) => setReviewerIdInput(e.target.value)}
-              placeholder="レビュアーIDを入力"
-              aria-label="レビュアーID"
-              onKeyDown={(e) => {
-                if (e.key === "Enter") handleSetReviewerId();
-              }}
-            />
-            <button
-              type="button"
-              className="btn-primary"
-              onClick={handleSetReviewerId}
-              disabled={!reviewerIdInput.trim()}
-            >
-              設定して続ける
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   // ── Loading state ─────────────────────────────────────────────────────────
 
   if (loading) {
     return (
       <div className="screen-review">
+        <BackLink to={routes().monitor(runId)} label="Runへ戻る" />
         <div className="review-skeleton">
           <Skeleton width="70%" height="28px" />
           <Skeleton width="100%" height="100px" />
@@ -170,6 +119,7 @@ export function HumanReview({ runId }: HumanReviewProps) {
   if (loadError) {
     return (
       <div className="screen-review">
+        <BackLink to={routes().monitor(runId)} label="Runへ戻る" />
         <div className="review-load-error" role="alert">
           <p>ペイロードの取得に失敗しました: {loadError}</p>
           <button type="button" className="btn-secondary" onClick={fetchPayload}>
@@ -188,6 +138,7 @@ export function HumanReview({ runId }: HumanReviewProps) {
     audit_summary.no_progress_count >= NO_PROGRESS_WARN_THRESHOLD;
 
   const isAllowed = (action: HumanReviewAction) => allowed_actions.includes(action);
+  const canRetryReview = isAllowed("request_review");
 
   const deepResearchGuardMessage = noProgressWarn
     ? `改善停滞が${audit_summary.no_progress_count}回続いています。再調査の効果は限定的かもしれません。`
@@ -195,6 +146,11 @@ export function HumanReview({ runId }: HumanReviewProps) {
 
   return (
     <div className="screen-review">
+      <header className="screen-header">
+        <BackLink to={routes().monitor(runId)} label="Runへ戻る" />
+        <h1 className="screen-title">判断</h1>
+      </header>
+
       {/* ── Stop-reason banner ────────────────────────── */}
       <div className="review-reason-banner" role="note">
         <span className="review-reason-label">停止理由</span>
@@ -342,6 +298,17 @@ export function HumanReview({ runId }: HumanReviewProps) {
             block
             onClick={() => void handleDecision("approve")}
           />
+          {canRetryReview && (
+            <DecisionButton
+              action="request_review"
+              label="レビュー再実行"
+              consequence="GPT-5.5で再レビュー"
+              tone="neutral"
+              disabled={submitting}
+              block
+              onClick={() => void handleDecision("request_review")}
+            />
+          )}
           <DecisionButton
             action="request_llm_fix"
             label="軽微修正"

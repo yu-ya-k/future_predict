@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -24,3 +25,6 @@ class ArtifactStore:
         encoded = text.encode("utf-8")
         path.write_bytes(encoded)
         return str(path), hashlib.sha256(encoded).hexdigest()
+
+    def delete_run(self, run_id: UUID) -> None:
+        shutil.rmtree(self.root / str(run_id), ignore_errors=True)
