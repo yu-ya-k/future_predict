@@ -7,7 +7,15 @@ from api.config import Settings
 from api.research.artifacts import ArtifactStore
 from api.research.azure_responses import AzureResponsesClient
 from api.research.repository import ResearchRepository
-from api.research.schemas import ReviewResult, Verdict
+from api.research.schemas import (
+    FailureMode,
+    ItemAssessment,
+    ItemStatus,
+    RecommendedAction,
+    ReviewResult,
+    Severity,
+    Verdict,
+)
 from api.research.service import ResearchOrchestrator
 
 
@@ -23,6 +31,7 @@ class IntegrationFakeAzure:
         deep_research_usage: dict[str, int] | None = None,
         review_usage: dict[str, int] | None = None,
         llm_finalize_usage: dict[str, int] | None = None,
+        item_assessments: list[ItemAssessment] | None = None,
         review_gaps: list[str] | None = None,
         review_factuality_concerns: list[str] | None = None,
         review_source_quality_concerns: list[str] | None = None,
@@ -36,6 +45,7 @@ class IntegrationFakeAzure:
         self.review_usage = review_usage or {}
         self.llm_finalize_usage = llm_finalize_usage or {}
         self.review_gaps = review_gaps or ["source coverage gap"]
+        self.item_assessments = item_assessments
         self.review_factuality_concerns = review_factuality_concerns or []
         self.review_source_quality_concerns = review_source_quality_concerns or []
         self.review_next_instructions = review_next_instructions
@@ -45,6 +55,7 @@ class IntegrationFakeAzure:
         self.retrieve_calls: list[str] = []
         self.review_calls: list[dict[str, Any]] = []
         self.llm_finalize_prompts: list[str] = []
+        self.verify_prompts: list[str] = []
         self.cancelled: list[str] = []
 
     def submit_deep_research(
@@ -119,6 +130,39 @@ class IntegrationFakeAzure:
         self.review_calls.append(kwargs)
         verdict_index = min(len(self.review_calls) - 1, len(self.verdicts) - 1)
         verdict = self.verdicts[verdict_index]
+        item_assessments = self.item_assessments or [
+            ItemAssessment(
+                item_id="RI-001",
+                status=ItemStatus.ANSWERED if verdict == Verdict.PASS else ItemStatus.PARTIAL,
+                severity=Severity.MAJOR,
+                failure_mode=(
+                    FailureMode.NONE
+                    if verdict == Verdict.PASS
+                    else FailureMode.NEEDS_DIFFERENT_SOURCES
+                ),
+                failure_mode_confidence=90,
+                    recommended_action=(
+                        RecommendedAction.NONE
+                        if verdict == Verdict.PASS
+                        else (
+                            RecommendedAction.LLM_PATCH
+                            if verdict == Verdict.NEEDS_LLM_PATCH
+                            else (
+                                RecommendedAction.VERIFY
+                                if verdict == Verdict.NEEDS_VERIFICATION
+                                else (
+                                    RecommendedAction.FULL_RERUN
+                                    if verdict == Verdict.NEEDS_FULL_RERUN
+                                    else RecommendedAction.TARGETED_RERUN
+                                )
+                            )
+                        )
+                    ),
+                evidence_summary="covered" if verdict == Verdict.PASS else None,
+                missing_evidence=[] if verdict == Verdict.PASS else ["official source"],
+                rationale="integration fake assessment",
+            )
+        ]
         response_id = f"resp_review_{len(self.review_calls)}"
         return (
             ReviewResult(
@@ -126,6 +170,7 @@ class IntegrationFakeAzure:
                 goal_achieved=verdict == Verdict.PASS,
                 score=92 if verdict == Verdict.PASS else 72,
                 rationale=f"review rationale: {verdict.value}",
+                item_assessments=item_assessments,
                 gaps=[] if verdict == Verdict.PASS else self.review_gaps,
                 factuality_concerns=(
                     [] if verdict == Verdict.PASS else self.review_factuality_concerns
@@ -136,11 +181,12 @@ class IntegrationFakeAzure:
                 next_instructions=(
                     None if verdict == Verdict.PASS else self.review_next_instructions
                 ),
-                can_be_fixed_by_llm=verdict == Verdict.NEEDS_LLM_FIX,
-                requires_new_external_research=verdict == Verdict.NEEDS_DEEP_RESEARCH,
+                freshness_concerns=[],
+                security_concerns=[],
                 reviewer_confidence=90,
                 high_risk_flags=[],
                 public_web_search_used=False,
+                route_rationale=f"route {verdict.value}",
             ),
             response_id,
             {"id": response_id, "status": "completed", "usage": self.review_usage},
@@ -158,6 +204,20 @@ class IntegrationFakeAzure:
             "軽微修正済みレポート本文",
             response_id,
             {"id": response_id, "status": "completed", "usage": self.llm_finalize_usage},
+        )
+
+    def verify_report(
+        self,
+        *,
+        prompt: str,
+        run: object,
+    ) -> tuple[str, str, dict[str, object]]:
+        self.verify_prompts.append(prompt)
+        response_id = f"resp_verify_{len(self.verify_prompts)}"
+        return (
+            "検証済みメモ",
+            response_id,
+            {"id": response_id, "status": "completed", "usage": self.review_usage},
         )
 
     def cancel_response(self, response_id: str) -> dict[str, object]:

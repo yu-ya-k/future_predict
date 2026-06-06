@@ -24,10 +24,11 @@ class Settings(BaseSettings):
     research_review_max_citations: int = 40
     research_review_web_search_enabled: bool = False
 
-    default_max_deep_research_runs: int = 2
-    default_max_llm_fix_runs: int = 3
+    default_max_targeted_rerun_runs: int = 2
+    default_max_full_rerun_runs: int = 1
+    default_max_llm_patch_runs: int = 3
+    default_max_verification_runs: int = 3
     default_max_total_iterations: int = 5
-    default_max_no_progress_rounds: int = 2
     default_max_total_tool_calls: int = 120
 
     research_deep_research_input_cost_per_1m: float = 0.0

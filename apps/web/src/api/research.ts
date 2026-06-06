@@ -17,15 +17,32 @@ import type {
   HumanReviewQueueItem,
   HumanReviewResumeAPIRequest,
   HumanReviewResumeResponse,
+  ObjectiveContract,
   ReportResponse,
   ResearchAttempt,
+  ResearchItem,
+  RerunPlan,
   ResearchRunStatusResponse,
-  ReviewRecord,
   ToolCallSummary,
 } from "../types";
 import { apiClient } from "./client";
 
 const BASE = "/research-runs";
+
+interface ContractResponse {
+  run_id: string;
+  contract: ObjectiveContract;
+}
+
+interface ItemsResponse {
+  run_id: string;
+  items: ResearchItem[];
+}
+
+interface RerunPlansResponse {
+  run_id: string;
+  rerun_plans: RerunPlan[];
+}
 
 export function createRun(
   request: CreateResearchRunRequest,
@@ -49,16 +66,40 @@ export function getReport(runId: string, signal?: AbortSignal): Promise<ReportRe
   return apiClient.request(`${BASE}/${runId}/report`, { signal });
 }
 
+export async function getContract(
+  runId: string,
+  signal?: AbortSignal,
+): Promise<ObjectiveContract> {
+  const response = await apiClient.request<ContractResponse>(`${BASE}/${runId}/contract`, {
+    signal,
+  });
+  return response.contract;
+}
+
+export async function getItems(runId: string, signal?: AbortSignal): Promise<ResearchItem[]> {
+  const response = await apiClient.request<ItemsResponse>(`${BASE}/${runId}/items`, {
+    signal,
+  });
+  return response.items;
+}
+
+export async function getRerunPlans(
+  runId: string,
+  signal?: AbortSignal,
+): Promise<RerunPlan[]> {
+  const response = await apiClient.request<RerunPlansResponse>(
+    `${BASE}/${runId}/rerun-plans`,
+    { signal },
+  );
+  return response.rerun_plans;
+}
+
 export function getAudit(runId: string, signal?: AbortSignal): Promise<AuditResponse> {
   return apiClient.request(`${BASE}/${runId}/audit`, { signal });
 }
 
 export function getCitations(runId: string, signal?: AbortSignal): Promise<Citation[]> {
   return apiClient.request(`${BASE}/${runId}/citations`, { signal });
-}
-
-export function getReviews(runId: string, signal?: AbortSignal): Promise<ReviewRecord[]> {
-  return apiClient.request(`${BASE}/${runId}/reviews`, { signal });
 }
 
 export function getAttempts(runId: string, signal?: AbortSignal): Promise<ResearchAttempt[]> {

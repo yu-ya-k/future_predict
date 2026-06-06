@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 import pytest
-from openai import APITimeoutError, OpenAIError
+from openai import APITimeoutError, BadRequestError, OpenAIError
 
 from api.config import Settings
 from api.research import azure_responses
@@ -36,10 +36,13 @@ class _FakeResponses:
         self.create_calls: list[dict[str, Any]] = []
         self.parse_calls: list[dict[str, Any]] = []
         self.parse_error: Exception | None = None
+        self.create_error: Exception | None = None
         self.create_response = _Response(response_id="resp_create")
 
     def create(self, **kwargs: Any) -> _Response:
         self.create_calls.append(kwargs)
+        if self.create_error is not None:
+            raise self.create_error
         return self.create_response
 
     def parse(self, **kwargs: Any) -> _Response:
@@ -70,17 +73,44 @@ def _valid_review_payload() -> str:
             "goal_achieved": True,
             "score": 91,
             "rationale": "sufficient",
+            "item_assessments": [
+                {
+                    "item_id": "RI-001",
+                    "status": "answered",
+                    "severity": "major",
+                    "failure_mode": "none",
+                    "failure_mode_confidence": 90,
+                    "recommended_action": "none",
+                    "evidence_summary": "covered",
+                    "missing_evidence": [],
+                    "rationale": "covered",
+                }
+            ],
             "gaps": [],
             "factuality_concerns": [],
             "source_quality_concerns": [],
+            "freshness_concerns": [],
+            "security_concerns": [],
             "next_instructions": None,
-            "can_be_fixed_by_llm": False,
-            "requires_new_external_research": False,
             "reviewer_confidence": 88,
             "high_risk_flags": [],
             "public_web_search_used": False,
+            "route_rationale": "pass",
         }
     )
+
+
+def _bad_request_error(message: str, *, param: str | None = None) -> BadRequestError:
+    request = httpx.Request("POST", "https://example.test/responses")
+    response = httpx.Response(400, request=request)
+    body = {
+        "error": {
+            "message": message,
+            "param": param,
+            "type": "invalid_request_error",
+        }
+    }
+    return BadRequestError(message, response=response, body=body)
 
 
 def test_deep_research_submit_always_includes_public_web_search_tool() -> None:
@@ -121,9 +151,34 @@ def test_review_report_falls_back_to_strict_schema_after_parse_helper_error() ->
     assert "tools" not in fake_client.responses.create_calls[0]
 
 
-def test_review_report_falls_back_to_strict_schema_after_parse_api_error() -> None:
+def test_review_report_does_not_fallback_after_parse_api_error() -> None:
     fake_client = _FakeClient()
     fake_client.responses.parse_error = OpenAIError("service unavailable")
+    fake_client.responses.create_response = _Response(
+        response_id="resp_strict",
+        output_text=_valid_review_payload(),
+    )
+    client = AzureResponsesClient(settings=_settings(), client=fake_client)
+
+    with pytest.raises(RuntimeError, match="Reviewer structured output request failed"):
+        client.review_report(
+            user_prompt="prompt",
+            optimized_prompt="optimized",
+            acceptance_criteria=[],
+            report="report",
+            citations=[],
+        )
+
+    assert fake_client.responses.parse_calls
+    assert fake_client.responses.create_calls == []
+
+
+def test_review_report_falls_back_after_parse_request_shape_error() -> None:
+    fake_client = _FakeClient()
+    fake_client.responses.parse_error = _bad_request_error(
+        "Unsupported parameter: 'text_format'.",
+        param="text_format",
+    )
     fake_client.responses.create_response = _Response(
         response_id="resp_strict",
         output_text=_valid_review_payload(),
@@ -218,7 +273,7 @@ def test_review_prompt_compacts_large_report_and_citations() -> None:
     assert "irrelevant" not in prompt
 
 
-def test_finalize_report_always_includes_web_search_tool() -> None:
+def test_finalize_report_uses_timeout_and_no_web_search_by_default() -> None:
     fake_client = _FakeClient()
     fake_client.responses.create_response = _Response(
         response_id="resp_finalize",
@@ -235,7 +290,41 @@ def test_finalize_report_always_includes_web_search_tool() -> None:
     assert report == "final report"
     assert response_id == "resp_finalize"
     assert raw_response["id"] == "resp_finalize"
+    assert fake_client.with_options_calls == [{"timeout": 180}]
+    assert "tools" not in fake_client.responses.create_calls[0]
+
+
+def test_finalize_report_can_enable_web_search_tool() -> None:
+    fake_client = _FakeClient()
+    fake_client.responses.create_response = _Response(
+        response_id="resp_finalize",
+        output_text="final report",
+    )
+    client = AzureResponsesClient(settings=_settings(), client=fake_client)
+
+    client.finalize_report(
+        user_prompt="prompt",
+        report="draft",
+        review={"rationale": "verify"},
+        enable_web_search=True,
+    )
+
     assert fake_client.responses.create_calls[0]["tools"] == [{"type": "web_search"}]
+
+
+def test_finalize_report_converts_timeout() -> None:
+    fake_client = _FakeClient()
+    fake_client.responses.create_error = APITimeoutError(
+        request=httpx.Request("POST", "https://example.test/responses")
+    )
+    client = AzureResponsesClient(settings=_settings(), client=fake_client)
+
+    with pytest.raises(ReviewRequestTimeout):
+        client.finalize_report(
+            user_prompt="prompt",
+            report="draft",
+            review={"rationale": "tighten wording"},
+        )
 
 
 def test_reviewer_client_uses_gpt_settings_when_present(monkeypatch: Any) -> None:

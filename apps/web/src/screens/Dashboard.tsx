@@ -179,6 +179,28 @@ function QueueEmptyCompact() {
   );
 }
 
+function confirmRunDelete(runId: string): boolean {
+  return window.confirm(
+    [
+      "このrunを削除しますか？",
+      "",
+      runId,
+      "",
+      "進行中の場合は停止してから削除されます。この操作は元に戻せません。",
+    ].join("\n"),
+  );
+}
+
+function formatDeleteError(runId: string, error: unknown): string {
+  const detail =
+    error instanceof ApiError
+      ? error.detail ?? error.message
+      : error instanceof Error
+        ? error.message
+        : "Unknown error";
+  return `run ${runId} の削除に失敗しました。${detail}`;
+}
+
 // ── Dashboard live polling for non-terminal tracked runs ──────────────────────
 
 function useTrackedRunStatuses(trackedRuns: TrackedRun[]) {
@@ -214,6 +236,7 @@ function useTrackedRunStatuses(trackedRuns: TrackedRun[]) {
 
   const { data } = usePolling({
     fetcher: fetchAll,
+    key: activeRuns.map((r) => r.run_id).join(","),
     interval: () => TRACKED_RUN_INTERVAL,
     enabled: activeRuns.length > 0,
     onData: (data) => setStatuses(data),
@@ -232,8 +255,12 @@ export function Dashboard() {
   const trackedRuns = useTrackedRuns();
   const [deletingRunIds, setDeletingRunIds] = useState<Set<string>>(() => new Set());
   const [hiddenQueueRunIds, setHiddenQueueRunIds] = useState<Set<string>>(() => new Set());
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const removeRun = useCallback(async (runId: string) => {
+    if (!confirmRunDelete(runId)) return;
+
+    setDeleteError(null);
     setDeletingRunIds((current) => new Set(current).add(runId));
     let shouldRemoveLocally = false;
     try {
@@ -243,7 +270,7 @@ export function Dashboard() {
       if (error instanceof ApiError && error.isNotFound) {
         shouldRemoveLocally = true;
       } else {
-        console.error("Failed to delete research run", error);
+        setDeleteError(formatDeleteError(runId, error));
       }
     } finally {
       if (shouldRemoveLocally) {
@@ -298,6 +325,12 @@ export function Dashboard() {
 
   return (
     <div className="screen-dashboard">
+      {deleteError && (
+        <div className="form-error" role="alert">
+          {deleteError}
+        </div>
+      )}
+
       {/* ── 要対応バンド ───────────────────────────── */}
       <section
         className={[

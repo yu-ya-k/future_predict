@@ -61,40 +61,78 @@ export function Settings() {
         <h2 id="defaults-heading" className="section-title">デフォルトオプション</h2>
         <div className="settings-grid">
           <div className="settings-field">
-            <label className="settings-label" htmlFor="s-max-deep-research">
-              最大Deep Research回数
+            <label className="settings-label" htmlFor="s-max-targeted-rerun">
+              最大Targeted rerun回数
             </label>
             <input
-              id="s-max-deep-research"
+              id="s-max-targeted-rerun"
               type="number"
               className="settings-input"
-              value={defaults.max_deep_research_runs}
-              min={OPTION_BOUNDS.max_deep_research_runs.min}
-              max={OPTION_BOUNDS.max_deep_research_runs.max}
+              value={defaults.max_targeted_rerun_runs}
+              min={OPTION_BOUNDS.max_targeted_rerun_runs.min}
+              max={OPTION_BOUNDS.max_targeted_rerun_runs.max}
               onChange={(e) =>
-                handleChange("max_deep_research_runs", Number(e.target.value))
+                handleChange("max_targeted_rerun_runs", Number(e.target.value))
               }
             />
             <span className="settings-range">
-              {OPTION_BOUNDS.max_deep_research_runs.min}–{OPTION_BOUNDS.max_deep_research_runs.max}
+              {OPTION_BOUNDS.max_targeted_rerun_runs.min}–{OPTION_BOUNDS.max_targeted_rerun_runs.max}
             </span>
           </div>
 
           <div className="settings-field">
-            <label className="settings-label" htmlFor="s-max-llm-fix">
-              最大LLM修正回数
+            <label className="settings-label" htmlFor="s-max-full-rerun">
+              最大Full rerun回数
             </label>
             <input
-              id="s-max-llm-fix"
+              id="s-max-full-rerun"
               type="number"
               className="settings-input"
-              value={defaults.max_llm_fix_runs}
-              min={OPTION_BOUNDS.max_llm_fix_runs.min}
-              max={OPTION_BOUNDS.max_llm_fix_runs.max}
-              onChange={(e) => handleChange("max_llm_fix_runs", Number(e.target.value))}
+              value={defaults.max_full_rerun_runs}
+              min={OPTION_BOUNDS.max_full_rerun_runs.min}
+              max={OPTION_BOUNDS.max_full_rerun_runs.max}
+              onChange={(e) => handleChange("max_full_rerun_runs", Number(e.target.value))}
             />
             <span className="settings-range">
-              {OPTION_BOUNDS.max_llm_fix_runs.min}–{OPTION_BOUNDS.max_llm_fix_runs.max}
+              {OPTION_BOUNDS.max_full_rerun_runs.min}–{OPTION_BOUNDS.max_full_rerun_runs.max}
+            </span>
+          </div>
+
+          <div className="settings-field">
+            <label className="settings-label" htmlFor="s-max-llm-patch">
+              最大LLM patch回数
+            </label>
+            <input
+              id="s-max-llm-patch"
+              type="number"
+              className="settings-input"
+              value={defaults.max_llm_patch_runs}
+              min={OPTION_BOUNDS.max_llm_patch_runs.min}
+              max={OPTION_BOUNDS.max_llm_patch_runs.max}
+              onChange={(e) => handleChange("max_llm_patch_runs", Number(e.target.value))}
+            />
+            <span className="settings-range">
+              {OPTION_BOUNDS.max_llm_patch_runs.min}–{OPTION_BOUNDS.max_llm_patch_runs.max}
+            </span>
+          </div>
+
+          <div className="settings-field">
+            <label className="settings-label" htmlFor="s-max-verification">
+              最大Verification回数
+            </label>
+            <input
+              id="s-max-verification"
+              type="number"
+              className="settings-input"
+              value={defaults.max_verification_runs}
+              min={OPTION_BOUNDS.max_verification_runs.min}
+              max={OPTION_BOUNDS.max_verification_runs.max}
+              onChange={(e) =>
+                handleChange("max_verification_runs", Number(e.target.value))
+              }
+            />
+            <span className="settings-range">
+              {OPTION_BOUNDS.max_verification_runs.min}–{OPTION_BOUNDS.max_verification_runs.max}
             </span>
           </div>
 
@@ -119,26 +157,6 @@ export function Settings() {
           </div>
 
           <div className="settings-field">
-            <label className="settings-label" htmlFor="s-max-no-progress">
-              最大停滞許容回数
-            </label>
-            <input
-              id="s-max-no-progress"
-              type="number"
-              className="settings-input"
-              value={defaults.max_no_progress_rounds}
-              min={OPTION_BOUNDS.max_no_progress_rounds.min}
-              max={OPTION_BOUNDS.max_no_progress_rounds.max}
-              onChange={(e) =>
-                handleChange("max_no_progress_rounds", Number(e.target.value))
-              }
-            />
-            <span className="settings-range">
-              {OPTION_BOUNDS.max_no_progress_rounds.min}–{OPTION_BOUNDS.max_no_progress_rounds.max}
-            </span>
-          </div>
-
-          <div className="settings-field">
             <label className="settings-label" htmlFor="s-max-tool-calls">
               最大ツール呼び出し数
             </label>
@@ -147,14 +165,16 @@ export function Settings() {
               type="number"
               className="settings-input"
               value={defaults.max_total_tool_calls}
-              min={10}
-              max={1000}
+              min={OPTION_BOUNDS.max_total_tool_calls.min}
+              max={OPTION_BOUNDS.max_total_tool_calls.max}
               step={10}
               onChange={(e) =>
                 handleChange("max_total_tool_calls", Number(e.target.value))
               }
             />
-            <span className="settings-range">10–1000</span>
+            <span className="settings-range">
+              {OPTION_BOUNDS.max_total_tool_calls.min}–{OPTION_BOUNDS.max_total_tool_calls.max}
+            </span>
           </div>
         </div>
 

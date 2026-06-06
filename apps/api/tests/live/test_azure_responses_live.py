@@ -59,6 +59,17 @@ def test_live_reviewer_structured_output_smoke(
             "Directly answers the user request.",
             "States evidence-backed claims and limitations.",
         ],
+        research_items=[
+            {
+                "item_id": "RI-001",
+                "criterion_id": "AC-001",
+                "question": "Directly answers the user request.",
+                "expected_answer_type": "fact",
+                "status": "not_started",
+                "severity": "major",
+                "confidence": 0,
+            }
+        ],
         report=(
             "OpenAI is a company focused on AI research and product development. "
             "This short report is for a smoke test and is not a detailed investigation."
@@ -68,8 +79,7 @@ def test_live_reviewer_structured_output_smoke(
 
     assert review.verdict in set(Verdict)
     assert 0 <= review.score <= 100
-    assert isinstance(review.can_be_fixed_by_llm, bool)
-    assert isinstance(review.requires_new_external_research, bool)
+    assert review.item_assessments
     assert response_id
     assert raw_response
 
@@ -130,7 +140,7 @@ def test_live_reviewer_finalize_smoke(
             "Limitation: smoke test only."
         ),
         review={
-            "verdict": Verdict.NEEDS_LLM_FIX.value,
+            "verdict": Verdict.NEEDS_LLM_PATCH.value,
             "rationale": "The wording should be made more concise.",
             "gaps": ["Slightly improve the structure."],
         },

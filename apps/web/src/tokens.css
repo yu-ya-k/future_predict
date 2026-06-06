@@ -28,12 +28,12 @@
   --pass-bg: #e1f5ee;
   --pass-border: #a8dfc9;
 
-  /* needs_llm_fix / minor fix — Amber */
+  /* needs_llm_patch / finalize_with_limitation — Amber */
   --llm: #854f0b;
   --llm-bg: #faeeda;
   --llm-border: #f0c980;
 
-  /* needs_deep_research / re-research — Coral */
+  /* needs_verification / targeted or full rerun — Coral */
   --deep: #993c1d;
   --deep-bg: #faece7;
   --deep-border: #f0b9a5;

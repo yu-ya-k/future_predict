@@ -107,7 +107,7 @@ COREPACK_HOME=$PWD/.corepack corepack pnpm --dir apps/web check
   - `docs/configuration.md`
   - `docs/testing.md`
   - `docs/operations.md`
-- Human-review endpoints require `X-Reviewer-Id`.
+- Human-review resume decisions currently do not require reviewer identity.
 - Live Azure OpenAI / OpenAI tests are opt-in only. Do not run them unless the
   user explicitly asks for live API testing and the required environment is set.
 

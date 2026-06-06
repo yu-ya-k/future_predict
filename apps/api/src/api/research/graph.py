@@ -37,6 +37,7 @@ def build_phase_3_graph(*, checkpointer: Any | None = None) -> Any:
     builder.add_node("finalize", _terminal_node("finalize"))
     builder.add_node("human_review", node_human_review)
     builder.add_node("partial_finalize", _terminal_node("partial_finalize"))
+    builder.add_node("human_review_rejected", _terminal_node("human_review_rejected"))
 
     builder.add_edge(START, "deep_research_collect")
     builder.add_edge("deep_research_collect", "review")
@@ -46,8 +47,12 @@ def build_phase_3_graph(*, checkpointer: Any | None = None) -> Any:
         {
             "finalize": "finalize",
             "human_review": "human_review",
-            "llm_finalize": "llm_finalize",
-            "deep_research_submit": "deep_research_submit",
+            "llm_patch": "llm_finalize",
+            "verify_items": "llm_finalize",
+            "build_targeted_rerun_plan": "deep_research_submit",
+            "full_rerun_submit": "deep_research_submit",
+            "revise_research_items": "human_review",
+            "finalize_with_limitation": "partial_finalize",
         },
     )
     builder.add_edge("llm_finalize", "review")
@@ -58,13 +63,19 @@ def build_phase_3_graph(*, checkpointer: Any | None = None) -> Any:
         {
             "finalize": "finalize",
             "review": "review",
-            "llm_finalize": "llm_finalize",
-            "deep_research_submit": "deep_research_submit",
+            "llm_patch": "llm_finalize",
+            "verify_items": "llm_finalize",
+            "build_targeted_rerun_plan": "deep_research_submit",
+            "full_rerun_submit": "deep_research_submit",
+            "revise_research_items": "human_review",
+            "finalize_with_limitation": "partial_finalize",
             "partial_finalize": "partial_finalize",
+            "human_review_rejected": "human_review_rejected",
         },
     )
     builder.add_edge("finalize", END)
     builder.add_edge("partial_finalize", END)
+    builder.add_edge("human_review_rejected", END)
     return builder.compile(checkpointer=checkpointer)
 
 
@@ -84,6 +95,7 @@ def build_phase_4_graph(*, checkpointer: Any) -> Any:
     builder.add_node("deep_research_submit", _deep_research_submit_node)
     builder.add_node("deep_research_collect", _deep_research_collect_node)
     builder.add_node("partial_finalize", _terminal_node("partial_finalize"))
+    builder.add_node("human_review_rejected", _terminal_node("human_review_rejected"))
 
     builder.add_edge(START, "human_review")
     builder.add_conditional_edges(
@@ -92,9 +104,14 @@ def build_phase_4_graph(*, checkpointer: Any) -> Any:
         {
             "finalize": "finalize",
             "review": "review",
-            "llm_finalize": "llm_finalize",
-            "deep_research_submit": "deep_research_submit",
+            "llm_patch": "llm_finalize",
+            "verify_items": "llm_finalize",
+            "build_targeted_rerun_plan": "deep_research_submit",
+            "full_rerun_submit": "deep_research_submit",
+            "revise_research_items": "human_review",
+            "finalize_with_limitation": "partial_finalize",
             "partial_finalize": "partial_finalize",
+            "human_review_rejected": "human_review_rejected",
         },
     )
     builder.add_edge("llm_finalize", "review")
@@ -106,12 +123,17 @@ def build_phase_4_graph(*, checkpointer: Any) -> Any:
         {
             "finalize": "finalize",
             "human_review": "human_review",
-            "llm_finalize": "llm_finalize",
-            "deep_research_submit": "deep_research_submit",
+            "llm_patch": "llm_finalize",
+            "verify_items": "llm_finalize",
+            "build_targeted_rerun_plan": "deep_research_submit",
+            "full_rerun_submit": "deep_research_submit",
+            "revise_research_items": "human_review",
+            "finalize_with_limitation": "partial_finalize",
         },
     )
     builder.add_edge("finalize", END)
     builder.add_edge("partial_finalize", END)
+    builder.add_edge("human_review_rejected", END)
     return builder.compile(checkpointer=checkpointer)
 
 
@@ -159,7 +181,6 @@ def _deep_research_collect_node(state: GraphState) -> dict[str, Any]:
         if (
             state.get("visited_deep_research_submit")
             or not isinstance(review, dict)
-            or review.get("verdict") == "needs_deep_research"
         ):
             review = {"verdict": "pass"}
     return {"visited_deep_research_collect": True, "review": review}
@@ -178,12 +199,18 @@ def _graph_route_after_human_review(state: GraphState) -> str:
 
     if action == HumanReviewAction.APPROVE:
         return "finalize"
+    if action == HumanReviewAction.APPROVE_WITH_LIMITATION:
+        return "partial_finalize"
     if action == HumanReviewAction.REQUEST_REVIEW:
         return "review"
-    if action == HumanReviewAction.REQUEST_LLM_FIX:
-        return "llm_finalize"
-    if action == HumanReviewAction.REQUEST_DEEP_RESEARCH:
-        return "deep_research_submit"
+    if action == HumanReviewAction.REQUEST_LLM_PATCH:
+        return "llm_patch"
+    if action == HumanReviewAction.REQUEST_VERIFICATION:
+        return "verify_items"
+    if action == HumanReviewAction.REQUEST_TARGETED_RERUN:
+        return "build_targeted_rerun_plan"
+    if action == HumanReviewAction.REQUEST_ITEM_REVISION:
+        return "revise_research_items"
     if action == HumanReviewAction.REJECT:
-        return "partial_finalize"
+        return "human_review_rejected"
     raise ValueError(f"Invalid human review action: {action_value!r}")

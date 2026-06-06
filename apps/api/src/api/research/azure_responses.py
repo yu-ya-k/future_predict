@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from openai import APITimeoutError, AzureOpenAI, OpenAI, OpenAIError
+from openai import APITimeoutError, AzureOpenAI, BadRequestError, OpenAI, OpenAIError
 from pydantic import ValidationError
 
 from api.config import Settings
@@ -22,6 +22,21 @@ _CITATION_COMPACT_KEYS = (
     "filename",
     "start_index",
     "end_index",
+)
+
+_PARSE_REQUEST_SHAPE_MARKERS = (
+    "text_format",
+    "response_format",
+    "json_schema",
+    "schema",
+)
+
+_REQUEST_SHAPE_ERROR_MARKERS = (
+    "unknown parameter",
+    "unsupported parameter",
+    "unrecognized request argument",
+    "unexpected request argument",
+    "extra inputs are not permitted",
 )
 
 
@@ -114,11 +129,13 @@ class AzureResponsesClient:
         acceptance_criteria: list[str],
         report: str,
         citations: list[dict[str, Any]],
+        research_items: list[dict[str, Any]] | None = None,
     ) -> tuple[ReviewResult, str | None, dict[str, Any]]:
         prompt = build_review_prompt(
             user_prompt=user_prompt,
             optimized_prompt=optimized_prompt,
             acceptance_criteria=acceptance_criteria,
+            research_items=research_items or [],
             report=report,
             citations=citations,
             max_report_chars=self.settings.research_review_max_report_chars,
@@ -154,9 +171,13 @@ class AzureResponsesClient:
                 TypeError,
                 AttributeError,
                 ValidationError,
-                OpenAIError,
             ):
                 pass
+            except OpenAIError as error:
+                if not _is_parse_request_shape_error(error):
+                    raise RuntimeError(
+                        "Reviewer structured output request failed."
+                    ) from error
 
         try:
             request = {
@@ -204,17 +225,31 @@ class AzureResponsesClient:
         user_prompt: str,
         report: str,
         review: dict[str, Any],
+        enable_web_search: bool = False,
     ) -> tuple[str, str | None, dict[str, Any]]:
-        tools = [{"type": "web_search"}]
-        response = self.reviewer_client.responses.create(
-            model=self.reviewer_deployment,
-            input=build_finalize_prompt(
+        tools = [{"type": "web_search"}] if enable_web_search else []
+        request_client = _client_with_timeout(
+            self.reviewer_client,
+            timeout=self.settings.research_review_timeout_seconds,
+        )
+        request: dict[str, Any] = {
+            "model": self.reviewer_deployment,
+            "input": build_finalize_prompt(
                 user_prompt=user_prompt,
                 report=report,
                 review=review,
             ),
-            tools=tools,
-        )
+        }
+        if tools:
+            request["tools"] = tools
+        try:
+            response = request_client.responses.create(
+                **request,
+            )
+        except APITimeoutError as error:
+            raise ReviewRequestTimeout("Reviewer finalize request timed out.") from error
+        except OpenAIError as error:
+            raise RuntimeError("Reviewer finalize request failed.") from error
         output_text = get_response_output_text(response)
         return output_text, get_response_id(response), response_to_jsonable(response)
 
@@ -224,6 +259,7 @@ def build_review_prompt(
     user_prompt: str,
     optimized_prompt: str,
     acceptance_criteria: list[str],
+    research_items: list[dict[str, Any]] | None = None,
     report: str,
     citations: list[dict[str, Any]],
     max_report_chars: int = 50000,
@@ -251,7 +287,8 @@ Review criteria:
 - How well the report achieves the objective in the original user prompt.
 - How completely the report satisfies the expected output items in the optimized prompt
   and acceptance criteria.
-- Whether any user-requested items are missing.
+- Whether each ResearchItem is answered, partially answered, unanswered, unverifiable,
+  or out of scope.
 - Whether key claims are backed by trustworthy sources.
 - Whether facts that require recency are current enough.
 - Whether numbers, proper nouns, dates, model names, and policy names are accurate.
@@ -264,20 +301,26 @@ Output policy:
 - Write all ReviewResult string fields in English, even if the user prompt or
   candidate report is in another language.
 - In rationale, include objective coverage, expected-output coverage, and the overall judgment.
-- In gaps, list unmet user requirements, missing expected outputs, and under-verified
-  issues specifically.
-- If verdict is needs_deep_research or requires_new_external_research is true,
-  write specific next_instructions for the next Deep Research run.
-- In next_instructions, include what to investigate, which source types to prioritize,
-  and what previous failures to avoid.
-- Use null for next_instructions only when verdict is pass.
+- For every ResearchItem, return one item_assessment with status, severity,
+  failure_mode, failure_mode_confidence, recommended_action, missing_evidence,
+  evidence_summary, and rationale.
+- Use needs_llm_patch only for format, organization, wording, or in-report content that
+  was lost in synthesis.
+- Use needs_verification for narrow factuality, freshness, or contradiction checks.
+- Use needs_targeted_rerun for missing item evidence requiring additional research.
+- Use needs_full_rerun only when the contract or initial report is systemically unusable.
+- Use finalize_with_limitation when unresolved non-blocking items should be disclosed
+  rather than rerun again.
+- Use null for next_instructions only when no automated follow-up is needed.
 
 verdict policy:
 - pass: The report satisfies the objective and has no major gaps, errors, or source issues.
-- needs_llm_fix: The report is mostly sufficient and can be fixed with minor edits,
-  organization, wording, or limited fact checks.
-- needs_deep_research: The report has major missing work, insufficient scope, weak sources,
-  contradictions, or requires multi-step research.
+- needs_llm_patch: The report is mostly sufficient and can be fixed without new research.
+- needs_verification: A narrow public-safe verification step is needed.
+- needs_targeted_rerun: One or more unresolved ResearchItems need additional Deep Research.
+- needs_full_rerun: The whole research attempt is unusable or the contract is defective.
+- needs_item_revision: The ResearchItems are ambiguous or need human-approved revision.
+- finalize_with_limitation: The report can finish with explicit limitations.
 - human_review: The topic is high-risk, unclear, or automated continuation is inappropriate.
 
 Return a response that strictly conforms to the ReviewResult schema.
@@ -291,6 +334,9 @@ Return a response that strictly conforms to the ReviewResult schema.
 
 # Acceptance Criteria
 {json.dumps(acceptance_criteria, ensure_ascii=False)}
+
+# Research Items
+{json.dumps(research_items or [], ensure_ascii=False)}
 
 # Candidate Report
 {report}
@@ -346,6 +392,25 @@ def _client_with_timeout(client: Any, *, timeout: int) -> Any:
     if callable(with_options):
         return with_options(timeout=timeout)
     return client
+
+
+def _is_parse_request_shape_error(error: OpenAIError) -> bool:
+    if not isinstance(error, BadRequestError):
+        return False
+
+    details = " ".join(
+        str(part)
+        for part in (
+            error,
+            getattr(error, "body", None),
+            getattr(error, "code", None),
+            getattr(error, "param", None),
+        )
+        if part
+    ).lower()
+    return any(
+        marker in details for marker in _PARSE_REQUEST_SHAPE_MARKERS
+    ) and any(marker in details for marker in _REQUEST_SHAPE_ERROR_MARKERS)
 
 
 def _truncate_text(value: str, *, max_chars: int) -> tuple[str, int]:

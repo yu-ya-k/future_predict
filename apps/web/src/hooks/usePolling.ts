@@ -28,91 +28,172 @@ interface UsePollingOptions<T> {
   /** Next delay in ms given the latest data, or null to stop. */
   interval: (data: T | undefined) => number | null;
   enabled?: boolean;
+  /** Resource or fetcher identity. Changing this resets state and starts a fresh request. */
+  key?: unknown;
   /** Called once on each successful fetch (e.g. notifications, store sync). */
   onData?: (data: T) => void;
+}
+
+function initialState<T>(loading: boolean): PollingState<T> {
+  return {
+    data: undefined,
+    error: undefined,
+    loading,
+    connectionUnstable: false,
+  };
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof DOMException && error.name === "AbortError";
 }
 
 export function usePolling<T>({
   fetcher,
   interval,
   enabled = true,
+  key = null,
   onData,
 }: UsePollingOptions<T>): PollingState<T> & { refetch: () => void } {
-  const [state, setState] = useState<PollingState<T>>({
-    data: undefined,
-    error: undefined,
-    loading: enabled,
-    connectionUnstable: false,
-  });
+  const [state, setState] = useState<PollingState<T>>(() => initialState(enabled));
 
   const errorStreak = useRef(0);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const cancelled = useRef(false);
+  const controller = useRef<AbortController | null>(null);
+  const sessionGeneration = useRef(0);
+  const requestGeneration = useRef(0);
+  const mounted = useRef(false);
+  const previousKey = useRef(key);
+  const tickRef = useRef<(sessionId: number) => void>(() => undefined);
 
   // Keep the latest callbacks without retriggering the polling loop.
   const fetcherRef = useRef(fetcher);
   const intervalRef = useRef(interval);
   const onDataRef = useRef(onData);
+  const enabledRef = useRef(enabled);
   fetcherRef.current = fetcher;
   intervalRef.current = interval;
   onDataRef.current = onData;
+  enabledRef.current = enabled;
 
-  const tick = useCallback(async () => {
-    const controller = new AbortController();
-    try {
-      const data = await fetcherRef.current(controller.signal);
-      if (cancelled.current) return;
-      errorStreak.current = 0;
-      setState({ data, error: undefined, loading: false, connectionUnstable: false });
-      onDataRef.current?.(data);
-      schedule(data);
-    } catch (error) {
-      if (cancelled.current || (error instanceof DOMException && error.name === "AbortError")) {
-        return;
-      }
-      errorStreak.current += 1;
-      setState((prev) => ({
-        ...prev,
-        error,
-        loading: false,
-        connectionUnstable: errorStreak.current >= BACKOFF_THRESHOLD,
-      }));
-      schedule(undefined, true);
+  const clearTimer = useCallback(() => {
+    if (timer.current) {
+      clearTimeout(timer.current);
+      timer.current = null;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const abortCurrent = useCallback(() => {
+    if (controller.current) {
+      controller.current.abort();
+      controller.current = null;
+    }
   }, []);
 
   const schedule = useCallback(
-    (data: T | undefined, isError = false) => {
+    (sessionId: number, data: T | undefined, isError = false) => {
+      if (sessionId !== sessionGeneration.current || !enabledRef.current) return;
+
       const base = intervalRef.current(data);
       if (base === null) return; // stop polling (terminal)
+
       let delay = base;
       if (isError && errorStreak.current >= BACKOFF_THRESHOLD) {
         const factor = 2 + (errorStreak.current - BACKOFF_THRESHOLD); // streak 3→2x, 4→3x, 5→4x ...
         delay = Math.min(base * factor, MAX_BACKOFF_MS);
       }
-      timer.current = setTimeout(tick, delay);
+
+      clearTimer();
+      timer.current = setTimeout(() => tickRef.current(sessionId), delay);
     },
-    [tick],
+    [clearTimer],
   );
 
+  const tick = useCallback(
+    async (sessionId: number) => {
+      if (sessionId !== sessionGeneration.current || !enabledRef.current) return;
+
+      clearTimer();
+      abortCurrent();
+      const generation = ++requestGeneration.current;
+      const currentController = new AbortController();
+      controller.current = currentController;
+      try {
+        const data = await fetcherRef.current(currentController.signal);
+        if (controller.current === currentController) {
+          controller.current = null;
+        }
+        if (
+          sessionId !== sessionGeneration.current ||
+          generation !== requestGeneration.current ||
+          !enabledRef.current
+        ) {
+          return;
+        }
+        errorStreak.current = 0;
+        setState({ data, error: undefined, loading: false, connectionUnstable: false });
+        onDataRef.current?.(data);
+        schedule(sessionId, data);
+      } catch (error) {
+        if (controller.current === currentController) {
+          controller.current = null;
+        }
+        if (
+          sessionId !== sessionGeneration.current ||
+          generation !== requestGeneration.current ||
+          !enabledRef.current ||
+          isAbortError(error)
+        ) {
+          return;
+        }
+        errorStreak.current += 1;
+        setState((prev) => ({
+          ...prev,
+          error,
+          loading: false,
+          connectionUnstable: errorStreak.current >= BACKOFF_THRESHOLD,
+        }));
+        schedule(sessionId, undefined, true);
+      }
+    },
+    [abortCurrent, clearTimer, schedule],
+  );
+  tickRef.current = tick;
+
   const refetch = useCallback(() => {
-    if (timer.current) clearTimeout(timer.current);
-    void tick();
-  }, [tick]);
+    if (!enabledRef.current) return;
+    clearTimer();
+    setState((prev) => ({ ...prev, loading: true }));
+    void tick(sessionGeneration.current);
+  }, [clearTimer, tick]);
 
   useEffect(() => {
-    cancelled.current = false;
+    const keyChanged = mounted.current && !Object.is(previousKey.current, key);
+    mounted.current = true;
+    previousKey.current = key;
+
+    sessionGeneration.current += 1;
+    requestGeneration.current += 1;
+    const sessionId = sessionGeneration.current;
+    errorStreak.current = 0;
+    clearTimer();
+    abortCurrent();
+
     if (!enabled) {
-      setState((prev) => ({ ...prev, loading: false }));
-      return;
+      setState((prev) => (keyChanged ? initialState(false) : { ...prev, loading: false }));
+    } else {
+      setState(initialState<T>(true));
+      tickRef.current(sessionId);
     }
-    void tick();
+
     return () => {
-      cancelled.current = true;
-      if (timer.current) clearTimeout(timer.current);
+      if (sessionGeneration.current === sessionId) {
+        sessionGeneration.current += 1;
+        requestGeneration.current += 1;
+      }
+      clearTimer();
+      abortCurrent();
     };
-  }, [enabled, tick]);
+  }, [abortCurrent, clearTimer, enabled, key]);
 
   return { ...state, refetch };
 }

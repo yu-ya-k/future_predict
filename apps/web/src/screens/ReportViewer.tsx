@@ -1,5 +1,5 @@
 /**
- * SCR-5: Report Viewer — Deep Research and review history.
+ * SCR-5: Report Viewer — Deep Research history.
  */
 
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
@@ -8,19 +8,18 @@ import {
   EmptyState,
   BackLink,
   Markdown,
-  ScoreChip,
   Skeleton,
   SourceListItem,
-  VerdictBadge,
 } from "../components";
-import { getReport, getCitations, getReviews, getAttempts } from "../api/research";
+import { getReport, getCitations, getAttempts } from "../api/research";
 import { usePolling } from "../hooks/usePolling";
-import { routes, type ReportTab } from "../router";
-import { type Citation, type ResearchAttempt, type ReviewRecord } from "../types";
+import { navigate, routes, type ReportTab } from "../router";
+import { type Citation, type ResearchAttempt } from "../types";
 
 interface ReportViewerProps {
   runId: string;
   initialTab?: ReportTab;
+  initialAttemptNo?: number | null;
 }
 
 interface ResearchReportVersion extends ResearchAttempt {
@@ -60,65 +59,58 @@ function buildResearchReportVersions(attempts: ResearchAttempt[]): ResearchRepor
     });
 }
 
-function formatReviewMarkdown(review: ReviewRecord | null): string | null {
-  if (!review) return null;
-  const lines = [
-    `# レビュー #${review.review_no}`,
-    "",
-    `- Verdict: ${review.verdict}`,
-    `- Score: ${review.score}`,
-    `- Recommended route: ${review.recommended_route}`,
-    `- Reviewer confidence: ${review.reviewer_confidence}%`,
-    "",
-    "## Rationale",
-    review.rationale,
-    "",
-    "## Gaps",
-    ...(review.gaps.length > 0 ? review.gaps.map((gap) => `- ${gap}`) : ["- なし"]),
-    "",
-    "## Factuality Concerns",
-    ...(
-      review.factuality_concerns.length > 0
-        ? review.factuality_concerns.map((concern) => `- ${concern}`)
-        : ["- なし"]
-    ),
-    "",
-    "## Source Quality Concerns",
-    ...(
-      review.source_quality_concerns.length > 0
-        ? review.source_quality_concerns.map((concern) => `- ${concern}`)
-        : ["- なし"]
-    ),
-    "",
-    "## Next Instructions",
-    review.next_instructions ?? "なし",
-  ];
-  return lines.join("\n");
+function safeMarkdownFilename(runId: string, attemptNo: number | null): string {
+  const safeRunId = runId.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  const suffix = attemptNo ? `deep-research-${attemptNo}` : "report";
+  return `${safeRunId || "research-run"}-${suffix}.md`;
 }
 
-export function ReportViewer({ runId, initialTab = "research" }: ReportViewerProps) {
+function downloadMarkdown(filename: string, markdown: string) {
+  const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.rel = "noopener";
+  anchor.style.display = "none";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export function ReportViewer({
+  runId,
+  initialTab = "research",
+  initialAttemptNo = null,
+}: ReportViewerProps) {
   const [viewMode, setViewMode] = useState<ReportTab>(initialTab);
   const [activeSourceType, setActiveSourceType] = useState<string>(SOURCE_TYPE_ALL);
-  const [selectedAttemptNo, setSelectedAttemptNo] = useState<number | null>(null);
-  const [selectedReviewNo, setSelectedReviewNo] = useState<number | null>(null);
-  const [attemptSelectionMode, setAttemptSelectionMode] = useState<"latest" | "manual">("latest");
-  const [reviewSelectionMode, setReviewSelectionMode] = useState<"latest" | "manual">("latest");
+  const [selectedAttemptNo, setSelectedAttemptNo] = useState<number | null>(
+    initialAttemptNo,
+  );
+  const [attemptSelectionMode, setAttemptSelectionMode] = useState<"latest" | "manual">(
+    initialAttemptNo ? "manual" : "latest",
+  );
   const sourcePanelRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     setViewMode(initialTab);
-  }, [initialTab]);
+    if (initialAttemptNo) {
+      setSelectedAttemptNo(initialAttemptNo);
+      setAttemptSelectionMode("manual");
+    }
+  }, [initialTab, initialAttemptNo]);
 
   useEffect(() => {
-    setSelectedAttemptNo(null);
-    setSelectedReviewNo(null);
-    setAttemptSelectionMode("latest");
-    setReviewSelectionMode("latest");
+    setSelectedAttemptNo(initialAttemptNo);
+    setAttemptSelectionMode(initialAttemptNo ? "manual" : "latest");
     setActiveSourceType(SOURCE_TYPE_ALL);
-  }, [runId]);
+  }, [initialAttemptNo, runId]);
 
   const { data: report, loading: reportLoading } = usePolling({
     fetcher: (signal) => getReport(runId, signal),
+    key: `report:${runId}`,
     interval: (data) => {
       if (data?.final_report) return null;
       return 15_000;
@@ -127,102 +119,62 @@ export function ReportViewer({ runId, initialTab = "research" }: ReportViewerPro
 
   const { data: citations } = usePolling({
     fetcher: (signal) => getCitations(runId, signal),
+    key: `citations:${runId}`,
     interval: () => 30_000,
   });
 
-  const { data: reviews } = usePolling({
-    fetcher: (signal) => getReviews(runId, signal),
-    interval: () => 30_000,
-  });
-
-  const { data: attempts } = usePolling({
+  const { data: attempts, loading: attemptsLoading } = usePolling({
     fetcher: (signal) => getAttempts(runId, signal),
+    key: `attempts:${runId}`,
     interval: () => 30_000,
   });
 
-  const sortedReviews = useMemo(
-    () => (
-      Array.isArray(reviews)
-        ? [...reviews].sort((a, b) => a.review_no - b.review_no)
-        : []
-    ),
-    [reviews],
-  );
-  const latestReview = sortedReviews.length > 0 ? sortedReviews[sortedReviews.length - 1] : null;
   const researchVersions = useMemo(
     () => buildResearchReportVersions(Array.isArray(attempts) ? attempts : []),
     [attempts],
   );
-  const latestAttemptNo =
-    researchVersions.length > 0 ? researchVersions[researchVersions.length - 1].run_no : null;
-  const latestReviewNo = latestReview?.review_no ?? null;
 
   useEffect(() => {
-    if (researchVersions.length === 0) {
-      setSelectedAttemptNo(null);
-      return;
-    }
     if (attemptSelectionMode === "latest") {
-      if (selectedAttemptNo !== latestAttemptNo) {
-        setSelectedAttemptNo(latestAttemptNo);
+      if (selectedAttemptNo !== null) {
+        setSelectedAttemptNo(null);
       }
-      return;
     }
-    if (!researchVersions.some((version) => version.run_no === selectedAttemptNo)) {
-      setSelectedAttemptNo(latestAttemptNo);
-      setAttemptSelectionMode("latest");
-    }
-  }, [attemptSelectionMode, latestAttemptNo, researchVersions, selectedAttemptNo]);
-
-  useEffect(() => {
-    if (sortedReviews.length === 0) {
-      setSelectedReviewNo(null);
-      return;
-    }
-    if (reviewSelectionMode === "latest") {
-      if (selectedReviewNo !== latestReviewNo) {
-        setSelectedReviewNo(latestReviewNo);
-      }
-      return;
-    }
-    if (!sortedReviews.some((review) => review.review_no === selectedReviewNo)) {
-      setSelectedReviewNo(latestReviewNo);
-      setReviewSelectionMode("latest");
-    }
-  }, [latestReviewNo, reviewSelectionMode, selectedReviewNo, sortedReviews]);
+  }, [attemptSelectionMode, selectedAttemptNo]);
 
   useEffect(() => {
     setActiveSourceType(SOURCE_TYPE_ALL);
   }, [viewMode, selectedAttemptNo]);
 
   const selectedAttempt =
-    researchVersions.find((version) => version.run_no === selectedAttemptNo) ??
-    researchVersions[researchVersions.length - 1] ??
-    null;
-  const selectedReview =
-    sortedReviews.find((review) => review.review_no === selectedReviewNo) ??
-    latestReview;
+    selectedAttemptNo === null
+      ? researchVersions[researchVersions.length - 1] ?? null
+      : researchVersions.find((version) => version.run_no === selectedAttemptNo) ?? null;
 
-  const currentCitations = selectedAttempt?.citations ?? (Array.isArray(citations) ? citations : []);
+  const finalReportText = report?.final_report || report?.report || null;
+  const displayMode = initialAttemptNo === null ? "final" : "attempt";
+  const displayText =
+    displayMode === "final" ? finalReportText : selectedAttempt?.report || null;
+  const displayLoading =
+    displayMode === "final"
+      ? reportLoading && !report
+      : attemptsLoading && researchVersions.length === 0;
+  const currentCitations =
+    displayMode === "attempt" && selectedAttempt?.citations
+      ? selectedAttempt.citations
+      : (Array.isArray(citations) ? citations : []);
   const sourceTypes = uniqueSourceTypes(currentCitations);
   const filteredCitations =
     activeSourceType === SOURCE_TYPE_ALL
       ? currentCitations
       : currentCitations.filter((c) => c.source_type === activeSourceType);
 
-  const exportText =
-    viewMode === "reviews"
-      ? formatReviewMarkdown(selectedReview)
-      : selectedAttempt?.report || null;
+  const exportText = displayText;
 
   function handleAttemptSelect(runNo: number) {
     setSelectedAttemptNo(runNo);
-    setAttemptSelectionMode(runNo === latestAttemptNo ? "latest" : "manual");
-  }
-
-  function handleReviewSelect(reviewNo: number) {
-    setSelectedReviewNo(reviewNo);
-    setReviewSelectionMode(reviewNo === latestReviewNo ? "latest" : "manual");
+    setAttemptSelectionMode("manual");
+    navigate(routes().report(runId, { attempt: runNo }));
   }
 
   function handleCitationClick(index: number) {
@@ -236,17 +188,13 @@ export function ReportViewer({ runId, initialTab = "research" }: ReportViewerPro
 
   function handleMdDownload() {
     if (!exportText) return;
-    const blob = new Blob([exportText], { type: "text/markdown;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${viewMode}-${runId}.md`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  function handlePdfPrint() {
-    window.print();
+    downloadMarkdown(
+      safeMarkdownFilename(
+        runId,
+        displayMode === "attempt" ? selectedAttempt?.run_no ?? null : null,
+      ),
+      exportText,
+    );
   }
 
   return (
@@ -254,21 +202,9 @@ export function ReportViewer({ runId, initialTab = "research" }: ReportViewerPro
       <header className="report-header">
         <div className="report-header-left">
           <BackLink to={routes().monitor(runId)} label="Runへ戻る" />
-          <h1 className="screen-title">
-            {viewMode === "reviews" ? "レビュー内容" : "レポート履歴"}
-          </h1>
+          <h1 className="screen-title">レポート履歴</h1>
           <p className="report-run-id">{runId}</p>
         </div>
-
-        {viewMode === "reviews" && latestReview && (
-          <div className="report-quality-row" aria-label="品質スコア">
-            <VerdictBadge verdict={latestReview.verdict} />
-            <ScoreChip score={latestReview.score} />
-            <span className="report-iteration-count">
-              レビュー {sortedReviews.length}回
-            </span>
-          </div>
-        )}
 
         <div className="report-export-buttons">
           <button
@@ -278,13 +214,6 @@ export function ReportViewer({ runId, initialTab = "research" }: ReportViewerPro
             disabled={!exportText}
           >
             MD ダウンロード
-          </button>
-          <button
-            type="button"
-            className="btn-secondary btn-sm"
-            onClick={handlePdfPrint}
-          >
-            PDF 印刷
           </button>
         </div>
       </header>
@@ -300,114 +229,98 @@ export function ReportViewer({ runId, initialTab = "research" }: ReportViewerPro
         </div>
       )}
 
-      {viewMode === "research" && (
-        <div className="report-layout">
-          <main className="report-body" aria-label="Deep Research出力">
-            {reportLoading && !report && researchVersions.length === 0 ? (
-              <div className="report-loading">
-                <Skeleton width="80%" height="24px" />
-                <Skeleton width="100%" height="16px" lines={6} />
-                <Skeleton width="60%" height="16px" />
-              </div>
-            ) : selectedAttempt?.report ? (
-              <Markdown source={selectedAttempt.report} onCitationClick={handleCitationClick} />
-            ) : (
-              <EmptyState
-                title="Deep Research出力なし"
-                description="完了済みのDeep Research出力がまだありません。"
-                icon="ti-file-text"
-              />
-            )}
+      <div className="report-layout">
+        <main
+          className="report-body"
+          aria-label={displayMode === "final" ? "最終レポート" : "Deep Research出力"}
+        >
+          {displayLoading ? (
+            <div className="report-loading">
+              <Skeleton width="80%" height="24px" />
+              <Skeleton width="100%" height="16px" lines={6} />
+              <Skeleton width="60%" height="16px" />
+            </div>
+          ) : displayText ? (
+            <Markdown source={displayText} onCitationClick={handleCitationClick} />
+          ) : displayMode === "attempt" ? (
+            <EmptyState
+              title={
+                selectedAttemptNo
+                  ? `Deep Research ${selectedAttemptNo}回目の出力なし`
+                  : "Deep Research出力なし"
+              }
+              description={
+                selectedAttemptNo
+                  ? "この試行はまだ取得中か、履歴がまだ同期されていません。"
+                  : "完了済みのDeep Research出力がまだありません。"
+              }
+              icon="ti-file-text"
+            />
+          ) : (
+            <EmptyState
+              title="レポートなし"
+              description="表示できるレポートがまだありません。"
+              icon="ti-file-text"
+            />
+          )}
 
-            {selectedAttempt && (
-              <section className="report-history-detail" aria-label="Deep Research詳細">
-                <h2 className="report-history-title">Deep Research {selectedAttempt.run_no}回目</h2>
-                <dl className="report-history-meta">
+          {displayMode === "attempt" && selectedAttempt && (
+            <section className="report-history-detail" aria-label="Deep Research詳細">
+              <h2 className="report-history-title">Deep Research {selectedAttempt.run_no}回目</h2>
+              <dl className="report-history-meta">
+                <div>
+                  <dt>Status</dt>
+                  <dd>{selectedAttempt.status}</dd>
+                </div>
+                <div>
+                  <dt>Model</dt>
+                  <dd>{selectedAttempt.model}</dd>
+                </div>
+                {selectedAttempt.response_id && (
                   <div>
-                    <dt>Status</dt>
-                    <dd>{selectedAttempt.status}</dd>
-                  </div>
-                  <div>
-                    <dt>Model</dt>
-                    <dd>{selectedAttempt.model}</dd>
-                  </div>
-                  {selectedAttempt.response_id && (
-                    <div>
-                      <dt>Response</dt>
-                      <dd className="mono">{selectedAttempt.response_id}</dd>
-                    </div>
-                  )}
-                </dl>
-                {selectedAttempt.error && (
-                  <div className="report-history-error" role="alert">
-                    {selectedAttempt.error}
+                    <dt>Response</dt>
+                    <dd className="mono">{selectedAttempt.response_id}</dd>
                   </div>
                 )}
-                <details className="report-history-prompt">
-                  <summary>Deep Researchへの指示内容</summary>
-                  <pre>{selectedAttempt.prompt}</pre>
-                </details>
-              </section>
-            )}
-          </main>
+              </dl>
+              {selectedAttempt.error && (
+                <div className="report-history-error" role="alert">
+                  {selectedAttempt.error}
+                </div>
+              )}
+              <details className="report-history-prompt">
+                <summary>Deep Researchへの指示内容</summary>
+                <pre>{selectedAttempt.prompt}</pre>
+              </details>
+            </section>
+          )}
+        </main>
 
-          <aside className="report-sources" aria-label="Deep Research履歴一覧">
-            <h2 className="sources-title">Deep Research履歴</h2>
-            <VersionList
-              versions={researchVersions.map((version) => ({
-                id: version.run_no,
-                title: `${version.run_no}回目`,
-                meta: `${version.status} / ${version.model}`,
-              }))}
-              selectedId={selectedAttempt?.run_no ?? null}
-              onSelect={handleAttemptSelect}
-              emptyTitle="履歴なし"
-              emptyDescription="Deep Researchの履歴がまだありません。"
-            />
-            <SourcesAside
-              title="選択版の引用ソース"
-              citations={filteredCitations}
-              allCitations={currentCitations}
-              sourceTypes={sourceTypes}
-              activeSourceType={activeSourceType}
-              onSourceTypeChange={setActiveSourceType}
-              sourcePanelRef={sourcePanelRef}
-              embedded
-            />
-          </aside>
-        </div>
-      )}
-
-      {viewMode === "reviews" && (
-        <div className="report-layout">
-          <main className="report-body" aria-label="レビュー内容">
-            {selectedReview ? (
-              <ReviewDetail review={selectedReview} />
-            ) : (
-              <EmptyState
-                title="レビュー履歴なし"
-                description="レビューが完了すると、ここに表示されます。"
-                icon="ti-clipboard-check"
-              />
-            )}
-          </main>
-
-          <aside className="report-sources" aria-label="レビュー履歴一覧">
-            <h2 className="sources-title">レビュー履歴</h2>
-            <VersionList
-              versions={sortedReviews.map((review) => ({
-                id: review.review_no,
-                title: `${review.review_no}回目`,
-                meta: `${review.verdict} / ${review.score}`,
-              }))}
-              selectedId={selectedReview?.review_no ?? null}
-              onSelect={handleReviewSelect}
-              emptyTitle="レビュー履歴なし"
-              emptyDescription="レビューが完了すると、ここに表示されます。"
-            />
-          </aside>
-        </div>
-      )}
+        <aside className="report-sources" aria-label="Deep Research履歴一覧">
+          <h2 className="sources-title">Deep Research履歴</h2>
+          <VersionList
+            versions={researchVersions.map((version) => ({
+              id: version.run_no,
+              title: `${version.run_no}回目`,
+              meta: `${version.status} / ${version.model}`,
+            }))}
+            selectedId={displayMode === "attempt" ? selectedAttempt?.run_no ?? null : null}
+            onSelect={handleAttemptSelect}
+            emptyTitle="履歴なし"
+            emptyDescription="Deep Researchの履歴がまだありません。"
+          />
+          <SourcesAside
+            title={displayMode === "final" ? "最終レポートの引用ソース" : "選択版の引用ソース"}
+            citations={filteredCitations}
+            allCitations={currentCitations}
+            sourceTypes={sourceTypes}
+            activeSourceType={activeSourceType}
+            onSourceTypeChange={setActiveSourceType}
+            sourcePanelRef={sourcePanelRef}
+            embedded
+          />
+        </aside>
+      </div>
     </div>
   );
 }
@@ -517,75 +430,5 @@ function VersionList({
         </button>
       ))}
     </div>
-  );
-}
-
-function ReviewDetail({ review }: { review: ReviewRecord }) {
-  return (
-    <article className="report-review-detail">
-      <div className="report-review-detail-header">
-        <div>
-          <h2 className="report-history-title">レビュー {review.review_no}回目</h2>
-          {review.reviewer_response_id && (
-            <p className="report-history-response mono">{review.reviewer_response_id}</p>
-          )}
-        </div>
-        <div className="report-quality-row">
-          <VerdictBadge verdict={review.verdict} />
-          <ScoreChip score={review.score} />
-        </div>
-      </div>
-
-      <dl className="report-history-meta">
-        <div>
-          <dt>Recommended route</dt>
-          <dd>{review.recommended_route}</dd>
-        </div>
-        <div>
-          <dt>Goal achieved</dt>
-          <dd>{review.goal_achieved ? "yes" : "no"}</dd>
-        </div>
-        <div>
-          <dt>Confidence</dt>
-          <dd>{review.reviewer_confidence}%</dd>
-        </div>
-        {review.report_hash && (
-          <div>
-            <dt>Report hash</dt>
-            <dd className="mono">{review.report_hash}</dd>
-          </div>
-        )}
-      </dl>
-
-      <section className="report-review-section">
-        <h3>Rationale</h3>
-        <p>{review.rationale}</p>
-      </section>
-      <ReviewList title="未解決のギャップ" items={review.gaps} />
-      <ReviewList title="事実確認の懸念" items={review.factuality_concerns} />
-      <ReviewList title="ソース品質の懸念" items={review.source_quality_concerns} />
-      <ReviewList title="高リスクフラグ" items={review.high_risk_flags} />
-      <section className="report-review-section">
-        <h3>次回実行への改善点</h3>
-        <p>{review.next_instructions ?? "なし"}</p>
-      </section>
-    </article>
-  );
-}
-
-function ReviewList({ title, items }: { title: string; items: string[] }) {
-  return (
-    <section className="report-review-section">
-      <h3>{title}</h3>
-      {items.length === 0 ? (
-        <p>なし</p>
-      ) : (
-        <ul>
-          {items.map((item, i) => (
-            <li key={i}>{item}</li>
-          ))}
-        </ul>
-      )}
-    </section>
   );
 }

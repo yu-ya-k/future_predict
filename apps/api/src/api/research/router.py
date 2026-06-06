@@ -19,11 +19,16 @@ from api.research.schemas import (
     HumanReviewResumeAPIRequest,
     HumanReviewResumeRequest,
     HumanReviewResumeResponse,
+    ItemStatus,
+    ObjectiveContractResponse,
     ReportResponse,
+    RerunPlansResponse,
     ResearchAttempt,
+    ResearchItemsResponse,
     ResearchRunStatusResponse,
     ReviewRecord,
     RunProgress,
+    Severity,
     ToolCallSummary,
 )
 from api.research.service import ResearchOrchestrator
@@ -76,6 +81,7 @@ def _status_response(
     return ResearchRunStatusResponse(
         run_id=run.id,
         status=run.status,
+        terminal_status=run.terminal_status,
         done_reason=run.done_reason,
         needs_human_review=run.needs_human_review,
         deep_research_submitted_at=orchestrator.repository.get_deep_research_submitted_at(
@@ -83,10 +89,14 @@ def _status_response(
         ),
         progress=RunProgress(
             deep_research_runs=run.deep_research_runs,
-            llm_fix_runs=run.llm_fix_runs,
+            targeted_rerun_runs=run.targeted_rerun_runs,
+            full_rerun_runs=run.full_rerun_runs,
+            llm_patch_runs=run.llm_patch_runs,
+            verification_runs=run.verification_runs,
             total_reviews=run.total_reviews,
             latest_verdict=latest.verdict if latest else None,
             latest_score=latest.score if latest else None,
+            **_item_progress_fields(orchestrator, run.id),
             total_tool_calls=run.total_tool_calls,
             estimated_cost_usd=estimated_cost_usd,
         ),
@@ -114,15 +124,72 @@ def get_audit(
     orchestrator: OrchestratorDependency,
 ) -> AuditResponse:
     run = _get_run_or_404(orchestrator, run_id)
+    cost_events = orchestrator.get_cost_events(run.id)
     return AuditResponse(
         run_id=run.id,
         attempts=orchestrator.repository.get_attempts(run.id),
         reviews=orchestrator.repository.get_reviews(run.id),
+        llm_calls=_llm_calls(cost_events),
+        objective_contract=orchestrator.repository.get_objective_contract(run.id),
+        research_items=orchestrator.repository.get_research_items(run.id),
+        rerun_plans=orchestrator.repository.get_rerun_plans(run.id),
+        verification_queries=orchestrator.repository.get_verification_queries(run.id),
         citations=orchestrator.repository.get_citations(run.id),
         tool_calls=orchestrator.repository.get_tool_calls(run.id),
-        cost_events=orchestrator.get_cost_events(run.id),
+        cost_events=cost_events,
         human_decisions=orchestrator.repository.get_human_decisions(run.id),
         history=orchestrator.repository.get_history(run.id),
+    )
+
+
+LLM_CALL_STEPS = {
+    "deep_research",
+    "review",
+    "review_failed",
+    "review_ignored",
+    "llm_finalize",
+    "llm_finalize_ignored",
+    "verification",
+}
+
+
+def _llm_calls(cost_events: list[CostEvent]) -> list[CostEvent]:
+    return [event for event in cost_events if event.step in LLM_CALL_STEPS]
+
+
+@router.get("/{run_id}/contract", response_model=ObjectiveContractResponse)
+def get_contract(
+    run_id: UUID,
+    orchestrator: OrchestratorDependency,
+) -> ObjectiveContractResponse:
+    run = _get_run_or_404(orchestrator, run_id)
+    return ObjectiveContractResponse(
+        run_id=run.id,
+        contract=orchestrator.repository.get_objective_contract(run.id),
+    )
+
+
+@router.get("/{run_id}/items", response_model=ResearchItemsResponse)
+def get_research_items(
+    run_id: UUID,
+    orchestrator: OrchestratorDependency,
+) -> ResearchItemsResponse:
+    run = _get_run_or_404(orchestrator, run_id)
+    return ResearchItemsResponse(
+        run_id=run.id,
+        items=orchestrator.repository.get_research_items(run.id),
+    )
+
+
+@router.get("/{run_id}/rerun-plans", response_model=RerunPlansResponse)
+def get_rerun_plans(
+    run_id: UUID,
+    orchestrator: OrchestratorDependency,
+) -> RerunPlansResponse:
+    run = _get_run_or_404(orchestrator, run_id)
+    return RerunPlansResponse(
+        run_id=run.id,
+        rerun_plans=orchestrator.repository.get_rerun_plans(run.id),
     )
 
 
@@ -201,7 +268,13 @@ def cancel_run(
     orchestrator: OrchestratorDependency,
 ) -> CancelResponse:
     _get_run_or_404(orchestrator, run_id)
-    run = orchestrator.cancel_run(run_id)
+    try:
+        run = orchestrator.cancel_run(run_id)
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        ) from error
     return CancelResponse(run_id=run.id, status=run.status)
 
 
@@ -258,3 +331,25 @@ def _get_run_or_404(orchestrator: ResearchOrchestrator, run_id: UUID):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Run not found."
         ) from error
+
+
+def _item_progress_fields(
+    orchestrator: ResearchOrchestrator,
+    run_id: UUID,
+) -> dict[str, int]:
+    items = orchestrator.repository.get_research_items(run_id)
+    return {
+        "items_total": len(items),
+        "items_answered": sum(item.status == ItemStatus.ANSWERED for item in items),
+        "items_partial": sum(item.status == ItemStatus.PARTIAL for item in items),
+        "items_unanswered": sum(
+            item.status in {ItemStatus.NOT_STARTED, ItemStatus.UNANSWERED}
+            for item in items
+        ),
+        "items_unverifiable": sum(item.status == ItemStatus.UNVERIFIABLE for item in items),
+        "blockers_unresolved": sum(
+            item.severity == Severity.BLOCKER
+            and item.status not in {ItemStatus.ANSWERED, ItemStatus.OUT_OF_SCOPE}
+            for item in items
+        ),
+    }

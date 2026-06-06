@@ -16,7 +16,7 @@ Do not commit secrets. Values prefixed with `VITE_` are exposed to browser code.
 
 | Variable | Default | Used for |
 | --- | --- | --- |
-| `RESEARCH_DB_PATH` | `.data/research.sqlite3` | SQLite database for runs, reviews, citations, tool calls, cost events, human decisions, and history. |
+| `RESEARCH_DB_PATH` | `.data/research.sqlite3` | SQLite database for runs, objective contracts, research items, rerun plans, verification queries, reviews, citations, tool calls, cost events, human decisions, and history. |
 | `RESEARCH_ARTIFACT_DIR` | `.data/research-runs` | Local artifact root for prompts, raw Responses API JSON, and report markdown files. |
 
 The repository and artifact store create parent directories as needed.
@@ -31,7 +31,7 @@ The repository and artifact store create parent directories as needed.
 | `RESEARCH_REVIEW_TIMEOUT_SECONDS` | `180` | Bounds GPT-5.5 review calls and marks stale `reviewing` runs as `review_timeout`. |
 | `RESEARCH_REVIEW_MAX_REPORT_CHARS` | `50000` | Caps report text sent to the reviewer. Long reports are truncated with a marker. |
 | `RESEARCH_REVIEW_MAX_CITATIONS` | `40` | Caps citation metadata sent to the reviewer. |
-| `RESEARCH_REVIEW_WEB_SEARCH_ENABLED` | `false` | Enables reviewer Web Search when explicitly needed. The default review uses the report and collected citations only. |
+| `RESEARCH_REVIEW_WEB_SEARCH_ENABLED` | `false` | Enables Web Search tools for structured review calls. LLM patch/finalization fallback and targeted verification have separate public-context/query-policy checks before using Web Search. |
 
 When the poller is disabled, submitted runs can remain `waiting_deep_research`
 until code explicitly calls `collect_deep_research`.
@@ -43,10 +43,11 @@ override in `options`.
 
 | Variable | Default | Used for |
 | --- | --- | --- |
-| `DEFAULT_MAX_DEEP_RESEARCH_RUNS` | `2` | Maximum Deep Research submissions for a run. |
-| `DEFAULT_MAX_LLM_FIX_RUNS` | `3` | Maximum LLM finalization/fix attempts. |
+| `DEFAULT_MAX_TARGETED_RERUN_RUNS` | `2` | Maximum targeted Deep Research reruns for a run. |
+| `DEFAULT_MAX_FULL_RERUN_RUNS` | `1` | Maximum full Deep Research reruns for a run. |
+| `DEFAULT_MAX_LLM_PATCH_RUNS` | `3` | Maximum reviewer LLM patch attempts. |
+| `DEFAULT_MAX_VERIFICATION_RUNS` | `3` | Maximum targeted verification attempts. |
 | `DEFAULT_MAX_TOTAL_ITERATIONS` | `5` | Maximum total review loop iterations. |
-| `DEFAULT_MAX_NO_PROGRESS_ROUNDS` | `2` | Maximum repeated no-progress rounds before human review. |
 | `DEFAULT_MAX_TOTAL_TOOL_CALLS` | `120` | Tool-call ceiling before human review or resume block. |
 
 ## Cost Estimation
@@ -78,8 +79,10 @@ rates are configured.
 empty value overrides the code default, so set this explicitly for real Deep
 Research usage.
 
-Deep Research submissions call `responses.create` with `background=True`,
-web-search tooling, and a bounded `max_tool_calls`.
+Public Deep Research submissions call `responses.create` with
+`background=True`, web-search tooling, and a bounded `max_tool_calls`.
+`internal`, `confidential`, and `mixed` runs are stopped by policy before public
+web submission.
 
 ## Azure OpenAI: Reviewer And Finalizer
 
