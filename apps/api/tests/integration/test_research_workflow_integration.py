@@ -53,7 +53,7 @@ async def test_api_poller_workflow_persists_report_and_audit(
 
     audit = audit_response.json()
     assert audit_response.status_code == 200
-    assert len(audit["attempts"]) == 2
+    assert len(audit["attempts"]) == 1
     assert len(audit["reviews"]) == 1
     assert len(audit["citations"]) == 1
     assert len(audit["tool_calls"]) == 1
@@ -99,7 +99,7 @@ def test_deep_research_rerun_route_creates_second_pending_attempt(
 
     assert rerun.status == RunStatus.WAITING_DEEP_RESEARCH
     assert rerun.deep_research_runs == 2
-    assert len(attempts) == 3
+    assert len(attempts) == 2
     assert fake.submit_calls[-1]["prompt"]
     assert "# Rerun Policy" in str(fake.submit_calls[-1]["prompt"])
 
@@ -129,7 +129,7 @@ async def test_deep_research_rerun_completes_after_poller_collect(
     assert completed.total_reviews == 2
     assert len(fake.submit_calls) == 2
     assert len(fake.retrieve_calls) == 2
-    assert len(attempts) == 4
+    assert len(attempts) == 2
     assert attempts[-1].status == "completed"
 
 

@@ -1013,6 +1013,23 @@ def test_failed_deep_research_records_attempt_error_and_human_review(tmp_path: P
     assert attempts[-1].error is not None
 
 
+def test_deep_research_attempt_is_updated_after_collect(tmp_path: Path) -> None:
+    orchestrator = make_orchestrator(tmp_path, FakeAzure())
+
+    run = orchestrator.create_run(CreateResearchRunRequest(user_prompt="競合調査をしてください"))
+    submitted_attempts = orchestrator.repository.get_attempts(run.id)
+    completed = orchestrator.collect_deep_research(run.id)
+    collected_attempts = orchestrator.repository.get_attempts(run.id)
+
+    assert completed.status == RunStatus.COMPLETED
+    assert len(submitted_attempts) == 1
+    assert submitted_attempts[0].status == "queued"
+    assert len(collected_attempts) == 1
+    assert collected_attempts[0].status == "completed"
+    assert collected_attempts[0].prompt == submitted_attempts[0].prompt
+    assert collected_attempts[0].report
+
+
 def test_failed_deep_research_records_usage_cost_and_tool_calls(tmp_path: Path) -> None:
     fake = FakeAzure(
         retrieve_status="failed",
@@ -1745,6 +1762,39 @@ def test_human_resume_request_deep_research_submits_rerun(tmp_path: Path) -> Non
     assert "一次情報を追加してください。" in fake.submitted_prompts[-1]
     assert "次回は公的統計を優先してください。" in fake.submitted_prompts[-1]
     assert "Write the entire Deep Research output in English" in fake.submitted_prompts[-1]
+
+
+def test_human_review_payload_hides_stale_review_after_deep_research_failure(
+    tmp_path: Path,
+) -> None:
+    fake = FakeAzure(verdict=Verdict.HUMAN_REVIEW)
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="公開情報を調査してください")
+    )
+    needs_human = orchestrator.collect_deep_research(run.id)
+    assert orchestrator.get_human_review_payload(needs_human.id).latest_review is not None
+
+    rerun = orchestrator.resume_run(
+        needs_human.id,
+        HumanReviewResumeRequest(
+            action=HumanReviewAction.REQUEST_DEEP_RESEARCH,
+            comment="追加調査してください。",
+        ),
+    )
+    fake.retrieve_status = "incomplete"
+    failed = orchestrator.collect_deep_research(rerun.id)
+    payload = orchestrator.get_human_review_payload(failed.id)
+    queue = orchestrator.list_human_reviews()
+
+    assert failed.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert failed.done_reason == "deep_research_incomplete"
+    assert payload.latest_review is None
+    assert payload.reason == "deep_research_incomplete"
+    assert queue[0].latest_verdict is None
+    assert queue[0].latest_score is None
+    assert queue[0].latest_rationale is None
 
 
 def test_human_resume_claim_prevents_second_resume(tmp_path: Path) -> None:

@@ -774,6 +774,17 @@ describe("RunMonitor (SCR-3)", () => {
                 tool_calls_summary: [],
                 error: null,
               },
+              {
+                run_no: 1,
+                response_id: "resp_prompt_test",
+                status: "completed",
+                model: "o3-deep-research",
+                prompt: "# Research Objective\n重複したcollect側の指示",
+                report: "# Deep Research出力",
+                citations: [],
+                tool_calls_summary: [],
+                error: null,
+              },
             ]),
         } as Response);
       }
@@ -813,6 +824,9 @@ describe("RunMonitor (SCR-3)", () => {
 
     expect(await screen.findByText("Deep Researchへの指示内容")).toBeInTheDocument();
     expect(screen.getByText(/実際のDeep Research指示/i)).toBeInTheDocument();
+    expect(screen.queryByText(/重複したcollect側の指示/i)).not.toBeInTheDocument();
+    expect(screen.getAllByText("Deep Research 1回目")).toHaveLength(1);
+    expect(screen.getByText("completed")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringContaining(`/research-runs/${runId}/attempts`),
       expect.any(Object),

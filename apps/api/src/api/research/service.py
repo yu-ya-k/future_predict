@@ -788,7 +788,10 @@ class ResearchOrchestrator:
         run = self.repository.get_run(run_id)
         if not _is_waiting_for_human_review(run):
             raise ValueError("Run is not waiting for human review.")
-        latest_review = self._latest_review(run.id)
+        latest_review = _visible_latest_review(
+            run,
+            latest_review=self._latest_review(run.id),
+        )
         return HumanReviewPayload(
             run_id=run.id,
             reason=run.done_reason or (latest_review.rationale if latest_review else ""),
@@ -1330,7 +1333,10 @@ class ResearchOrchestrator:
         self,
         run: ResearchRunRecord,
     ) -> HumanReviewQueueItem:
-        latest_review = self._latest_review(run.id)
+        latest_review = _visible_latest_review(
+            run,
+            latest_review=self._latest_review(run.id),
+        )
         return HumanReviewQueueItem(
             run_id=run.id,
             status=run.status,
@@ -1506,6 +1512,29 @@ def _has_pending_remote_deep_research(run: ResearchRunRecord) -> bool:
         run.status in {RunStatus.WAITING_DEEP_RESEARCH, RunStatus.COLLECTING}
         and bool(run.pending_deep_research_response_id)
     )
+
+
+def _visible_latest_review(
+    run: ResearchRunRecord,
+    *,
+    latest_review: ReviewRecord | None,
+) -> ReviewRecord | None:
+    if latest_review is None:
+        return None
+    if _done_reason_is_deep_research_execution_stop(run.done_reason):
+        return None
+    return latest_review
+
+
+def _done_reason_is_deep_research_execution_stop(done_reason: str | None) -> bool:
+    if done_reason is None:
+        return False
+    if done_reason.startswith("deep_research_"):
+        return True
+    return done_reason in {
+        "missing_deep_research_response_id",
+        "max_total_tool_calls_reached_before_deep_research_submit",
+    }
 
 
 def _human_review_route_reason(review: ReviewRecord) -> str:

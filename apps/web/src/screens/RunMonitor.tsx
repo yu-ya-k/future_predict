@@ -83,6 +83,22 @@ function hasNoProgressSignal(
   return false;
 }
 
+function coalesceAttemptsByRunNo(attempts: ResearchAttempt[]): ResearchAttempt[] {
+  const byRunNo = new Map<number, ResearchAttempt>();
+  for (const attempt of attempts) {
+    const existing = byRunNo.get(attempt.run_no);
+    if (!existing) {
+      byRunNo.set(attempt.run_no, attempt);
+      continue;
+    }
+    byRunNo.set(attempt.run_no, {
+      ...attempt,
+      prompt: existing.prompt || attempt.prompt,
+    });
+  }
+  return Array.from(byRunNo.values()).sort((a, b) => a.run_no - b.run_no);
+}
+
 // ── RunMonitor ────────────────────────────────────────────────────────────────
 
 interface RunMonitorProps {
@@ -198,7 +214,7 @@ export function RunMonitor({ runId }: RunMonitorProps) {
     setAttemptsLoading(true);
     setAttemptsError(null);
     try {
-      setAttempts(await getAttempts(runId));
+      setAttempts(coalesceAttemptsByRunNo(await getAttempts(runId)));
     } catch (err) {
       if (err instanceof ApiError) {
         setAttemptsError(err.detail ?? err.message);
