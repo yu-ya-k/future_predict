@@ -114,11 +114,13 @@ class AzureResponsesClient:
         acceptance_criteria: list[str],
         report: str,
         citations: list[dict[str, Any]],
+        research_items: list[dict[str, Any]] | None = None,
     ) -> tuple[ReviewResult, str | None, dict[str, Any]]:
         prompt = build_review_prompt(
             user_prompt=user_prompt,
             optimized_prompt=optimized_prompt,
             acceptance_criteria=acceptance_criteria,
+            research_items=research_items or [],
             report=report,
             citations=citations,
             max_report_chars=self.settings.research_review_max_report_chars,
@@ -204,16 +206,21 @@ class AzureResponsesClient:
         user_prompt: str,
         report: str,
         review: dict[str, Any],
+        enable_web_search: bool = True,
     ) -> tuple[str, str | None, dict[str, Any]]:
-        tools = [{"type": "web_search"}]
-        response = self.reviewer_client.responses.create(
-            model=self.reviewer_deployment,
-            input=build_finalize_prompt(
+        tools = [{"type": "web_search"}] if enable_web_search else []
+        request: dict[str, Any] = {
+            "model": self.reviewer_deployment,
+            "input": build_finalize_prompt(
                 user_prompt=user_prompt,
                 report=report,
                 review=review,
             ),
-            tools=tools,
+        }
+        if tools:
+            request["tools"] = tools
+        response = self.reviewer_client.responses.create(
+            **request,
         )
         output_text = get_response_output_text(response)
         return output_text, get_response_id(response), response_to_jsonable(response)
@@ -224,6 +231,7 @@ def build_review_prompt(
     user_prompt: str,
     optimized_prompt: str,
     acceptance_criteria: list[str],
+    research_items: list[dict[str, Any]] | None = None,
     report: str,
     citations: list[dict[str, Any]],
     max_report_chars: int = 50000,
@@ -251,7 +259,8 @@ Review criteria:
 - How well the report achieves the objective in the original user prompt.
 - How completely the report satisfies the expected output items in the optimized prompt
   and acceptance criteria.
-- Whether any user-requested items are missing.
+- Whether each ResearchItem is answered, partially answered, unanswered, unverifiable,
+  or out of scope.
 - Whether key claims are backed by trustworthy sources.
 - Whether facts that require recency are current enough.
 - Whether numbers, proper nouns, dates, model names, and policy names are accurate.
@@ -264,20 +273,26 @@ Output policy:
 - Write all ReviewResult string fields in English, even if the user prompt or
   candidate report is in another language.
 - In rationale, include objective coverage, expected-output coverage, and the overall judgment.
-- In gaps, list unmet user requirements, missing expected outputs, and under-verified
-  issues specifically.
-- If verdict is needs_deep_research or requires_new_external_research is true,
-  write specific next_instructions for the next Deep Research run.
-- In next_instructions, include what to investigate, which source types to prioritize,
-  and what previous failures to avoid.
-- Use null for next_instructions only when verdict is pass.
+- For every ResearchItem, return one item_assessment with status, severity,
+  failure_mode, failure_mode_confidence, recommended_action, missing_evidence,
+  evidence_summary, and rationale.
+- Use needs_llm_patch only for format, organization, wording, or in-report content that
+  was lost in synthesis.
+- Use needs_verification for narrow factuality, freshness, or contradiction checks.
+- Use needs_targeted_rerun for missing item evidence requiring additional research.
+- Use needs_full_rerun only when the contract or initial report is systemically unusable.
+- Use finalize_with_limitation when unresolved non-blocking items should be disclosed
+  rather than rerun again.
+- Use null for next_instructions only when no automated follow-up is needed.
 
 verdict policy:
 - pass: The report satisfies the objective and has no major gaps, errors, or source issues.
-- needs_llm_fix: The report is mostly sufficient and can be fixed with minor edits,
-  organization, wording, or limited fact checks.
-- needs_deep_research: The report has major missing work, insufficient scope, weak sources,
-  contradictions, or requires multi-step research.
+- needs_llm_patch: The report is mostly sufficient and can be fixed without new research.
+- needs_verification: A narrow public-safe verification step is needed.
+- needs_targeted_rerun: One or more unresolved ResearchItems need additional Deep Research.
+- needs_full_rerun: The whole research attempt is unusable or the contract is defective.
+- needs_item_revision: The ResearchItems are ambiguous or need human-approved revision.
+- finalize_with_limitation: The report can finish with explicit limitations.
 - human_review: The topic is high-risk, unclear, or automated continuation is inappropriate.
 
 Return a response that strictly conforms to the ReviewResult schema.
@@ -291,6 +306,9 @@ Return a response that strictly conforms to the ReviewResult schema.
 
 # Acceptance Criteria
 {json.dumps(acceptance_criteria, ensure_ascii=False)}
+
+# Research Items
+{json.dumps(research_items or [], ensure_ascii=False)}
 
 # Candidate Report
 {report}

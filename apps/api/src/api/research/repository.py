@@ -10,15 +10,20 @@ from uuid import UUID, uuid4
 from api.config import Settings
 from api.research.schemas import (
     Citation,
+    ContextClassification,
     CostEvent,
     HumanReviewAction,
     HumanReviewDecision,
+    ObjectiveContract,
+    RerunPlan,
     ResearchAttempt,
+    ResearchItem,
     ResearchRunOptions,
     ResearchRunRecord,
     ReviewRecord,
     RunStatus,
     ToolCallSummary,
+    VerificationQuery,
     utc_now,
 )
 
@@ -68,17 +73,23 @@ class ResearchRepository:
                     needs_human_review INTEGER NOT NULL DEFAULT 0,
                     pending_deep_research_response_id TEXT,
                     deep_research_status TEXT,
+                    context_classification TEXT NOT NULL DEFAULT 'public',
                     deep_research_runs INTEGER NOT NULL DEFAULT 0,
-                    llm_fix_runs INTEGER NOT NULL DEFAULT 0,
+                    targeted_rerun_runs INTEGER NOT NULL DEFAULT 0,
+                    full_rerun_runs INTEGER NOT NULL DEFAULT 0,
+                    llm_patch_runs INTEGER NOT NULL DEFAULT 0,
+                    verification_runs INTEGER NOT NULL DEFAULT 0,
                     total_reviews INTEGER NOT NULL DEFAULT 0,
                     no_progress_count INTEGER NOT NULL DEFAULT 0,
-                    max_deep_research_runs INTEGER NOT NULL DEFAULT 2,
-                    max_llm_fix_runs INTEGER NOT NULL DEFAULT 3,
+                    max_targeted_rerun_runs INTEGER NOT NULL DEFAULT 2,
+                    max_full_rerun_runs INTEGER NOT NULL DEFAULT 1,
+                    max_llm_patch_runs INTEGER NOT NULL DEFAULT 3,
+                    max_verification_runs INTEGER NOT NULL DEFAULT 3,
                     max_total_iterations INTEGER NOT NULL DEFAULT 5,
-                    max_no_progress_rounds INTEGER NOT NULL DEFAULT 2,
                     max_total_tool_calls INTEGER NOT NULL DEFAULT 120,
                     total_tool_calls INTEGER NOT NULL DEFAULT 0,
                     estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                    terminal_status TEXT,
                     warnings TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -109,10 +120,47 @@ class ResearchRepository:
                     verdict TEXT NOT NULL,
                     score INTEGER NOT NULL,
                     goal_achieved INTEGER NOT NULL,
-                    can_be_fixed_by_llm INTEGER NOT NULL,
-                    requires_new_external_research INTEGER NOT NULL,
                     reviewer_confidence INTEGER NOT NULL,
                     review_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS objective_contracts (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
+                    contract_json TEXT NOT NULL,
+                    contract_frozen INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS research_items (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
+                    item_id TEXT NOT NULL,
+                    criterion_id TEXT NOT NULL,
+                    item_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS rerun_plans (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
+                    rerun_id TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    target_item_ids TEXT NOT NULL,
+                    plan_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS verification_queries (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
+                    item_id TEXT NOT NULL,
+                    raw_query TEXT,
+                    safe_query TEXT,
+                    policy_status TEXT NOT NULL,
+                    blocked_reason TEXT,
                     created_at TEXT NOT NULL
                 );
 
@@ -183,11 +231,32 @@ class ResearchRepository:
                 ON human_review_decisions(run_id, decision_no, created_at);
                 """
             )
+            self._ensure_run_columns(connection)
+
+    def _ensure_run_columns(self, connection: sqlite3.Connection) -> None:
+        rows = connection.execute("PRAGMA table_info(research_runs)").fetchall()
+        existing = {row["name"] for row in rows}
+        columns = {
+            "context_classification": "TEXT NOT NULL DEFAULT 'public'",
+            "targeted_rerun_runs": "INTEGER NOT NULL DEFAULT 0",
+            "full_rerun_runs": "INTEGER NOT NULL DEFAULT 0",
+            "llm_patch_runs": "INTEGER NOT NULL DEFAULT 0",
+            "verification_runs": "INTEGER NOT NULL DEFAULT 0",
+            "max_targeted_rerun_runs": "INTEGER NOT NULL DEFAULT 2",
+            "max_full_rerun_runs": "INTEGER NOT NULL DEFAULT 1",
+            "max_llm_patch_runs": "INTEGER NOT NULL DEFAULT 3",
+            "max_verification_runs": "INTEGER NOT NULL DEFAULT 3",
+            "terminal_status": "TEXT",
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                connection.execute(f"ALTER TABLE research_runs ADD COLUMN {name} {definition}")
 
     def create_run(
         self,
         *,
         user_prompt: str,
+        context_classification: ContextClassification,
         options: ResearchRunOptions,
         settings: Settings,
     ) -> ResearchRunRecord:
@@ -201,21 +270,32 @@ class ResearchRepository:
                 """
                 INSERT INTO research_runs (
                     id, thread_id, user_prompt, status, needs_human_review,
-                    max_deep_research_runs, max_llm_fix_runs, max_total_iterations,
-                    max_no_progress_rounds, max_total_tool_calls,
+                    context_classification, max_targeted_rerun_runs, max_full_rerun_runs,
+                    max_llm_patch_runs, max_verification_runs, max_total_iterations,
+                    max_total_tool_calls,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(run_id),
                     thread_id,
                     user_prompt,
                     RunStatus.QUEUED.value,
-                    options.max_deep_research_runs or settings.default_max_deep_research_runs,
-                    options.max_llm_fix_runs or settings.default_max_llm_fix_runs,
+                    context_classification.value,
+                    options.max_targeted_rerun_runs
+                    if options.max_targeted_rerun_runs is not None
+                    else settings.default_max_targeted_rerun_runs,
+                    options.max_full_rerun_runs
+                    if options.max_full_rerun_runs is not None
+                    else settings.default_max_full_rerun_runs,
+                    options.max_llm_patch_runs
+                    if options.max_llm_patch_runs is not None
+                    else settings.default_max_llm_patch_runs,
+                    options.max_verification_runs
+                    if options.max_verification_runs is not None
+                    else settings.default_max_verification_runs,
                     options.max_total_iterations or settings.default_max_total_iterations,
-                    options.max_no_progress_rounds or settings.default_max_no_progress_rounds,
                     max_tool_calls,
                     now.isoformat(),
                     now.isoformat(),
@@ -567,11 +647,10 @@ class ResearchRepository:
             connection.execute(
                 """
                 INSERT INTO research_reviews (
-                    id, run_id, review_no, response_id, model, verdict, score, goal_achieved,
-                    can_be_fixed_by_llm, requires_new_external_research, reviewer_confidence,
-                    review_json, created_at
+                    id, run_id, review_no, response_id, model, verdict, score,
+                    goal_achieved, reviewer_confidence, review_json, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid4()),
@@ -582,8 +661,6 @@ class ResearchRepository:
                     review.verdict.value,
                     review.score,
                     int(review.goal_achieved),
-                    int(review.can_be_fixed_by_llm),
-                    int(review.requires_new_external_research),
                     review.reviewer_confidence,
                     review.model_dump_json(),
                     now,
@@ -759,6 +836,223 @@ class ResearchRepository:
             for row in rows
         ]
 
+    def save_objective_contract(
+        self,
+        run_id: UUID,
+        contract: ObjectiveContract,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "DELETE FROM objective_contracts WHERE run_id = ?",
+                (str(run_id),),
+            )
+            connection.execute(
+                """
+                INSERT INTO objective_contracts (
+                    id, run_id, contract_json, contract_frozen, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    str(run_id),
+                    contract.model_dump_json(),
+                    int(contract.contract_frozen),
+                    utc_now().isoformat(),
+                ),
+            )
+            self.append_history(
+                connection,
+                run_id,
+                {"step": "objective_contract_saved", "contract_id": contract.contract_id},
+            )
+
+    def get_objective_contract(self, run_id: UUID) -> ObjectiveContract | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT contract_json
+                FROM objective_contracts
+                WHERE run_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (str(run_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return ObjectiveContract.model_validate_json(row["contract_json"])
+
+    def upsert_research_items(self, run_id: UUID, items: list[ResearchItem]) -> None:
+        now = utc_now().isoformat()
+        with self.connect() as connection:
+            for item in items:
+                existing = connection.execute(
+                    """
+                    SELECT id
+                    FROM research_items
+                    WHERE run_id = ? AND item_id = ?
+                    """,
+                    (str(run_id), item.item_id),
+                ).fetchone()
+                if existing is None:
+                    connection.execute(
+                        """
+                        INSERT INTO research_items (
+                            id, run_id, item_id, criterion_id, item_json, created_at,
+                            updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(uuid4()),
+                            str(run_id),
+                            item.item_id,
+                            item.criterion_id,
+                            item.model_dump_json(),
+                            now,
+                            now,
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE research_items
+                        SET criterion_id = ?, item_json = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            item.criterion_id,
+                            item.model_dump_json(),
+                            now,
+                            existing["id"],
+                        ),
+                    )
+            self.append_history(
+                connection,
+                run_id,
+                {"step": "research_items_upserted", "count": len(items)},
+            )
+
+    def get_research_items(self, run_id: UUID) -> list[ResearchItem]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT item_json
+                FROM research_items
+                WHERE run_id = ?
+                ORDER BY item_id ASC, created_at ASC
+                """,
+                (str(run_id),),
+            ).fetchall()
+        return [ResearchItem.model_validate_json(row["item_json"]) for row in rows]
+
+    def add_rerun_plan(self, run_id: UUID, plan: RerunPlan) -> None:
+        created_at = utc_now()
+        plan = plan.model_copy(update={"created_at": created_at})
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO rerun_plans (
+                    id, run_id, rerun_id, scope, target_item_ids, plan_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    str(run_id),
+                    plan.rerun_id,
+                    plan.scope,
+                    _json_dump(plan.target_item_ids),
+                    plan.model_dump_json(),
+                    created_at.isoformat(),
+                ),
+            )
+            self.append_history(
+                connection,
+                run_id,
+                {
+                    "step": "rerun_plan_created",
+                    "rerun_id": plan.rerun_id,
+                    "scope": plan.scope,
+                    "target_item_ids": plan.target_item_ids,
+                },
+            )
+
+    def get_rerun_plans(self, run_id: UUID) -> list[RerunPlan]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT plan_json
+                FROM rerun_plans
+                WHERE run_id = ?
+                ORDER BY created_at ASC
+                """,
+                (str(run_id),),
+            ).fetchall()
+        return [RerunPlan.model_validate_json(row["plan_json"]) for row in rows]
+
+    def add_verification_query(
+        self,
+        run_id: UUID,
+        query: VerificationQuery,
+    ) -> None:
+        created_at = query.created_at or utc_now()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO verification_queries (
+                    id, run_id, item_id, raw_query, safe_query, policy_status,
+                    blocked_reason, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    str(run_id),
+                    query.item_id,
+                    query.raw_query,
+                    query.safe_query,
+                    query.policy_status,
+                    query.blocked_reason,
+                    created_at.isoformat(),
+                ),
+            )
+            self.append_history(
+                connection,
+                run_id,
+                {
+                    "step": "verification_query_policy_decision",
+                    "item_id": query.item_id,
+                    "policy_status": query.policy_status,
+                    "blocked_reason": query.blocked_reason,
+                },
+            )
+
+    def get_verification_queries(self, run_id: UUID) -> list[VerificationQuery]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT item_id, raw_query, safe_query, policy_status, blocked_reason,
+                       created_at
+                FROM verification_queries
+                WHERE run_id = ?
+                ORDER BY created_at ASC
+                """,
+                (str(run_id),),
+            ).fetchall()
+        return [
+            VerificationQuery(
+                item_id=row["item_id"],
+                raw_query=row["raw_query"],
+                safe_query=row["safe_query"],
+                policy_status=row["policy_status"],
+                blocked_reason=row["blocked_reason"],
+                created_at=_parse_dt(row["created_at"]),
+            )
+            for row in rows
+        ]
+
     def claim_human_review_decision(
         self,
         run_id: UUID,
@@ -928,17 +1222,23 @@ class ResearchRepository:
             needs_human_review=bool(row["needs_human_review"]),
             pending_deep_research_response_id=row["pending_deep_research_response_id"],
             deep_research_status=row["deep_research_status"],
+            context_classification=ContextClassification(row["context_classification"]),
             deep_research_runs=row["deep_research_runs"],
-            llm_fix_runs=row["llm_fix_runs"],
+            targeted_rerun_runs=row["targeted_rerun_runs"],
+            full_rerun_runs=row["full_rerun_runs"],
+            llm_patch_runs=row["llm_patch_runs"],
+            verification_runs=row["verification_runs"],
             total_reviews=row["total_reviews"],
             no_progress_count=row["no_progress_count"],
-            max_deep_research_runs=row["max_deep_research_runs"],
-            max_llm_fix_runs=row["max_llm_fix_runs"],
+            max_targeted_rerun_runs=row["max_targeted_rerun_runs"],
+            max_full_rerun_runs=row["max_full_rerun_runs"],
+            max_llm_patch_runs=row["max_llm_patch_runs"],
+            max_verification_runs=row["max_verification_runs"],
             max_total_iterations=row["max_total_iterations"],
-            max_no_progress_rounds=row["max_no_progress_rounds"],
             max_total_tool_calls=row["max_total_tool_calls"],
             total_tool_calls=row["total_tool_calls"],
             estimated_cost_usd=row["estimated_cost_usd"],
+            terminal_status=row["terminal_status"],
             warnings=_json_load(row["warnings"], []),
             created_at=_parse_dt(row["created_at"]),
             updated_at=_parse_dt(row["updated_at"]),

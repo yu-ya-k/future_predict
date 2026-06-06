@@ -70,15 +70,29 @@ def _valid_review_payload() -> str:
             "goal_achieved": True,
             "score": 91,
             "rationale": "sufficient",
+            "item_assessments": [
+                {
+                    "item_id": "RI-001",
+                    "status": "answered",
+                    "severity": "major",
+                    "failure_mode": "none",
+                    "failure_mode_confidence": 90,
+                    "recommended_action": "none",
+                    "evidence_summary": "covered",
+                    "missing_evidence": [],
+                    "rationale": "covered",
+                }
+            ],
             "gaps": [],
             "factuality_concerns": [],
             "source_quality_concerns": [],
+            "freshness_concerns": [],
+            "security_concerns": [],
             "next_instructions": None,
-            "can_be_fixed_by_llm": False,
-            "requires_new_external_research": False,
             "reviewer_confidence": 88,
             "high_risk_flags": [],
             "public_web_search_used": False,
+            "route_rationale": "pass",
         }
     )
 

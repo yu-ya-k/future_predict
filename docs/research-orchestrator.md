@@ -1,120 +1,202 @@
-# Research Orchestrator
+# Research Orchestrator v2
 
-The Research Orchestrator is implemented in `apps/api/src/api/research`. It
-coordinates background Deep Research, report review, bounded repair loops,
-human review, persistence, audit records, and local artifacts.
+The Research Orchestrator is implemented in `apps/api/src/api/research`. The v2
+design changes the unit of repair from a full report to unresolved
+`ResearchItem` records. Deep Research still performs broad initial research and
+targeted follow-up research, while the reviewer model owns structured review,
+small patches, finalization, and the single routing gate.
+
+## Design Principle
+
+Deep Research is not rerun to rewrite a report. It is rerun only to close
+specific unresolved ResearchItems with the smallest safe action.
+
+The v2 orchestrator therefore keeps a lightweight item ledger as the P0 quality
+surface:
+
+- `ObjectiveContract`: frozen interpretation of the user's objective.
+- `AcceptanceCriterion`: stable criteria used by review and rerun planning.
+- `ResearchItem`: item-level research questions derived from the criteria.
+- `ReviewResult` / `ReviewRecord`: item assessments and a single verdict.
+- `RerunPlan`: target item ids, preserved item ids, source hints, and tool-call
+  budget for a targeted rerun.
+- `PatchDelta`: deterministic merge primitive used for item-scoped deltas.
+- `verification_queries`: query-policy decisions for targeted verification.
+
+Claim and full evidence ledgers are intentionally out of P0. They can be added
+after item decomposition, failure-mode diagnosis, and targeted rerun quality are
+validated with evals.
 
 ## Workflow
 
-1. `POST /research-runs` creates a run, stores it in SQLite, builds an optimized
-   research prompt, and submits an Azure OpenAI Responses background request for
-   Deep Research.
-2. The API stores the run as `waiting_deep_research` with the pending response
+1. `POST /research-runs` requires `context_classification` and creates a run.
+2. The orchestrator validates security policy, builds an `ObjectiveContract`,
+   generates initial `ResearchItem` rows, freezes the contract, and submits an
+   Azure OpenAI Responses background request for initial Deep Research.
+3. The API stores the run as `waiting_deep_research` with the pending response
    id.
-3. The app lifespan starts `ResearchPoller` when `RESEARCH_POLLER_ENABLED=true`.
-   Each tick marks timed-out runs or collects waiting Deep Research responses.
-4. Collection retrieves the Responses API result. A completed response produces
-   a report, citations, tool-call summaries, cost events, raw response artifacts,
-   and a review step.
-5. Review uses the reviewer deployment with structured output matching
-   `ReviewResult`. It records review details, citations, tool calls, cost
-   events, and a `route_after_review` history event.
-6. Routing can finalize, request an LLM fix, request another Deep Research run,
-   or enter human review.
-7. LLM fixes revise the current report and immediately re-enter review.
-8. Additional Deep Research runs create a rerun brief, submit another background
-   request, and wait for the poller.
-9. Human review exposes a queue and payload through API endpoints. A reviewer
-   resumes the run with one of the allowed actions.
+4. `ResearchPoller` collects completed Deep Research responses when
+   `RESEARCH_POLLER_ENABLED=true`.
+5. Collection stores the candidate report, citations, tool calls, cost events,
+   and raw response artifacts. Item-level evidence remains summarized on
+   `ResearchItem` records in P0.
+6. Review uses structured output matching `ReviewResult`. The review gate
+   returns item-level status, failure mode, confidence, and recommended action.
+7. Deterministic routing uses only the latest `ReviewRecord` plus guard state.
+8. LLM patches are bounded reviewer edits and then re-enter review.
+9. Verification uses public web search only after the query policy gate allows
+   the generated safe query. Blocked verification goes to human review.
+10. Targeted reruns submit a `RerunPlan` and require Deep Research to return
+    item deltas, not a full merged report. Application code applies the delta
+    through deterministic merge and rejects outputs that look like a full merged
+    report.
+11. Full rerun is reserved for defective contracts, unusable initial reports, or
+    systemic source failure.
+12. Human review is a resumable control point. Payloads include unresolved
+    items, failure modes, attempted actions, and allowed next actions.
 
-## Phases
+## Required Context Classification
 
-- Phase 1-2: strict schemas, review routing, optimized prompts, persistence,
-  artifacts, and local test coverage.
-- Phase 3: automated collect -> review -> finalize / LLM fix / Deep Research
-  loop / human review routing. `build_phase_3_graph` mirrors this flow for
-  LangGraph tests.
-- Phase 4: human-review interrupt and resume routing. `build_phase_4_graph`
-  requires a checkpointer and resumes with a LangGraph `Command`.
+Every run must declare how the prompt may be used:
 
-The production HTTP path is `ResearchOrchestrator`; the graph module provides
-testable workflow shapes for the same route decisions.
+- `public`: public web search is allowed.
+- `internal`: public web search is blocked unless a private tool is explicitly
+  used by a future implementation.
+- `confidential`: public web search is blocked.
+- `mixed`: public web search is blocked until a redaction/private-tool path is
+  implemented.
 
-## MVP Scope
-
-The MVP treats every run as public Web Research. Web Search is required for
-Deep Research and remains available for finalization. GPT-5.5 review uses the
-report and collected citations by default, with reviewer Web Search available
-only through explicit configuration. The app does not accept or route on source
-categories or a per-run search-toggle policy.
-
-## Statuses
-
-Runs use these status values:
-
-- `queued`
-- `submitted`
-- `waiting_deep_research`
-- `collecting`
-- `reviewing`
-- `needs_action`
-- `needs_human_review`
-- `completed`
-- `cancelled`
-- `failed`
-
-Current code most commonly exposes `waiting_deep_research`,
-`needs_human_review`, `completed`, `cancelled`, and `failed` through the API.
+The query policy gate runs before public-web Deep Research submission and
+targeted verification. Verification decisions are persisted as
+`verification_queries` with raw query, safe query, policy decision, and blocked
+reason.
 
 ## Review Verdicts
 
-Reviewer structured output can return:
+`ReviewResult.verdict` can return:
 
 - `pass`: finalize the current report.
-- `needs_llm_fix`: use the reviewer deployment to revise the report when safe.
-- `needs_deep_research`: submit another Deep Research run when limits allow.
+- `needs_llm_patch`: apply item-scoped report deltas without new external
+  research.
+- `needs_verification`: run targeted verification if query policy allows it.
+- `needs_targeted_rerun`: submit Deep Research for unresolved item ids only.
+- `needs_full_rerun`: rebuild the research attempt because the current report or
+  contract is unusable.
+- `needs_item_revision`: split, merge, or clarify ResearchItems before more
+  automation.
+- `finalize_with_limitation`: complete with explicit limitations when unresolved
+  non-blocking items remain.
 - `human_review`: stop automation and require a reviewer decision.
 
-## Guard Conditions
+The legacy `needs_deep_research` verdict is invalid in v2.
 
-Automation routes to human review when continuing would exceed or violate a
-guard:
+## Failure Modes
 
-- `max_total_iterations`
-- `max_deep_research_runs`
-- `max_llm_fix_runs`
-- `max_no_progress_rounds`
-- `max_total_tool_calls`
-- malformed or failed review output
-- missing report or missing response id
-- Deep Research terminal failure, unknown status, timeout, or submit failure
+Each `ItemAssessment` must include one failure mode:
 
-The same guards also block human resume actions that would continue automated
-work (`request_llm_fix` or `request_deep_research`) after a hard stop.
-`request_review` retries only the GPT-5.5 review step and is exposed when the
-review itself failed, for example `review_timeout` or
-`review_schema_or_request_failed`. `approve` and `reject` remain terminal
-reviewer actions.
+- `none`
+- `format_only`
+- `in_report_but_lost`
+- `needs_targeted_verification`
+- `needs_different_sources`
+- `needs_deeper_search`
+- `needs_query_reformulation`
+- `source_contradiction`
+- `likely_not_publicly_available`
+- `criterion_too_ambiguous`
+- `requires_human_judgment`
+
+Routing is based on failure mode, severity, confidence, security policy, and
+budget guards. Score is retained only as diagnostic metadata.
+
+## Routing Priority
+
+The single review gate chooses the route in this order:
+
+1. `pass`
+2. explicit `human_review`
+3. security violation
+4. hard stops
+5. item revision
+6. LLM patch
+7. verification
+8. targeted rerun
+9. full rerun
+10. finalize with limitation
+11. human review fallback
+
+Default item routing:
+
+| Failure mode | Minor | Major | Blocker |
+| --- | --- | --- | --- |
+| `format_only` | `needs_llm_patch` | `needs_llm_patch` | `needs_llm_patch` |
+| `in_report_but_lost` | `needs_llm_patch` | `needs_llm_patch` | `needs_llm_patch` |
+| `needs_targeted_verification` | `needs_verification` | `needs_verification` | `needs_verification` |
+| `needs_different_sources` | `needs_targeted_rerun` | `needs_targeted_rerun` | `needs_targeted_rerun` |
+| `needs_deeper_search` | `needs_targeted_rerun` | `needs_targeted_rerun` | `needs_targeted_rerun` |
+| `needs_query_reformulation` | `needs_targeted_rerun` | `needs_targeted_rerun` | `needs_targeted_rerun` |
+| `source_contradiction` | `needs_verification` | `needs_verification` or `needs_targeted_rerun` | `needs_targeted_rerun` |
+| high-confidence `likely_not_publicly_available` | `finalize_with_limitation` | `finalize_with_limitation` | `human_review` |
+| low-confidence `likely_not_publicly_available` | one verification | one targeted rerun | `human_review` |
+| `criterion_too_ambiguous` | `needs_item_revision` | `human_review` | `human_review` |
+| `requires_human_judgment` | `human_review` | `human_review` | `human_review` |
+
+## Rerun Output Contract
+
+Targeted reruns must not return a full merged report. Valid output is limited to:
+
+- `target_item_id`
+- `gap_closure_summary`
+- `new_evidence_summary`
+- `revised_section_delta`
+- `remaining_uncertainty`
+- `suggested_status_after_rerun`
+
+Application code converts accepted targeted-rerun deltas into deterministic merge
+operations. The existing report body is treated as preserved; a targeted rerun
+that returns what looks like a full merged report routes to human review.
 
 ## No-Progress Handling
 
-After each review, the orchestrator compares current and previous review state
-using `compute_no_progress_count`. Repeated rounds without meaningful progress
-increment `no_progress_count`. When it reaches `max_no_progress_rounds`, the
-run enters human review instead of continuing the loop.
+No-progress is item based:
 
-## Cost And Tool-Call Tracking
+- `unanswered` or `partial` to `answered` is progress.
+- `unanswered` or `partial` to `unverifiable` is progress.
+- Failure-mode confidence gain of at least 10 points is progress.
+- A status regression increments no-progress even if another signal improved.
+- Same item status and same failure mode without progress increments
+  no-progress.
+- If either review does not contain item assessments, the fallback heuristic uses
+  repeated verdicts, small score deltas, similar gaps or concerns, and unchanged
+  report hash.
 
-The orchestrator records cost events for Deep Research, review, failed review
-responses with billable metadata, and LLM finalization. Estimated cost is derived
-from each cost event's model, token usage, and billable web-search calls.
-`o3-deep-research` and Azure deployment names containing `o3-deep-research`
-use the Deep Research rate, while `gpt-5.5` and deployment names containing
-`gpt5.5` use the reviewer/finalizer rate. Tool calls are counted from extracted
-response tool-call summaries and stored for audit.
+An `unverifiable` blocker does not pass automatically. It routes to human review
+or limitation approval.
 
-Defaults come from `.env.example` and the limit values can be overridden per
-run through `ResearchRunOptions`.
+## Human Review
+
+Human review payloads include:
+
+- latest report
+- latest `ReviewRecord`
+- unresolved item list
+- failure mode and confidence for each unresolved item
+- attempted verification or rerun actions
+- audit summary
+- allowed actions
+
+Allowed actions:
+
+- `approve`
+- `approve_with_limitation`
+- `request_review` (allowed only after reviewer execution/schema failures)
+- `request_llm_patch`
+- `request_verification`
+- `request_targeted_rerun`
+- `request_item_revision` (returns to human review for manual item revision)
+- `reject`
+
+The legacy `request_deep_research` action is invalid in v2.
 
 ## Artifacts
 
@@ -124,7 +206,8 @@ Artifacts are written under `RESEARCH_ARTIFACT_DIR`:
 - `prompts/rerun_prompt_NNN.txt`
 - `raw-responses/*.json`
 - `reports/report_attempt_NNN.md`
-- `reports/llm_fix_NNN.md`
+- `reports/llm_patch_NNN.md`
 - `reports/final_report.md`
 
-SQLite state is stored at `RESEARCH_DB_PATH`.
+SQLite state, including objective contracts, research items, rerun plans, and
+verification query decisions, is stored at `RESEARCH_DB_PATH`.

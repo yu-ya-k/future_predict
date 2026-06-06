@@ -49,8 +49,8 @@ Fetch the payload for one run:
 curl -sS http://127.0.0.1:8000/research-runs/{run_id}/human-review
 ```
 
-The payload includes the latest report, latest review, allowed actions, warnings,
-and audit summary.
+The payload includes the latest report, latest review, unresolved ResearchItems,
+allowed actions, warnings, and audit summary.
 
 ## Resume Decisions
 
@@ -62,12 +62,12 @@ curl -sS -X POST http://127.0.0.1:8000/research-runs/{run_id}/resume \
   -d '{"action":"approve","comment":"Approved."}'
 ```
 
-Ask for an LLM-only fix:
+Ask for a bounded LLM patch:
 
 ```sh
 curl -sS -X POST http://127.0.0.1:8000/research-runs/{run_id}/resume \
   -H 'Content-Type: application/json' \
-  -d '{"action":"request_llm_fix","comment":"Address the listed gaps."}'
+  -d '{"action":"request_llm_patch","comment":"Address the listed item gaps."}'
 ```
 
 Retry the GPT-5.5 review after a review timeout or malformed review response:
@@ -78,12 +78,28 @@ curl -sS -X POST http://127.0.0.1:8000/research-runs/{run_id}/resume \
   -d '{"action":"request_review","comment":"Retry the review."}'
 ```
 
-Ask for another Deep Research run:
+Ask for targeted verification:
 
 ```sh
 curl -sS -X POST http://127.0.0.1:8000/research-runs/{run_id}/resume \
   -H 'Content-Type: application/json' \
-  -d '{"action":"request_deep_research","comment":"Find stronger current sources."}'
+  -d '{"action":"request_verification","comment":"Verify the disputed ResearchItems."}'
+```
+
+Ask for a targeted Deep Research rerun:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8000/research-runs/{run_id}/resume \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"request_targeted_rerun","comment":"Find stronger current sources for the unresolved items."}'
+```
+
+Approve with limitations:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8000/research-runs/{run_id}/resume \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"approve_with_limitation","comment":"Accept with the listed limitations."}'
 ```
 
 Reject the run:
@@ -96,8 +112,8 @@ curl -sS -X POST http://127.0.0.1:8000/research-runs/{run_id}/resume \
 
 If a continuing action returns `409`, inspect the response detail and audit
 history. Hard stops include tool-call, total-iteration, no-progress, Deep
-Research run, and LLM fix limits. Cost is recorded for visibility, but it does
-not block continuation.
+Research rerun, LLM patch, and verification limits. Cost is recorded for
+visibility, but it does not block continuation.
 
 ## Cancel
 
@@ -121,7 +137,8 @@ curl -sS -X DELETE http://127.0.0.1:8000/research-runs/{run_id}
 
 Deletion physically removes the run, related audit rows, and
 `.data/research-runs/{run_id}`. If the run is still active, the orchestrator
-first attempts the same best-effort remote cancellation as `/cancel`.
+first attempts the same remote cancellation as `/cancel`; if that remote
+cancellation fails, deletion returns `409` and the local run is preserved.
 
 ## Audit, Citations, Tool Calls, And Cost
 
@@ -139,6 +156,9 @@ curl -sS http://127.0.0.1:8000/research-runs/{run_id}/tool-calls
 curl -sS http://127.0.0.1:8000/research-runs/{run_id}/cost-events
 curl -sS http://127.0.0.1:8000/research-runs/{run_id}/reviews
 curl -sS http://127.0.0.1:8000/research-runs/{run_id}/attempts
+curl -sS http://127.0.0.1:8000/research-runs/{run_id}/contract
+curl -sS http://127.0.0.1:8000/research-runs/{run_id}/items
+curl -sS http://127.0.0.1:8000/research-runs/{run_id}/rerun-plans
 ```
 
 Human decisions can be fetched with:
@@ -162,7 +182,7 @@ By default:
 - Artifacts: `.data/research-runs`
 
 Artifacts include prompts, rerun briefs, raw response JSON, report attempts,
-LLM fixes, and final reports.
+LLM patches, and final reports.
 
 ## Failure Checklist
 

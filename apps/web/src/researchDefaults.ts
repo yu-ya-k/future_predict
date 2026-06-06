@@ -1,26 +1,29 @@
 export interface ResearchDefaults {
-  max_deep_research_runs: number;
-  max_llm_fix_runs: number;
+  max_targeted_rerun_runs: number;
+  max_full_rerun_runs: number;
+  max_llm_patch_runs: number;
+  max_verification_runs: number;
   max_total_iterations: number;
-  max_no_progress_rounds: number;
   max_total_tool_calls: number;
 }
 
 export const RESEARCH_DEFAULTS_STORAGE_KEY = "dro.defaults";
 
 export const FACTORY_RESEARCH_DEFAULTS: ResearchDefaults = {
-  max_deep_research_runs: 2,
-  max_llm_fix_runs: 3,
+  max_targeted_rerun_runs: 2,
+  max_full_rerun_runs: 1,
+  max_llm_patch_runs: 3,
+  max_verification_runs: 3,
   max_total_iterations: 5,
-  max_no_progress_rounds: 2,
   max_total_tool_calls: 120,
 };
 
 const STALE_SAVED_FACTORY_DEFAULTS: ResearchDefaults = {
-  max_deep_research_runs: 3,
-  max_llm_fix_runs: 3,
+  max_targeted_rerun_runs: 3,
+  max_full_rerun_runs: 1,
+  max_llm_patch_runs: 3,
+  max_verification_runs: 3,
   max_total_iterations: 10,
-  max_no_progress_rounds: 3,
   max_total_tool_calls: 200,
 };
 
@@ -51,24 +54,28 @@ export function saveResearchDefaults(defaults: ResearchDefaults): void {
 
 function isStaleSavedFactoryDefaults(defaults: Partial<ResearchDefaults>): boolean {
   return (
-    defaults.max_deep_research_runs === STALE_SAVED_FACTORY_DEFAULTS.max_deep_research_runs &&
-    defaults.max_llm_fix_runs === STALE_SAVED_FACTORY_DEFAULTS.max_llm_fix_runs &&
+    defaults.max_targeted_rerun_runs === STALE_SAVED_FACTORY_DEFAULTS.max_targeted_rerun_runs &&
+    defaults.max_full_rerun_runs === STALE_SAVED_FACTORY_DEFAULTS.max_full_rerun_runs &&
+    defaults.max_llm_patch_runs === STALE_SAVED_FACTORY_DEFAULTS.max_llm_patch_runs &&
+    defaults.max_verification_runs === STALE_SAVED_FACTORY_DEFAULTS.max_verification_runs &&
     defaults.max_total_iterations === STALE_SAVED_FACTORY_DEFAULTS.max_total_iterations &&
-    defaults.max_no_progress_rounds === STALE_SAVED_FACTORY_DEFAULTS.max_no_progress_rounds &&
     defaults.max_total_tool_calls === STALE_SAVED_FACTORY_DEFAULTS.max_total_tool_calls
   );
 }
 
 function normalizeResearchDefaults(defaults: Partial<ResearchDefaults>): ResearchDefaults {
   return {
-    max_deep_research_runs:
-      defaults.max_deep_research_runs ?? FACTORY_RESEARCH_DEFAULTS.max_deep_research_runs,
-    max_llm_fix_runs:
-      defaults.max_llm_fix_runs ?? FACTORY_RESEARCH_DEFAULTS.max_llm_fix_runs,
+    max_targeted_rerun_runs:
+      defaults.max_targeted_rerun_runs ??
+      FACTORY_RESEARCH_DEFAULTS.max_targeted_rerun_runs,
+    max_full_rerun_runs:
+      defaults.max_full_rerun_runs ?? FACTORY_RESEARCH_DEFAULTS.max_full_rerun_runs,
+    max_llm_patch_runs:
+      defaults.max_llm_patch_runs ?? FACTORY_RESEARCH_DEFAULTS.max_llm_patch_runs,
+    max_verification_runs:
+      defaults.max_verification_runs ?? FACTORY_RESEARCH_DEFAULTS.max_verification_runs,
     max_total_iterations:
       defaults.max_total_iterations ?? FACTORY_RESEARCH_DEFAULTS.max_total_iterations,
-    max_no_progress_rounds:
-      defaults.max_no_progress_rounds ?? FACTORY_RESEARCH_DEFAULTS.max_no_progress_rounds,
     max_total_tool_calls:
       defaults.max_total_tool_calls ?? FACTORY_RESEARCH_DEFAULTS.max_total_tool_calls,
   };

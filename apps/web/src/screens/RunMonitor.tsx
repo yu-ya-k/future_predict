@@ -24,7 +24,13 @@ import {
   EmptyState,
   type PipelineStep,
 } from "../components";
-import { getRunStatus, getReviews, getAttempts, cancelRun } from "../api/research";
+import {
+  getRunStatus,
+  getReviews,
+  getAttempts,
+  getItems,
+  cancelRun,
+} from "../api/research";
 import { ApiError } from "../api/client";
 import { usePolling } from "../hooks/usePolling";
 import { useElapsed, formatElapsed } from "../hooks/useElapsed";
@@ -36,6 +42,7 @@ import {
   isTerminal,
   type ResearchRunStatusResponse,
   type ResearchAttempt,
+  type ResearchItem,
   type ReviewRecord,
   type RunStatus,
 } from "../types";
@@ -75,10 +82,14 @@ function hasNoProgressSignal(
   reviews: ReviewRecord[],
 ): boolean {
   if (status === "needs_human_review") return true;
-  if (reviews.length >= 2) {
-    const latest = reviews[reviews.length - 1].score;
-    const prev = reviews[reviews.length - 2].score;
-    if (latest <= prev) return true;
+  const latest = reviews[reviews.length - 1];
+  if (latest?.item_assessments.length) {
+    return latest.item_assessments.some(
+      (item) =>
+        item.severity === "blocker" &&
+        item.status !== "answered" &&
+        item.status !== "out_of_scope",
+    );
   }
   return false;
 }
@@ -97,6 +108,52 @@ function coalesceAttemptsByRunNo(attempts: ResearchAttempt[]): ResearchAttempt[]
     });
   }
   return Array.from(byRunNo.values()).sort((a, b) => a.run_no - b.run_no);
+}
+
+function countItemsByStatus(items: ResearchItem[]) {
+  return items.reduce(
+    (acc, item) => {
+      acc.total += 1;
+      acc[item.status] += 1;
+      if (
+        item.severity === "blocker" &&
+        item.status !== "answered" &&
+        item.status !== "out_of_scope"
+      ) {
+        acc.blockers_unresolved += 1;
+      }
+      return acc;
+    },
+    {
+      total: 0,
+      not_started: 0,
+      answered: 0,
+      partial: 0,
+      unanswered: 0,
+      unverifiable: 0,
+      out_of_scope: 0,
+      blockers_unresolved: 0,
+    },
+  );
+}
+
+const ITEM_STATUS_LABEL: Record<ResearchItem["status"], string> = {
+  not_started: "未開始",
+  answered: "回答済み",
+  partial: "一部回答",
+  unanswered: "未回答",
+  unverifiable: "確認不能",
+  out_of_scope: "対象外",
+};
+
+const ITEM_SEVERITY_LABEL: Record<ResearchItem["severity"], string> = {
+  blocker: "Blocker",
+  major: "Major",
+  minor: "Minor",
+};
+
+function isUnresolved(item: ResearchItem): boolean {
+  return item.status !== "answered" && item.status !== "out_of_scope";
 }
 
 // ── RunMonitor ────────────────────────────────────────────────────────────────
@@ -161,6 +218,18 @@ export function RunMonitor({ runId }: RunMonitorProps) {
     },
   });
 
+  // ── Item polling ──────────────────────────────────────────────────────────
+
+  const { data: items } = usePolling<ResearchItem[]>({
+    fetcher: (signal) => getItems(runId, signal),
+    interval: () => {
+      if (runStatus && isTerminal(runStatus.status)) return null;
+      const s = runStatus?.status;
+      if (s === "waiting_deep_research" || s === "collecting") return 30_000;
+      return 10_000;
+    },
+  });
+
   // ── Derived values ────────────────────────────────────────────────────────
 
   const status = runStatus?.status ?? (tracked?.last_status ?? "queued");
@@ -185,6 +254,24 @@ export function RunMonitor({ runId }: RunMonitorProps) {
     !!runStatus && hasNoProgressSignal(runStatus.status, sortedReviews);
 
   const estimatedCost = progress?.estimated_cost_usd ?? 0;
+  const itemCounts = Array.isArray(items) ? countItemsByStatus(items) : null;
+  const itemsTotal = itemCounts?.total ?? progress?.items_total ?? 0;
+  const itemsAnswered = itemCounts?.answered ?? progress?.items_answered ?? 0;
+  const itemsPartial = itemCounts?.partial ?? progress?.items_partial ?? 0;
+  const itemsUnanswered = itemCounts?.unanswered ?? progress?.items_unanswered ?? 0;
+  const itemsUnverifiable =
+    itemCounts?.unverifiable ?? progress?.items_unverifiable ?? 0;
+  const blockersUnresolved =
+    itemCounts?.blockers_unresolved ?? progress?.blockers_unresolved ?? 0;
+  const unresolvedItems = Array.isArray(items)
+    ? items.filter(isUnresolved).sort((a, b) => {
+        const severityOrder = { blocker: 0, major: 1, minor: 2 };
+        return (
+          severityOrder[a.severity] - severityOrder[b.severity] ||
+          a.item_id.localeCompare(b.item_id)
+        );
+      })
+    : [];
 
   // ── Cancel action ─────────────────────────────────────────────────────────
 
@@ -325,7 +412,7 @@ export function RunMonitor({ runId }: RunMonitorProps) {
                 Deep Researchへの指示内容
               </h2>
               <p className="prompt-panel-description">
-                実際にDeep Researchへ送信したブリーフと再調査指示です。
+                実際にDeep Researchへ送信したブリーフとtargeted rerun指示です。
               </p>
             </div>
             <button
@@ -388,10 +475,79 @@ export function RunMonitor({ runId }: RunMonitorProps) {
       {/* ── No-progress note ──────────────────────────── */}
       {showNoProgressNote && !showHumanReviewBanner && (
         <div className="no-progress-note" role="note">
-          直近のレビューでスコアの改善が見られません。
+          未解決のblocker itemが残っています。
           人間レビューが必要になる可能性があります。
         </div>
       )}
+
+      {/* ── Item progress ────────────────────────────── */}
+      <section className="item-progress" aria-labelledby="item-progress-heading">
+        <div className="section-heading-row">
+          <h2 id="item-progress-heading" className="section-title">
+            ResearchItem進捗
+          </h2>
+          {itemsTotal > 0 && (
+            <span className="item-progress-summary">
+              {itemsAnswered}/{itemsTotal} answered
+            </span>
+          )}
+        </div>
+        <div className="metrics-row metrics-row--items">
+          <MetricCard label="回答済み" value={itemsAnswered} icon="ti-check" />
+          <MetricCard label="一部回答" value={itemsPartial} icon="ti-progress" />
+          <MetricCard label="未回答" value={itemsUnanswered} icon="ti-alert-circle" />
+          <MetricCard
+            label="未解決Blocker"
+            value={blockersUnresolved}
+            icon="ti-alert-triangle"
+            warn={blockersUnresolved > 0}
+          />
+        </div>
+        {itemsUnverifiable > 0 && (
+          <p className="item-progress-note">
+            {itemsUnverifiable}件は公開情報での確認不能として扱われています。
+          </p>
+        )}
+        {unresolvedItems.length > 0 && (
+          <div className="item-table-wrap">
+            <table className="item-table">
+              <thead>
+                <tr>
+                  <th scope="col">Item</th>
+                  <th scope="col">Severity</th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Failure mode</th>
+                  <th scope="col">Question</th>
+                </tr>
+              </thead>
+              <tbody>
+                {unresolvedItems.slice(0, 8).map((item) => (
+                  <tr key={item.item_id}>
+                    <td className="item-table-id">{item.item_id}</td>
+                    <td>
+                      <span className={`item-severity item-severity--${item.severity}`}>
+                        {ITEM_SEVERITY_LABEL[item.severity]}
+                      </span>
+                    </td>
+                    <td>{ITEM_STATUS_LABEL[item.status]}</td>
+                    <td className="item-table-mono">
+                      {item.failure_mode ?? "none"}
+                      {item.failure_mode_confidence !== null &&
+                        ` (${item.failure_mode_confidence}%)`}
+                    </td>
+                    <td>{item.question}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {unresolvedItems.length > 8 && (
+              <p className="item-progress-note">
+                ほか{unresolvedItems.length - 8}件の未解決itemがあります。
+              </p>
+            )}
+          </div>
+        )}
+      </section>
 
       {/* ── Metrics row ───────────────────────────────── */}
       <div className="metrics-row">
@@ -404,6 +560,16 @@ export function RunMonitor({ runId }: RunMonitorProps) {
           label="レビュー回数"
           value={progress?.total_reviews ?? 0}
           icon="ti-repeat"
+        />
+        <MetricCard
+          label="Targeted rerun"
+          value={progress?.targeted_rerun_runs ?? 0}
+          icon="ti-search"
+        />
+        <MetricCard
+          label="Verification"
+          value={progress?.verification_runs ?? 0}
+          icon="ti-shield-check"
         />
         {progress?.latest_score !== null && progress?.latest_score !== undefined && (
           <div className="metric-score-wrap">
@@ -420,7 +586,12 @@ export function RunMonitor({ runId }: RunMonitorProps) {
         <PipelineStepper
           currentStep={statusToStep(status)}
           completedSteps={getCompletedSteps(status)}
-          loopCount={progress?.deep_research_runs ?? 0}
+          loopCount={
+            (progress?.targeted_rerun_runs ?? 0) +
+            (progress?.full_rerun_runs ?? 0) +
+            (progress?.llm_patch_runs ?? 0) +
+            (progress?.verification_runs ?? 0)
+          }
           maxIterations={tracked?.max_total_iterations ?? 0}
         />
       </div>

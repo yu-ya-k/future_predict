@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
@@ -25,22 +25,38 @@ from api.research.extractors import (
     get_response_status,
     response_to_jsonable,
 )
-from api.research.nodes import build_optimized_prompt
+from api.research.merge import (
+    PatchDelta as MergePatchDelta,
+)
+from api.research.merge import (
+    RegressionError,
+    ReportDocument,
+    deterministic_merge,
+)
+from api.research.nodes import build_objective_contract
 from api.research.progress import compute_no_progress_count, report_hash
+from api.research.query_policy import contains_sensitive_terms, query_policy_gate
 from api.research.repository import ResearchRepository
 from api.research.routing import MIN_REVIEWER_CONFIDENCE_FOR_AUTO_FINALIZE, route_after_review
 from api.research.schemas import (
     CostEvent,
     CreateResearchRunRequest,
+    FailureMode,
     HumanReviewAction,
     HumanReviewAuditSummary,
     HumanReviewPayload,
     HumanReviewQueueItem,
     HumanReviewResumeRequest,
+    ItemStatus,
+    QueryPolicyDecision,
+    RecommendedAction,
+    RerunPlan,
     ResearchAttempt,
+    ResearchItem,
     ResearchRunRecord,
     ReviewRecord,
     RunStatus,
+    VerificationQuery,
 )
 
 TERMINAL_FAILURE_STATUSES = {"failed", "cancelled", "incomplete"}
@@ -66,6 +82,7 @@ class ResearchOrchestrator:
     def create_run(self, request: CreateResearchRunRequest) -> ResearchRunRecord:
         run = self.repository.create_run(
             user_prompt=request.user_prompt,
+            context_classification=request.context_classification,
             options=request.options,
             settings=self.settings,
         )
@@ -76,13 +93,22 @@ class ResearchOrchestrator:
         run_id: UUID,
         *,
         human_comment: str | None = None,
+        scope: str = "targeted_gap_closure",
     ) -> ResearchRunRecord:
         run = self.repository.get_run(run_id)
         run_no = run.deep_research_runs + 1
+        requested_max_tool_calls = self.settings.default_max_total_tool_calls
+
         if run.deep_research_runs == 0:
-            optimized_prompt, acceptance_criteria = build_optimized_prompt(
+            contract, research_items, optimized_prompt = build_objective_contract(
                 user_prompt=run.user_prompt,
+                context_classification=run.context_classification,
             )
+            self.repository.save_objective_contract(run.id, contract)
+            self.repository.upsert_research_items(run.id, research_items)
+            acceptance_criteria = [
+                criterion.description for criterion in contract.acceptance_criteria
+            ]
             prompt = optimized_prompt
             prompt_path, _ = self.artifacts.save_text(
                 run.id,
@@ -94,12 +120,22 @@ class ResearchOrchestrator:
                 {
                     "step": "optimized_prompt_created",
                     "artifact_path": prompt_path,
+                    "contract_id": contract.contract_id,
+                    "research_item_ids": [item.item_id for item in research_items],
                     "acceptance_criteria": acceptance_criteria,
                 },
             )
+            run = self.repository.update_run(run.id, optimized_prompt=optimized_prompt)
         else:
             optimized_prompt = run.optimized_prompt or run.user_prompt
-            prompt = self._build_rerun_brief(run, human_comment=human_comment)
+            plan = self._build_rerun_plan(
+                run,
+                human_comment=human_comment,
+                scope=scope,
+            )
+            requested_max_tool_calls = plan.max_tool_calls
+            self.repository.add_rerun_plan(run.id, plan)
+            prompt = self._build_rerun_brief(run, human_comment=human_comment, plan=plan)
             prompt_path, _ = self.artifacts.save_text(
                 run.id,
                 f"prompts/rerun_prompt_{run_no:03d}.txt",
@@ -110,8 +146,27 @@ class ResearchOrchestrator:
                 {
                     "step": "deep_research_rerun_brief_created",
                     "run_no": run_no,
+                    "rerun_id": plan.rerun_id,
+                    "target_item_ids": plan.target_item_ids,
                     "artifact_path": prompt_path,
                 },
+            )
+
+        policy_decision = _deep_research_query_policy_decision(run, prompt)
+        if policy_decision.status != "allowed":
+            self.repository.append_history_event(
+                run.id,
+                {
+                    "step": "deep_research_submit_blocked",
+                    "reason": policy_decision.blocked_reason,
+                    "context_classification": run.context_classification.value,
+                    "policy_status": policy_decision.status,
+                },
+            )
+            return self._enter_human_review(
+                run.id,
+                done_reason="deep_research_blocked_by_query_policy",
+                optimized_prompt=optimized_prompt,
             )
 
         remaining_tool_calls = run.max_total_tool_calls - run.total_tool_calls
@@ -127,7 +182,7 @@ class ResearchOrchestrator:
                 prompt=prompt,
                 max_tool_calls=min(
                     remaining_tool_calls,
-                    self.settings.default_max_total_tool_calls,
+                    requested_max_tool_calls,
                 ),
             )
             raw_path, _ = self.artifacts.save_json(
@@ -157,6 +212,16 @@ class ResearchOrchestrator:
                 pending_deep_research_response_id=response_id,
                 deep_research_status=response_status,
                 deep_research_runs=run_no,
+                targeted_rerun_runs=(
+                    run.targeted_rerun_runs + 1
+                    if run.deep_research_runs > 0 and scope != "full_rerun"
+                    else run.targeted_rerun_runs
+                ),
+                full_rerun_runs=(
+                    run.full_rerun_runs + 1
+                    if run.deep_research_runs > 0 and scope == "full_rerun"
+                    else run.full_rerun_runs
+                ),
                 done_reason=None,
             )
             if updated is None:
@@ -315,6 +380,21 @@ class ResearchOrchestrator:
             )
 
         report = get_response_output_text(response)
+        latest_plan = _latest_rerun_plan(self.repository.get_rerun_plans(run.id))
+        merge_error: str | None = None
+        merged_report = report
+        if run.deep_research_runs > 1 and (
+            latest_plan is None or latest_plan.scope != "full_rerun"
+        ):
+            try:
+                merged_report = _merge_targeted_research_delta(
+                    existing_report=run.report or "",
+                    delta=report,
+                    run_no=run.deep_research_runs,
+                )
+            except RegressionError as error:
+                merge_error = str(error)
+                merged_report = run.report or ""
         citations = extract_citations(response)
         tool_calls = extract_tool_calls(response)
         cost_event = build_cost_event(
@@ -345,10 +425,27 @@ class ResearchOrchestrator:
         cost_recorded = self.repository.add_cost_event(run.id, cost_event)
         tool_call_delta = len(tool_calls) if cost_recorded else 0
         cost_delta = cost_event.estimated_cost_usd if cost_recorded else 0.0
+        if merge_error is not None:
+            self.repository.append_history_event(
+                run.id,
+                {
+                    "step": "targeted_rerun_merge_rejected",
+                    "reason": merge_error,
+                    "response_id": response_id,
+                },
+            )
+            return self._enter_human_review(
+                run.id,
+                done_reason="targeted_rerun_merge_rejected",
+                allowed_statuses={RunStatus.COLLECTING},
+                deep_research_status=response_status,
+                total_tool_calls=run.total_tool_calls + tool_call_delta,
+                estimated_cost_usd=run.estimated_cost_usd + cost_delta,
+            )
         report_path, _ = self.artifacts.save_text(
             run.id,
             f"reports/report_attempt_{run.deep_research_runs:03d}.md",
-            report,
+            merged_report,
         )
         self.repository.append_history_event(
             run.id,
@@ -365,7 +462,7 @@ class ResearchOrchestrator:
             run.id,
             {RunStatus.COLLECTING},
             status=RunStatus.REVIEWING,
-            report=report,
+            report=merged_report,
             deep_research_status=response_status,
             total_tool_calls=run.total_tool_calls + tool_call_delta,
             estimated_cost_usd=run.estimated_cost_usd + cost_delta,
@@ -387,13 +484,20 @@ class ResearchOrchestrator:
             return self._enter_human_review(run.id, done_reason="missing_report_for_review")
 
         previous_reviews = self.repository.get_reviews(run.id)
-        acceptance_criteria = _acceptance_criteria_from_history(self.repository.get_history(run.id))
+        contract = self.repository.get_objective_contract(run.id)
+        research_items = self.repository.get_research_items(run.id)
+        acceptance_criteria = (
+            [criterion.description for criterion in contract.acceptance_criteria]
+            if contract is not None
+            else _acceptance_criteria_from_history(self.repository.get_history(run.id))
+        )
         try:
             self._active_review_run_ids.add(run.id)
             try:
                 review_result, response_id, raw_response = self._review_with_retry(
                     run=run,
                     acceptance_criteria=acceptance_criteria,
+                    research_items=research_items,
                 )
             finally:
                 self._active_review_run_ids.discard(run.id)
@@ -497,6 +601,38 @@ class ResearchOrchestrator:
             reviewer_response_id=response_id,
             report_hash=report_hash(run.report),
         )
+        unknown_item_ids = _unknown_item_assessment_ids(research_items, review)
+        if unknown_item_ids:
+            self.repository.add_review(
+                run_id=run.id,
+                review=review,
+                model=self.azure.reviewer_deployment,
+            )
+            self.repository.append_history_event(
+                run.id,
+                {
+                    "step": "review_unknown_research_items",
+                    "unknown_item_ids": unknown_item_ids,
+                    "known_item_ids": [item.item_id for item in research_items],
+                },
+            )
+            return self._enter_human_review(
+                run.id,
+                done_reason="review_referenced_unknown_research_items",
+                allowed_statuses={RunStatus.REVIEWING},
+                total_reviews=run.total_reviews + 1,
+                total_tool_calls=next_total_tool_calls,
+                estimated_cost_usd=next_estimated_cost,
+            )
+        if review.item_assessments:
+            self.repository.upsert_research_items(
+                run.id,
+                _items_from_review_assessments(
+                    existing_items=research_items,
+                    review=review,
+                    attempt_no=run.deep_research_runs,
+                ),
+            )
         no_progress_count = compute_no_progress_count(
             previous_reviews=previous_reviews,
             current_review=review,
@@ -512,13 +648,16 @@ class ResearchOrchestrator:
             {
                 "review": review.model_dump(),
                 "total_reviews": run.total_reviews + 1,
-                "deep_research_runs": run.deep_research_runs,
-                "llm_fix_runs": run.llm_fix_runs,
+                "targeted_rerun_runs": run.targeted_rerun_runs,
+                "full_rerun_runs": run.full_rerun_runs,
+                "llm_patch_runs": run.llm_patch_runs,
+                "verification_runs": run.verification_runs,
                 "no_progress_count": no_progress_count,
                 "max_total_iterations": run.max_total_iterations,
-                "max_deep_research_runs": run.max_deep_research_runs,
-                "max_llm_fix_runs": run.max_llm_fix_runs,
-                "max_no_progress_rounds": run.max_no_progress_rounds,
+                "max_targeted_rerun_runs": run.max_targeted_rerun_runs,
+                "max_full_rerun_runs": run.max_full_rerun_runs,
+                "max_llm_patch_runs": run.max_llm_patch_runs,
+                "max_verification_runs": run.max_verification_runs,
                 "total_tool_calls": next_total_tool_calls,
                 "max_total_tool_calls": run.max_total_tool_calls,
             }
@@ -556,6 +695,7 @@ class ResearchOrchestrator:
                 status=RunStatus.COMPLETED,
                 final_report=final_report,
                 done_reason="passed_review",
+                terminal_status="completed_passed_review",
                 total_reviews=run.total_reviews + 1,
                 no_progress_count=no_progress_count,
                 total_tool_calls=next_total_tool_calls,
@@ -598,10 +738,18 @@ class ResearchOrchestrator:
                 {"step": "review_update_skipped_status_changed", "route": route},
             )
             return self.repository.get_run(run.id)
-        if route == "llm_finalize":
+        if route == "llm_patch":
             return self.llm_finalize(updated.id)
-        if route == "deep_research_submit":
+        if route == "build_targeted_rerun_plan":
             return self.submit_deep_research(updated.id)
+        if route == "verify_items":
+            return self.verify_items(updated.id)
+        if route == "full_rerun_submit":
+            return self.submit_deep_research(updated.id, scope="full_rerun")
+        if route == "finalize_with_limitation":
+            return self._finalize_with_limitation(updated.id)
+        if route == "revise_research_items":
+            return self._enter_human_review(updated.id, done_reason="needs_item_revision")
 
         return self._enter_human_review(
             updated.id,
@@ -627,7 +775,7 @@ class ResearchOrchestrator:
                 done_reason="missing_review_for_llm_finalize",
             )
 
-        run_no = run.llm_fix_runs + 1
+        run_no = run.llm_patch_runs + 1
         prompt = self._build_llm_finalize_prompt(
             run=run,
             review=latest_review,
@@ -741,13 +889,13 @@ class ResearchOrchestrator:
         cost_delta = cost_event.estimated_cost_usd if cost_recorded else 0.0
         report_path, _ = self.artifacts.save_text(
             run.id,
-            f"reports/llm_fix_{run_no:03d}.md",
+            f"reports/llm_patch_{run_no:03d}.md",
             revised_report,
         )
         self.repository.append_history_event(
             run.id,
             {
-                "step": "llm_finalize",
+                "step": "llm_patch",
                 "run_no": run_no,
                 "response_id": response_id,
                 "tool_calls_count": len(llm_tool_calls),
@@ -761,7 +909,7 @@ class ResearchOrchestrator:
             status=RunStatus.REVIEWING,
             needs_human_review=False,
             report=revised_report,
-            llm_fix_runs=run_no,
+            llm_patch_runs=run_no,
             total_tool_calls=run.total_tool_calls + tool_call_delta,
             estimated_cost_usd=run.estimated_cost_usd + cost_delta,
             done_reason=None,
@@ -797,6 +945,17 @@ class ResearchOrchestrator:
             reason=run.done_reason or (latest_review.rationale if latest_review else ""),
             latest_report=run.report or "",
             latest_review=latest_review,
+            unresolved_items=[
+                item
+                for item in self.repository.get_research_items(run.id)
+                if item.status
+                in {
+                    ItemStatus.NOT_STARTED,
+                    ItemStatus.PARTIAL,
+                    ItemStatus.UNANSWERED,
+                    ItemStatus.UNVERIFIABLE,
+                }
+            ],
             allowed_actions=_allowed_human_review_actions(run),
             audit_summary=self._human_review_audit_summary(run),
             warnings=run.warnings,
@@ -815,6 +974,202 @@ class ResearchOrchestrator:
         if not cost_events:
             return fallback
         return sum(event.estimated_cost_usd for event in cost_events)
+
+    def verify_items(self, run_id: UUID) -> ResearchRunRecord:
+        run = self.repository.get_run(run_id)
+        latest_review = self._latest_review(run.id)
+        target_items = _target_item_ids_for_action(
+            latest_review,
+            {RecommendedAction.VERIFY},
+        )
+        research_items = self.repository.get_research_items(run.id)
+        item_by_id = {item.item_id: item for item in research_items}
+        target_research_items = [
+            item_by_id[item_id] for item_id in target_items if item_id in item_by_id
+        ]
+        if not target_research_items:
+            return self._enter_human_review(
+                run.id,
+                done_reason="verification_missing_target_items",
+                allowed_statuses={RunStatus.REVIEWING},
+            )
+
+        raw_queries = [
+            _verification_query_for_item(item, latest_review)
+            for item in target_research_items
+        ]
+        policy_decision = query_policy_gate(
+            {
+                "candidate_queries": raw_queries,
+                "contains_sensitive_terms": any(
+                    contains_sensitive_terms(query) for query in raw_queries
+                ),
+            },
+            {"context_classification": run.context_classification.value},
+        )
+        for index, (item, raw_query) in enumerate(
+            zip(target_research_items, raw_queries, strict=True)
+        ):
+            safe_query = (
+                policy_decision.safe_queries[index]
+                if index < len(policy_decision.safe_queries)
+                and policy_decision.status == "allowed"
+                else None
+            )
+            self.repository.add_verification_query(
+                run.id,
+                VerificationQuery(
+                    item_id=item.item_id,
+                    raw_query=raw_query,
+                    safe_query=safe_query,
+                    policy_status=policy_decision.status,
+                    blocked_reason=policy_decision.blocked_reason,
+                ),
+            )
+
+        if policy_decision.status != "allowed":
+            self.repository.append_history_event(
+                run.id,
+                {
+                    "step": "verification_blocked",
+                    "reason": policy_decision.blocked_reason,
+                    "context_classification": run.context_classification.value,
+                },
+            )
+            return self._enter_human_review(
+                run.id,
+                done_reason="verification_blocked_by_query_policy",
+                allowed_statuses={RunStatus.REVIEWING},
+            )
+
+        run_no = run.verification_runs + 1
+        prompt = _build_verification_prompt(
+            run=run,
+            items=target_research_items,
+            safe_queries=policy_decision.safe_queries,
+            latest_review=latest_review,
+        )
+        try:
+            verification_delta, response_id, raw_response = self._call_verification(
+                run=run,
+                prompt=prompt,
+            )
+        except Exception as error:
+            self.repository.append_history_event(
+                run.id,
+                {
+                    "step": "verification_failed",
+                    "run_no": run_no,
+                    "error": repr(error),
+                },
+            )
+            return self._enter_human_review(
+                run.id,
+                done_reason="verification_failed",
+                allowed_statuses={RunStatus.REVIEWING},
+            )
+
+        verification_tool_calls = extract_tool_calls(raw_response)
+        verification_citations = extract_citations(raw_response)
+        cost_event = build_cost_event(
+            step="verification",
+            model=self.azure.reviewer_deployment,
+            response_id=response_id,
+            response=raw_response,
+            tool_calls=len(verification_tool_calls),
+            billable_tool_calls=count_billable_web_search_calls(verification_tool_calls),
+            input_cost_per_1m=self.settings.research_reviewer_input_cost_per_1m,
+            output_cost_per_1m=self.settings.research_reviewer_output_cost_per_1m,
+            tool_call_cost=self.settings.research_web_search_cost_per_call,
+        )
+        if raw_response:
+            self.artifacts.save_json(
+                run.id,
+                f"raw-responses/verification_resp_{run_no:03d}.json",
+                raw_response,
+            )
+        self.repository.add_tool_calls(
+            run.id,
+            response_id=response_id,
+            step="verification",
+            tool_calls=verification_tool_calls,
+        )
+        self.repository.add_citations(run.id, verification_citations)
+        cost_recorded = self.repository.add_cost_event(run.id, cost_event)
+        tool_call_delta = len(verification_tool_calls) if cost_recorded else 0
+        cost_delta = cost_event.estimated_cost_usd if cost_recorded else 0.0
+        patched_report = _deterministic_merge_delta(
+            run.report or "",
+            verification_delta,
+            run_no=run_no,
+            heading="Targeted Verification Notes",
+        )
+        updated = self.repository.update_run_if_status(
+            run.id,
+            {RunStatus.REVIEWING},
+            report=patched_report,
+            verification_runs=run_no,
+            total_tool_calls=run.total_tool_calls + tool_call_delta,
+            estimated_cost_usd=run.estimated_cost_usd + cost_delta,
+            done_reason=None,
+        )
+        if updated is None:
+            return self.repository.get_run(run.id)
+        self.repository.append_history_event(
+            run.id,
+            {
+                "step": "verification_completed",
+                "target_item_ids": target_items,
+                "response_id": response_id,
+                "tool_calls_count": len(verification_tool_calls),
+            },
+        )
+        return self.review_run(updated.id)
+
+    def _finalize_with_limitation(self, run_id: UUID) -> ResearchRunRecord:
+        run = self.repository.get_run(run_id)
+        items = self.repository.get_research_items(run.id)
+        unresolved = [
+            item
+            for item in items
+            if item.status
+            in {ItemStatus.PARTIAL, ItemStatus.UNANSWERED, ItemStatus.UNVERIFIABLE}
+        ]
+        limitation_lines = [
+            f"- {item.item_id}: {item.unresolved_reason or item.question}"
+            for item in unresolved
+            if item.severity != "blocker"
+        ]
+        final_report = _deterministic_merge_delta(
+            run.report or "",
+            "\n".join(limitation_lines) or "No material unresolved limitations.",
+            run_no=run.total_reviews + 1,
+            heading="Limitations",
+        )
+        final_path, _ = self.artifacts.save_text(
+            run.id,
+            "reports/final_report.md",
+            final_report,
+        )
+        self.repository.append_history_event(
+            run.id,
+            {
+                "step": "finalized_with_limitation",
+                "final_report_path": final_path,
+                "unresolved_item_ids": [item.item_id for item in unresolved],
+            },
+        )
+        completed = self.repository.update_run_if_status(
+            run.id,
+            {RunStatus.REVIEWING},
+            status=RunStatus.COMPLETED,
+            final_report=final_report,
+            report=final_report,
+            done_reason="completed_with_limitations",
+            terminal_status="completed_with_limitations",
+            needs_human_review=False,
+        )
+        return completed or self.repository.get_run(run.id)
 
     def resume_run(
         self,
@@ -850,7 +1205,10 @@ class ResearchOrchestrator:
             raise ValueError("Run is not waiting for human review.")
         run, _decision = claimed
 
-        if request.action == HumanReviewAction.APPROVE:
+        if request.action in {
+            HumanReviewAction.APPROVE,
+            HumanReviewAction.APPROVE_WITH_LIMITATION,
+        }:
             if not run.report:
                 failed = self.repository.update_run_if_status(
                     run.id,
@@ -874,7 +1232,16 @@ class ResearchOrchestrator:
                 {RunStatus.REVIEWING},
                 status=RunStatus.COMPLETED,
                 final_report=run.report,
-                done_reason="human_approved",
+                done_reason=(
+                    "human_approved_with_limitation"
+                    if request.action == HumanReviewAction.APPROVE_WITH_LIMITATION
+                    else "human_approved"
+                ),
+                terminal_status=(
+                    "completed_with_limitations"
+                    if request.action == HumanReviewAction.APPROVE_WITH_LIMITATION
+                    else "completed_by_human_approval"
+                ),
                 needs_human_review=False,
             )
             return completed or self.repository.get_run(run.id)
@@ -889,11 +1256,20 @@ class ResearchOrchestrator:
             )
             return self.review_run(run.id)
 
-        if request.action == HumanReviewAction.REQUEST_LLM_FIX:
+        if request.action == HumanReviewAction.REQUEST_LLM_PATCH:
             return self.llm_finalize(run.id, human_comment=request.comment)
 
-        if request.action == HumanReviewAction.REQUEST_DEEP_RESEARCH:
+        if request.action == HumanReviewAction.REQUEST_TARGETED_RERUN:
             return self.submit_deep_research(run.id, human_comment=request.comment)
+
+        if request.action == HumanReviewAction.REQUEST_VERIFICATION:
+            return self.verify_items(run.id)
+
+        if request.action == HumanReviewAction.REQUEST_ITEM_REVISION:
+            return self._enter_human_review(
+                run.id,
+                done_reason="item_revision_requires_manual_edit",
+            )
 
         warnings = list(run.warnings)
         if request.comment:
@@ -1103,6 +1479,7 @@ class ResearchOrchestrator:
         *,
         run: ResearchRunRecord,
         acceptance_criteria: list[str],
+        research_items: list[ResearchItem],
     ) -> tuple[Any, str | None, dict[str, Any]]:
         last_error: Exception | None = None
         citations = [citation.model_dump() for citation in self.repository.get_citations(run.id)]
@@ -1146,6 +1523,7 @@ class ResearchOrchestrator:
                     user_prompt=run.user_prompt,
                     optimized_prompt=run.optimized_prompt or run.user_prompt,
                     acceptance_criteria=acceptance_criteria,
+                    research_items=[item.model_dump(mode="json") for item in research_items],
                     report=run.report or "",
                     citations=citations,
                 )
@@ -1295,7 +1673,10 @@ class ResearchOrchestrator:
     ) -> HumanReviewAuditSummary:
         return HumanReviewAuditSummary(
             deep_research_runs=run.deep_research_runs,
-            llm_fix_runs=run.llm_fix_runs,
+            targeted_rerun_runs=run.targeted_rerun_runs,
+            full_rerun_runs=run.full_rerun_runs,
+            llm_patch_runs=run.llm_patch_runs,
+            verification_runs=run.verification_runs,
             total_reviews=run.total_reviews,
             no_progress_count=run.no_progress_count,
             total_tool_calls=run.total_tool_calls,
@@ -1360,8 +1741,15 @@ class ResearchOrchestrator:
         run: ResearchRunRecord,
         *,
         human_comment: str | None,
+        plan: RerunPlan,
     ) -> str:
         latest_review = self._latest_review(run.id)
+        items = self.repository.get_research_items(run.id)
+        target_item_id_set = set(plan.target_item_ids)
+        target_items = [item for item in items if item.item_id in target_item_id_set]
+        preserve_item_ids = [
+            item.item_id for item in items if item.item_id not in target_item_id_set
+        ]
         review_block = (
             "No previous review is available."
             if latest_review is None
@@ -1380,6 +1768,20 @@ rationale: {latest_review.rationale}"""
             else latest_review.next_instructions
         )
         human_block = human_comment or "None."
+        rerun_policy = (
+            """You are rebuilding the report because the current report or contract execution
+was judged unusable. Address the full Objective Contract and all ResearchItems.
+Return a complete replacement report."""
+            if plan.scope == "full_rerun"
+            else """You are not rewriting the full report.
+Close only the specified unresolved ResearchItems.
+Treat # Rerun Plan and # Next Instructions as the primary guidance.
+Focus on missing evidence, outdated facts, contradictions, and insufficient sources for
+the target items only.
+Return only item-scoped delta sections and evidence summaries.
+Do not return a complete revised report.
+Do not rewrite preserved sections or preserved ResearchItems."""
+        )
         return f"""# Original User Prompt
 {run.user_prompt}
 
@@ -1388,6 +1790,15 @@ rationale: {latest_review.rationale}"""
 
 # Previous Report
 {run.report or ""}
+
+# Rerun Plan
+{plan.model_dump_json()}
+
+# Target ResearchItems
+{[item.model_dump(mode="json") for item in target_items]}
+
+# Preserve ResearchItems
+{preserve_item_ids}
 
 # Review Result
 {review_block}
@@ -1408,14 +1819,67 @@ rationale: {latest_review.rationale}"""
 {human_block}
 
 # Rerun Policy
-Do not merely rewrite the previous report.
-Re-investigate weak areas.
-Treat # Next Instructions as the primary guidance for the next Deep Research run.
-Focus on missing evidence, outdated facts, contradictions, and insufficient sources.
-Return a complete revised report with citations.
+{rerun_policy}
 Write the entire Deep Research output in English, even if the original prompt,
 previous report, review, or human comment is in another language.
 """
+
+    def _build_rerun_plan(
+        self,
+        run: ResearchRunRecord,
+        *,
+        human_comment: str | None,
+        scope: str,
+    ) -> RerunPlan:
+        latest_review = self._latest_review(run.id)
+        items = self.repository.get_research_items(run.id)
+        if scope == "full_rerun":
+            target_item_ids = [item.item_id for item in items]
+        else:
+            target_item_ids = _target_item_ids_for_action(
+                latest_review,
+                {
+                    RecommendedAction.TARGETED_RERUN,
+                    RecommendedAction.FULL_RERUN,
+                    RecommendedAction.VERIFY,
+                },
+            )
+        if not target_item_ids:
+            target_item_ids = [
+                item.item_id
+                for item in items
+                if item.status in {ItemStatus.PARTIAL, ItemStatus.UNANSWERED}
+            ]
+        if not target_item_ids:
+            target_item_ids = [item.item_id for item in items[:1]]
+        target_items = [item for item in items if item.item_id in set(target_item_ids)]
+        return RerunPlan(
+            rerun_id=f"RR-{uuid4()}",
+            scope=scope,
+            target_item_ids=target_item_ids,
+            preserve_item_ids=[
+                item.item_id for item in items if item.item_id not in target_item_ids
+            ],
+            target_questions=[item.question for item in target_items],
+            missing_evidence=_missing_evidence_for_items(latest_review, target_item_ids),
+            preferred_source_types=["official", "primary", "regulator", "filing"],
+            already_tried_queries=[
+                tool.query
+                for tool in self.repository.get_tool_calls(run.id)
+                if tool.query
+            ],
+            forbidden_changes=[
+                "Do not rewrite accepted sections.",
+                "Do not return a full merged report.",
+            ],
+            max_tool_calls=min(
+                80 if scope == "full_rerun" else 25,
+                max(1, run.max_total_tool_calls - run.total_tool_calls),
+            ),
+            rerun_reason=human_comment
+            or (latest_review.route_rationale if latest_review else None)
+            or "Close unresolved ResearchItems.",
+        )
 
     def _build_llm_finalize_prompt(
         self,
@@ -1476,10 +1940,32 @@ Return only the final report body.
             user_prompt=run.user_prompt,
             report=run.report or "",
             review={"prompt": prompt},
+            enable_web_search=run.context_classification.value == "public",
         )
         if not revised_report:
             raise RuntimeError("LLM finalize returned an empty report.")
         return revised_report, response_id, raw_response
+
+    def _call_verification(
+        self,
+        *,
+        run: ResearchRunRecord,
+        prompt: str,
+    ) -> tuple[str, str | None, dict[str, Any]]:
+        custom_verify = getattr(self.azure, "verify_report", None)
+        if callable(custom_verify):
+            result = custom_verify(prompt=prompt, run=run)
+            return _normalize_llm_finalize_result(result)
+
+        verification_note, response_id, raw_response = self.azure.finalize_report(
+            user_prompt=run.user_prompt,
+            report=run.report or "",
+            review={"prompt": prompt},
+            enable_web_search=True,
+        )
+        if not verification_note:
+            raise RuntimeError("Verification returned an empty response.")
+        return verification_note, response_id, raw_response
 
 
 def _extract_response_error(response: Any) -> str:
@@ -1497,6 +1983,247 @@ def _acceptance_criteria_from_history(history: list[dict[str, Any]]) -> list[str
         if isinstance(criteria, list):
             return [str(item) for item in cast(list[object], criteria)]
     return []
+
+
+def _deep_research_query_policy_decision(
+    run: ResearchRunRecord,
+    prompt: str,
+) -> QueryPolicyDecision:
+    return query_policy_gate(
+        {
+            "candidate_queries": [prompt],
+            "contains_sensitive_terms": contains_sensitive_terms(prompt),
+        },
+        {"context_classification": run.context_classification.value},
+    )
+
+
+def _latest_rerun_plan(plans: list[RerunPlan]) -> RerunPlan | None:
+    if not plans:
+        return None
+    return plans[-1]
+
+
+def _unknown_item_assessment_ids(
+    existing_items: list[ResearchItem],
+    review: ReviewRecord,
+) -> list[str]:
+    if not existing_items:
+        return []
+    known_ids = {item.item_id for item in existing_items}
+    return [
+        assessment.item_id
+        for assessment in review.item_assessments
+        if assessment.item_id not in known_ids
+    ]
+
+
+def _items_from_review_assessments(
+    *,
+    existing_items: list[ResearchItem],
+    review: ReviewRecord,
+    attempt_no: int,
+) -> list[ResearchItem]:
+    by_id = {item.item_id: item for item in existing_items}
+    updated: list[ResearchItem] = []
+    for assessment in review.item_assessments:
+        item = by_id.get(assessment.item_id)
+        if item is None:
+            continue
+        updated.append(
+            item.model_copy(
+                update={
+                    "status": assessment.status,
+                    "severity": assessment.severity,
+                    "confidence": assessment.failure_mode_confidence,
+                    "evidence_summary": assessment.evidence_summary,
+                    "failure_mode": assessment.failure_mode,
+                    "failure_mode_confidence": assessment.failure_mode_confidence,
+                    "unresolved_reason": (
+                        assessment.rationale
+                        if assessment.status
+                        in {ItemStatus.PARTIAL, ItemStatus.UNANSWERED, ItemStatus.UNVERIFIABLE}
+                        else None
+                    ),
+                    "last_attempt_no": attempt_no,
+                    "last_review_no": review.review_no,
+                }
+            )
+        )
+    updated_ids = {item.item_id for item in updated}
+    unchanged = [item for item in existing_items if item.item_id not in updated_ids]
+    return [*updated, *unchanged]
+
+
+def _verification_query_for_item(
+    item: ResearchItem,
+    review: ReviewRecord | None,
+) -> str:
+    missing_evidence: list[str] = []
+    rationale = ""
+    if review is not None:
+        for assessment in review.item_assessments:
+            if assessment.item_id == item.item_id:
+                missing_evidence = assessment.missing_evidence
+                rationale = assessment.rationale
+                break
+    evidence_need = "; ".join(missing_evidence) if missing_evidence else item.question
+    return f"{item.question} {evidence_need} {rationale}".strip()
+
+
+def _build_verification_prompt(
+    *,
+    run: ResearchRunRecord,
+    items: list[ResearchItem],
+    safe_queries: list[str],
+    latest_review: ReviewRecord | None,
+) -> str:
+    review_context = (
+        "No prior review context is available."
+        if latest_review is None
+        else f"""verdict: {latest_review.verdict.value}
+rationale: {latest_review.rationale}
+factuality_concerns: {latest_review.factuality_concerns}
+freshness_concerns: {latest_review.freshness_concerns}
+source_quality_concerns: {latest_review.source_quality_concerns}"""
+    )
+    return f"""# Verification Task
+Verify only the listed ResearchItems. Use public web search only for the safe
+queries supplied below. Return concise item-scoped verification notes with source
+metadata and remaining uncertainty. Do not rewrite the full report.
+
+# Original Prompt
+{run.user_prompt}
+
+# Current Report
+{run.report or ""}
+
+# Target ResearchItems
+{[item.model_dump(mode="json") for item in items]}
+
+# Safe Queries
+{safe_queries}
+
+# Latest Review
+{review_context}
+"""
+
+
+def _target_item_ids_for_action(
+    review: ReviewRecord | None,
+    actions: set[RecommendedAction],
+) -> list[str]:
+    if review is None:
+        return []
+    return [
+        item.item_id
+        for item in review.item_assessments
+        if item.recommended_action in actions
+        or (
+            RecommendedAction.TARGETED_RERUN in actions
+            and item.failure_mode
+            in {
+                FailureMode.NEEDS_DIFFERENT_SOURCES,
+                FailureMode.NEEDS_DEEPER_SEARCH,
+                FailureMode.NEEDS_QUERY_REFORMULATION,
+            }
+        )
+    ]
+
+
+def _missing_evidence_for_items(
+    review: ReviewRecord | None,
+    target_item_ids: list[str],
+) -> list[str]:
+    if review is None:
+        return []
+    target_set = set(target_item_ids)
+    missing: list[str] = []
+    for item in review.item_assessments:
+        if item.item_id in target_set:
+            missing.extend(item.missing_evidence)
+    return missing
+
+
+def _deterministic_merge_delta(
+    existing_report: str,
+    delta: str,
+    *,
+    run_no: int,
+    heading: str = "Targeted Research Updates",
+) -> str:
+    existing = existing_report.rstrip()
+    delta_text = delta.strip()
+    if not existing:
+        return delta_text
+    if not delta_text:
+        return existing
+    return (
+        f"{existing}\n\n"
+        f"## {heading} {run_no}\n\n"
+        f"{delta_text}\n"
+    )
+
+
+def _merge_targeted_research_delta(
+    *,
+    existing_report: str,
+    delta: str,
+    run_no: int,
+) -> str:
+    if _looks_like_full_merged_report(existing_report, delta):
+        raise RegressionError("Targeted rerun returned what looks like a full merged report.")
+
+    section_id = f"targeted-research-updates-{run_no:03d}"
+    report = ReportDocument(
+        sections={"base": existing_report.rstrip()},
+        mutable_sections={section_id},
+        preserve_section_ids={"base"},
+    )
+    merged = deterministic_merge(
+        report,
+        [
+            MergePatchDelta(
+                target_item_id="targeted-rerun",
+                section_id=section_id,
+                operation="add_new_section",
+                new_text=delta.strip(),
+                citation_ids=[],
+                patch_reason="targeted Deep Research delta",
+            )
+        ],
+    )
+    base = merged.sections["base"].rstrip()
+    update = merged.sections[section_id].strip()
+    if not base:
+        return update
+    if not update:
+        return base
+    return f"{base}\n\n## Targeted Research Updates {run_no}\n\n{update}\n"
+
+
+def _looks_like_full_merged_report(existing_report: str, delta: str) -> bool:
+    existing = existing_report.strip()
+    candidate = delta.strip()
+    if not existing or not candidate:
+        return False
+    leading_sample = existing[: min(500, len(existing))]
+    if leading_sample and leading_sample in candidate:
+        return True
+    if len(candidate) > len(existing) * 0.8:
+        existing_lines = {
+            line.strip()
+            for line in existing.splitlines()
+            if len(line.strip()) >= 40
+        }
+        candidate_lines = {
+            line.strip()
+            for line in candidate.splitlines()
+            if len(line.strip()) >= 40
+        }
+        if existing_lines and len(existing_lines & candidate_lines) / len(existing_lines) >= 0.5:
+            return True
+    return False
 
 
 def _is_waiting_for_human_review(run: ResearchRunRecord) -> bool:
@@ -1568,8 +2295,10 @@ def _blocked_human_resume_reason(
         return None
 
     if action not in {
-        HumanReviewAction.REQUEST_LLM_FIX,
-        HumanReviewAction.REQUEST_DEEP_RESEARCH,
+        HumanReviewAction.REQUEST_LLM_PATCH,
+        HumanReviewAction.REQUEST_TARGETED_RERUN,
+        HumanReviewAction.REQUEST_VERIFICATION,
+        HumanReviewAction.REQUEST_ITEM_REVISION,
     }:
         return None
 
@@ -1579,17 +2308,26 @@ def _blocked_human_resume_reason(
     if run.total_reviews >= run.max_total_iterations:
         return "max_total_iterations_reached"
 
-    if run.no_progress_count >= run.max_no_progress_rounds:
-        return "max_no_progress_rounds_reached"
+    if run.no_progress_count >= 2:
+        return "max_no_progress_count_reached"
 
     if (
-        action == HumanReviewAction.REQUEST_DEEP_RESEARCH
-        and run.deep_research_runs >= run.max_deep_research_runs
+        action == HumanReviewAction.REQUEST_TARGETED_RERUN
+        and run.targeted_rerun_runs >= run.max_targeted_rerun_runs
     ):
-        return "max_deep_research_runs_reached"
+        return "max_targeted_rerun_runs_reached"
 
-    if action == HumanReviewAction.REQUEST_LLM_FIX and run.llm_fix_runs >= run.max_llm_fix_runs:
-        return "max_llm_fix_runs_reached"
+    if (
+        action == HumanReviewAction.REQUEST_LLM_PATCH
+        and run.llm_patch_runs >= run.max_llm_patch_runs
+    ):
+        return "max_llm_patch_runs_reached"
+
+    if (
+        action == HumanReviewAction.REQUEST_VERIFICATION
+        and run.verification_runs >= run.max_verification_runs
+    ):
+        return "max_verification_runs_reached"
 
     return None
 

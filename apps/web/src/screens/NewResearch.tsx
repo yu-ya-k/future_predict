@@ -24,7 +24,7 @@ import {
 } from "../researchDefaults";
 import { navigate, routes } from "../router";
 import { trackRun } from "../runStore";
-import { OPTION_BOUNDS } from "../types";
+import { OPTION_BOUNDS, type ContextClassification } from "../types";
 
 const MAX_PROMPT_CHARS = 50_000;
 
@@ -35,19 +35,26 @@ export function NewResearch() {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [contextClassification, setContextClassification] =
+    useState<ContextClassification>("public");
 
   // Advanced options — initialised from localStorage defaults
-  const [maxDeepResearch, setMaxDeepResearch] = useState(
-    defaults.current.max_deep_research_runs ?? FACTORY_RESEARCH_DEFAULTS.max_deep_research_runs,
+  const [maxTargetedRerun, setMaxTargetedRerun] = useState(
+    defaults.current.max_targeted_rerun_runs ??
+      FACTORY_RESEARCH_DEFAULTS.max_targeted_rerun_runs,
   );
-  const [maxLlmFix, setMaxLlmFix] = useState(
-    defaults.current.max_llm_fix_runs ?? FACTORY_RESEARCH_DEFAULTS.max_llm_fix_runs,
+  const [maxFullRerun, setMaxFullRerun] = useState(
+    defaults.current.max_full_rerun_runs ?? FACTORY_RESEARCH_DEFAULTS.max_full_rerun_runs,
+  );
+  const [maxLlmPatch, setMaxLlmPatch] = useState(
+    defaults.current.max_llm_patch_runs ?? FACTORY_RESEARCH_DEFAULTS.max_llm_patch_runs,
+  );
+  const [maxVerification, setMaxVerification] = useState(
+    defaults.current.max_verification_runs ??
+      FACTORY_RESEARCH_DEFAULTS.max_verification_runs,
   );
   const [maxIterations, setMaxIterations] = useState(
     defaults.current.max_total_iterations ?? FACTORY_RESEARCH_DEFAULTS.max_total_iterations,
-  );
-  const [maxNoProgress, setMaxNoProgress] = useState(
-    defaults.current.max_no_progress_rounds ?? FACTORY_RESEARCH_DEFAULTS.max_no_progress_rounds,
   );
   const [maxToolCalls, setMaxToolCalls] = useState(
     defaults.current.max_total_tool_calls ?? FACTORY_RESEARCH_DEFAULTS.max_total_tool_calls,
@@ -58,10 +65,11 @@ export function NewResearch() {
     function onStorage(e: StorageEvent) {
       if (e.key !== RESEARCH_DEFAULTS_STORAGE_KEY) return;
       const d = loadResearchDefaults();
-      setMaxDeepResearch(d.max_deep_research_runs);
-      setMaxLlmFix(d.max_llm_fix_runs);
+      setMaxTargetedRerun(d.max_targeted_rerun_runs);
+      setMaxFullRerun(d.max_full_rerun_runs);
+      setMaxLlmPatch(d.max_llm_patch_runs);
+      setMaxVerification(d.max_verification_runs);
       setMaxIterations(d.max_total_iterations);
-      setMaxNoProgress(d.max_no_progress_rounds);
       setMaxToolCalls(d.max_total_tool_calls);
     }
     window.addEventListener("storage", onStorage);
@@ -82,11 +90,13 @@ export function NewResearch() {
 
       const response = await createRun({
         user_prompt: promptTrimmed,
+        context_classification: contextClassification,
         options: {
-          max_deep_research_runs: maxDeepResearch,
-          max_llm_fix_runs: maxLlmFix,
+          max_targeted_rerun_runs: maxTargetedRerun,
+          max_full_rerun_runs: maxFullRerun,
+          max_llm_patch_runs: maxLlmPatch,
+          max_verification_runs: maxVerification,
           max_total_iterations: maxIterations,
-          max_no_progress_rounds: maxNoProgress,
           max_total_tool_calls: maxToolCalls,
         },
       });
@@ -117,6 +127,7 @@ export function NewResearch() {
 
   const remaining = MAX_PROMPT_CHARS - prompt.length;
   const overLimit = prompt.length > MAX_PROMPT_CHARS;
+  const nonPublicContextSelected = contextClassification !== "public";
 
   return (
     <div className="screen-new">
@@ -159,6 +170,33 @@ export function NewResearch() {
           </div>
         </section>
 
+        <section className="form-section">
+          <label className="form-label" htmlFor="context-classification">
+            コンテキスト分類
+            <span className="form-required" aria-hidden="true">*</span>
+          </label>
+          <select
+            id="context-classification"
+            className="option-input"
+            value={contextClassification}
+            onChange={(e) =>
+              setContextClassification(e.target.value as ContextClassification)
+            }
+            disabled={submitting}
+            required
+          >
+            <option value="public">public</option>
+            <option value="internal">internal</option>
+            <option value="confidential">confidential</option>
+            <option value="mixed">mixed</option>
+          </select>
+          {nonPublicContextSelected && (
+            <div className="form-warning" role="alert">
+              public web Deep Research は policy により送信されず、人間レビューで停止します。
+            </div>
+          )}
+        </section>
+
         {/* Advanced options (collapsible) */}
         <section className="form-section">
           <button
@@ -177,40 +215,78 @@ export function NewResearch() {
             <div className="advanced-options" role="group" aria-label="詳細オプション">
               <div className="options-grid">
                 <div className="option-field">
-                  <label className="option-label" htmlFor="max-deep-research">
-                    最大Deep Research回数
+                  <label className="option-label" htmlFor="max-targeted-rerun">
+                    最大Targeted rerun回数
                   </label>
                   <input
-                    id="max-deep-research"
+                    id="max-targeted-rerun"
                     type="number"
                     className="option-input"
-                    value={maxDeepResearch}
-                    min={OPTION_BOUNDS.max_deep_research_runs.min}
-                    max={OPTION_BOUNDS.max_deep_research_runs.max}
-                    onChange={(e) => setMaxDeepResearch(Number(e.target.value))}
+                    value={maxTargetedRerun}
+                    min={OPTION_BOUNDS.max_targeted_rerun_runs.min}
+                    max={OPTION_BOUNDS.max_targeted_rerun_runs.max}
+                    onChange={(e) => setMaxTargetedRerun(Number(e.target.value))}
                     disabled={submitting}
                   />
                   <span className="option-range">
-                    {OPTION_BOUNDS.max_deep_research_runs.min}–{OPTION_BOUNDS.max_deep_research_runs.max}
+                    {OPTION_BOUNDS.max_targeted_rerun_runs.min}–{OPTION_BOUNDS.max_targeted_rerun_runs.max}
                   </span>
                 </div>
 
                 <div className="option-field">
-                  <label className="option-label" htmlFor="max-llm-fix">
-                    最大LLM修正回数
+                  <label className="option-label" htmlFor="max-full-rerun">
+                    最大Full rerun回数
                   </label>
                   <input
-                    id="max-llm-fix"
+                    id="max-full-rerun"
                     type="number"
                     className="option-input"
-                    value={maxLlmFix}
-                    min={OPTION_BOUNDS.max_llm_fix_runs.min}
-                    max={OPTION_BOUNDS.max_llm_fix_runs.max}
-                    onChange={(e) => setMaxLlmFix(Number(e.target.value))}
+                    value={maxFullRerun}
+                    min={OPTION_BOUNDS.max_full_rerun_runs.min}
+                    max={OPTION_BOUNDS.max_full_rerun_runs.max}
+                    onChange={(e) => setMaxFullRerun(Number(e.target.value))}
                     disabled={submitting}
                   />
                   <span className="option-range">
-                    {OPTION_BOUNDS.max_llm_fix_runs.min}–{OPTION_BOUNDS.max_llm_fix_runs.max}
+                    {OPTION_BOUNDS.max_full_rerun_runs.min}–{OPTION_BOUNDS.max_full_rerun_runs.max}
+                  </span>
+                </div>
+
+                <div className="option-field">
+                  <label className="option-label" htmlFor="max-llm-patch">
+                    最大LLM patch回数
+                  </label>
+                  <input
+                    id="max-llm-patch"
+                    type="number"
+                    className="option-input"
+                    value={maxLlmPatch}
+                    min={OPTION_BOUNDS.max_llm_patch_runs.min}
+                    max={OPTION_BOUNDS.max_llm_patch_runs.max}
+                    onChange={(e) => setMaxLlmPatch(Number(e.target.value))}
+                    disabled={submitting}
+                  />
+                  <span className="option-range">
+                    {OPTION_BOUNDS.max_llm_patch_runs.min}–{OPTION_BOUNDS.max_llm_patch_runs.max}
+                  </span>
+                </div>
+
+                <div className="option-field">
+                  <label className="option-label" htmlFor="max-verification">
+                    最大Verification回数
+                  </label>
+                  <input
+                    id="max-verification"
+                    type="number"
+                    className="option-input"
+                    value={maxVerification}
+                    min={OPTION_BOUNDS.max_verification_runs.min}
+                    max={OPTION_BOUNDS.max_verification_runs.max}
+                    onChange={(e) => setMaxVerification(Number(e.target.value))}
+                    disabled={submitting}
+                  />
+                  <span className="option-range">
+                    {OPTION_BOUNDS.max_verification_runs.min}–{OPTION_BOUNDS.max_verification_runs.max}
                   </span>
                 </div>
 
@@ -234,25 +310,6 @@ export function NewResearch() {
                 </div>
 
                 <div className="option-field">
-                  <label className="option-label" htmlFor="max-no-progress">
-                    最大停滞許容回数
-                  </label>
-                  <input
-                    id="max-no-progress"
-                    type="number"
-                    className="option-input"
-                    value={maxNoProgress}
-                    min={OPTION_BOUNDS.max_no_progress_rounds.min}
-                    max={OPTION_BOUNDS.max_no_progress_rounds.max}
-                    onChange={(e) => setMaxNoProgress(Number(e.target.value))}
-                    disabled={submitting}
-                  />
-                  <span className="option-range">
-                    {OPTION_BOUNDS.max_no_progress_rounds.min}–{OPTION_BOUNDS.max_no_progress_rounds.max}
-                  </span>
-                </div>
-
-                <div className="option-field">
                   <label className="option-label" htmlFor="max-tool-calls">
                     最大ツール呼び出し数
                   </label>
@@ -261,13 +318,15 @@ export function NewResearch() {
                     type="number"
                     className="option-input"
                     value={maxToolCalls}
-                    min={10}
-                    max={1000}
+                    min={OPTION_BOUNDS.max_total_tool_calls.min}
+                    max={OPTION_BOUNDS.max_total_tool_calls.max}
                     step={10}
                     onChange={(e) => setMaxToolCalls(Number(e.target.value))}
                     disabled={submitting}
                   />
-                  <span className="option-range">10–1000</span>
+                  <span className="option-range">
+                    {OPTION_BOUNDS.max_total_tool_calls.min}–{OPTION_BOUNDS.max_total_tool_calls.max}
+                  </span>
                 </div>
               </div>
             </div>

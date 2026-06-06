@@ -51,11 +51,27 @@ function clearStorage() {
 
 function staleSavedFactoryDefaults() {
   return {
-    max_deep_research_runs: 3,
-    max_llm_fix_runs: 3,
+    max_targeted_rerun_runs: 3,
+    max_full_rerun_runs: 1,
+    max_llm_patch_runs: 3,
+    max_verification_runs: 3,
     max_total_iterations: 10,
-    max_no_progress_rounds: 3,
     max_total_tool_calls: 200,
+  };
+}
+
+function makeItemAssessment(overrides: Record<string, unknown> = {}) {
+  return {
+    item_id: "RI-001",
+    status: "partial",
+    severity: "major",
+    failure_mode: "needs_deeper_search",
+    failure_mode_confidence: 82,
+    recommended_action: "targeted_rerun",
+    evidence_summary: "追加調査が必要です",
+    missing_evidence: ["一次情報"],
+    rationale: "ResearchItem の根拠が不足しています",
+    ...overrides,
   };
 }
 
@@ -232,8 +248,8 @@ describe("Dashboard (SCR-2)", () => {
             done_reason: null,
             needs_human_review: false,
             progress: {
-              deep_research_runs: 1,
-              llm_fix_runs: 0,
+              targeted_rerun_runs: 1,
+              llm_patch_runs: 0,
               total_reviews: 0,
               latest_verdict: null,
               latest_score: null,
@@ -392,8 +408,8 @@ describe("Dashboard (SCR-2)", () => {
                 latest_score: 72,
                 latest_rationale: "判断が必要です",
                 audit_summary: {
-                  deep_research_runs: 1,
-                  llm_fix_runs: 0,
+                  targeted_rerun_runs: 1,
+                  llm_patch_runs: 0,
                   total_reviews: 1,
                   no_progress_count: 0,
                   total_tool_calls: 0,
@@ -416,8 +432,8 @@ describe("Dashboard (SCR-2)", () => {
               done_reason: "deep_research_timeout",
               needs_human_review: true,
               progress: {
-                deep_research_runs: 1,
-                llm_fix_runs: 0,
+                targeted_rerun_runs: 1,
+                llm_patch_runs: 0,
                 total_reviews: 1,
                 latest_verdict: "human_review",
                 latest_score: 72,
@@ -471,8 +487,8 @@ describe("Dashboard (SCR-2)", () => {
                 latest_score: 72,
                 latest_rationale: "判断が必要です",
                 audit_summary: {
-                  deep_research_runs: 1,
-                  llm_fix_runs: 0,
+                  targeted_rerun_runs: 1,
+                  llm_patch_runs: 0,
                   total_reviews: 1,
                   no_progress_count: 0,
                   total_tool_calls: 0,
@@ -555,7 +571,7 @@ describe("NewResearch (SCR-1)", () => {
 
     await userEvent.click(screen.getByRole("button", { name: /詳細オプション/i }));
     const advancedOptions = screen.getByRole("group", { name: /詳細オプション/i });
-    expect(within(advancedOptions).getAllByRole("spinbutton")).toHaveLength(5);
+    expect(within(advancedOptions).getAllByRole("spinbutton")).toHaveLength(6);
   });
 
   it("submits a run and navigates to monitor on success", async () => {
@@ -611,18 +627,38 @@ describe("NewResearch (SCR-1)", () => {
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     const body = JSON.parse(String(init.body)) as {
       user_prompt: string;
+      context_classification: string;
       options: Record<string, unknown>;
     };
 
-    expect(Object.keys(body).sort()).toEqual(["options", "user_prompt"]);
+    expect(Object.keys(body).sort()).toEqual([
+      "context_classification",
+      "options",
+      "user_prompt",
+    ]);
     expect(body.user_prompt).toBe("テスト用プロンプト");
+    expect(body.context_classification).toBe("public");
     expect(body.options).toEqual({
-      max_deep_research_runs: 2,
-      max_llm_fix_runs: 3,
+      max_targeted_rerun_runs: 2,
+      max_full_rerun_runs: 1,
+      max_llm_patch_runs: 3,
+      max_verification_runs: 3,
       max_total_iterations: 5,
-      max_no_progress_rounds: 2,
       max_total_tool_calls: 120,
     });
+  });
+
+  it("warns that non-public context stops public web Deep Research for human review", async () => {
+    render(<App />);
+
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: /コンテキスト分類/i }),
+      "internal",
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      /public web Deep Research は policy により送信されず/,
+    );
   });
 
   it("normalizes stale saved factory defaults before submitting", async () => {
@@ -653,7 +689,7 @@ describe("NewResearch (SCR-1)", () => {
       options: Record<string, unknown>;
     };
 
-    expect(body.options.max_deep_research_runs).toBe(2);
+    expect(body.options.max_targeted_rerun_runs).toBe(2);
     expect(body.options.max_total_iterations).toBe(5);
     expect(body.options.max_total_tool_calls).toBe(120);
   });
@@ -698,6 +734,101 @@ describe("RunMonitor (SCR-3)", () => {
     );
   });
 
+  it("unwraps ResearchItem API wrapper responses in the monitor", async () => {
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/reviews`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/items`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              run_id: runId,
+              items: [
+                {
+                  item_id: "RI-001",
+                  criterion_id: "AC-001",
+                  question: "回答済みの項目",
+                  expected_answer_type: "fact",
+                  status: "answered",
+                  severity: "major",
+                  confidence: 90,
+                  evidence_summary: "根拠あり",
+                  citation_ids: [],
+                  failure_mode: null,
+                  failure_mode_confidence: null,
+                  unresolved_reason: null,
+                  tried_queries: [],
+                  tried_source_types: [],
+                  last_attempt_no: 1,
+                  last_review_no: 1,
+                },
+                {
+                  item_id: "RI-002",
+                  criterion_id: "AC-002",
+                  question: "未解決の項目",
+                  expected_answer_type: "comparison",
+                  status: "partial",
+                  severity: "blocker",
+                  confidence: 45,
+                  evidence_summary: null,
+                  citation_ids: [],
+                  failure_mode: "needs_deeper_search",
+                  failure_mode_confidence: 70,
+                  unresolved_reason: "追加情報が必要",
+                  tried_queries: [],
+                  tried_source_types: [],
+                  last_attempt_no: 1,
+                  last_review_no: 1,
+                },
+              ],
+            }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "reviewing",
+            done_reason: null,
+            needs_human_review: false,
+            progress: {
+              items_total: 0,
+              items_answered: 0,
+              items_partial: 0,
+              items_unanswered: 0,
+              items_unverifiable: 0,
+              blockers_unresolved: 0,
+              targeted_rerun_runs: 1,
+              full_rerun_runs: 0,
+              llm_patch_runs: 0,
+              verification_runs: 0,
+              total_reviews: 1,
+              latest_verdict: null,
+              latest_score: null,
+              total_tool_calls: 12,
+              estimated_cost_usd: 0.42,
+            },
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("1/2 answered")).toBeInTheDocument();
+    expect(screen.getByText("RI-002")).toBeInTheDocument();
+    expect(screen.getByText("needs_deeper_search (70%)")).toBeInTheDocument();
+  });
+
   it("separates total elapsed time from the current Deep Research attempt", async () => {
     vi.spyOn(Date, "now").mockReturnValue(
       new Date("2026-06-06T05:00:00.000Z").getTime(),
@@ -734,8 +865,8 @@ describe("RunMonitor (SCR-3)", () => {
             needs_human_review: false,
             deep_research_submitted_at: "2026-06-06T04:30:00.000Z",
             progress: {
-              deep_research_runs: 2,
-              llm_fix_runs: 0,
+              targeted_rerun_runs: 2,
+              llm_patch_runs: 0,
               total_reviews: 1,
               latest_verdict: null,
               latest_score: null,
@@ -805,8 +936,8 @@ describe("RunMonitor (SCR-3)", () => {
             done_reason: null,
             needs_human_review: false,
             progress: {
-              deep_research_runs: 1,
-              llm_fix_runs: 0,
+              targeted_rerun_runs: 1,
+              llm_patch_runs: 0,
               total_reviews: 0,
               latest_verdict: null,
               latest_score: null,
@@ -834,26 +965,36 @@ describe("RunMonitor (SCR-3)", () => {
   });
 
   it("returns to the dashboard from the run monitor", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: () =>
-        Promise.resolve({
-          run_id: runId,
-          status: "waiting_deep_research",
-          done_reason: null,
-          needs_human_review: false,
-          progress: {
-            deep_research_runs: 1,
-            llm_fix_runs: 0,
-            total_reviews: 0,
-            latest_verdict: null,
-            latest_score: null,
-            total_tool_calls: 0,
-            estimated_cost_usd: 0,
-          },
-        }),
-    } as Response);
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/research-runs/human-reviews")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "waiting_deep_research",
+            done_reason: null,
+            needs_human_review: false,
+            progress: {
+              targeted_rerun_runs: 1,
+              llm_patch_runs: 0,
+              total_reviews: 0,
+              latest_verdict: null,
+              latest_score: null,
+              total_tool_calls: 0,
+              estimated_cost_usd: 0,
+            },
+          }),
+      } as Response);
+    });
 
     render(<App />);
 
@@ -912,8 +1053,8 @@ describe("RunMonitor (SCR-3)", () => {
             done_reason: null,
             needs_human_review: false,
             progress: {
-              deep_research_runs: 1,
-              llm_fix_runs: 0,
+              targeted_rerun_runs: 1,
+              llm_patch_runs: 0,
               total_reviews: 0,
               latest_verdict: null,
               latest_score: null,
@@ -955,17 +1096,16 @@ describe("ReportViewer (SCR-5)", () => {
   function makeReview(reviewNo: number, rationale: string, score = 70) {
     return {
       review_no: reviewNo,
-      verdict: "needs_deep_research",
-      recommended_route: "needs_deep_research",
+      verdict: "needs_targeted_rerun",
+      recommended_route: "needs_targeted_rerun",
       goal_achieved: false,
       score,
       rationale,
       gaps: [`ギャップ ${reviewNo}`],
       factuality_concerns: [],
       source_quality_concerns: [],
+      item_assessments: [makeItemAssessment({ item_id: `RI-0${reviewNo}` })],
       next_instructions: `改善指示 ${reviewNo}`,
-      can_be_fixed_by_llm: false,
-      requires_new_external_research: true,
       reviewer_confidence: 80,
       high_risk_flags: [],
       public_web_search_used: false,
@@ -1232,17 +1372,21 @@ describe("ReportViewer (SCR-5)", () => {
             Promise.resolve([
               {
                 review_no: 1,
-                verdict: "needs_deep_research",
-                recommended_route: "needs_deep_research",
+                verdict: "needs_targeted_rerun",
+                recommended_route: "needs_targeted_rerun",
                 goal_achieved: false,
                 score: 58,
                 rationale: "目的達成度が不足しています",
                 gaps: ["想定出力の比較表が不足"],
                 factuality_concerns: ["数値の検証が不足"],
                 source_quality_concerns: ["一次情報が不足"],
+                item_assessments: [
+                  makeItemAssessment({
+                    missing_evidence: ["想定出力の比較表"],
+                    rationale: "比較表が不足しています",
+                  }),
+                ],
                 next_instructions: "次回は公式資料を優先して比較表を作る",
-                can_be_fixed_by_llm: false,
-                requires_new_external_research: true,
                 reviewer_confidence: 82,
                 high_risk_flags: ["判断不能な数値"],
                 public_web_search_used: false,
@@ -1478,17 +1622,23 @@ describe("HumanReview (SCR-4)", () => {
         gaps: ["データ不足"],
         factuality_concerns: [],
         source_quality_concerns: [],
+        item_assessments: [
+          makeItemAssessment({
+            recommended_action: "human_review",
+            rationale: "人間の判断が必要です",
+          }),
+        ],
         next_instructions: null,
-        can_be_fixed_by_llm: false,
-        requires_new_external_research: true,
         reviewer_confidence: 80,
         high_risk_flags: [],
         public_web_search_used: false,
       },
       allowed_actions: allowedActions,
       audit_summary: {
-        deep_research_runs: 2,
-        llm_fix_runs: 1,
+        targeted_rerun_runs: 2,
+        full_rerun_runs: 1,
+        llm_patch_runs: 1,
+        verification_runs: 1,
         total_reviews: 3,
         no_progress_count: 1,
         total_tool_calls: 45,
@@ -1524,11 +1674,11 @@ describe("HumanReview (SCR-4)", () => {
     render(<App />);
 
     // Wait for payload to load (buttons are rendered after fetch)
-    const llmFixBtn = await screen.findByRole("button", { name: /軽微修正/i });
-    const deepResearchBtn = screen.getByRole("button", { name: /再調査/i });
+    const llmPatchBtn = await screen.findByRole("button", { name: /LLM patch/i });
+    const targetedRerunBtn = screen.getByRole("button", { name: /Targeted rerun/i });
 
-    expect(llmFixBtn).toBeDisabled();
-    expect(deepResearchBtn).toBeDisabled();
+    expect(llmPatchBtn).toBeDisabled();
+    expect(targetedRerunBtn).toBeDisabled();
   });
 
   it("enables actions that are in allowed_actions", async () => {
@@ -1540,9 +1690,13 @@ describe("HumanReview (SCR-4)", () => {
 
     render(<App />);
 
-    const approveBtn = await screen.findByRole("button", { name: /承認/i });
+    await screen.findByText("承認");
+    const approveBtn = document.querySelector<HTMLButtonElement>(
+      'button[data-action="approve"]',
+    );
     const rejectBtn = screen.getByRole("button", { name: /却下/i });
 
+    expect(approveBtn).not.toBeNull();
     expect(approveBtn).not.toBeDisabled();
     expect(rejectBtn).not.toBeDisabled();
   });
@@ -1595,7 +1749,12 @@ describe("HumanReview (SCR-4)", () => {
 
     render(<App />);
 
-    await userEvent.click(await screen.findByRole("button", { name: /承認/i }));
+    await screen.findByText("承認");
+    const approveBtn = document.querySelector<HTMLButtonElement>(
+      'button[data-action="approve"]',
+    );
+    expect(approveBtn).not.toBeNull();
+    await userEvent.click(approveBtn as HTMLButtonElement);
 
     expect(fetchMock).toHaveBeenCalledWith(
       `http://localhost:8000/research-runs/${runId}/resume`,
@@ -1669,17 +1828,18 @@ describe("Settings (SCR-7)", () => {
     render(<App />);
 
     expect(screen.getByText(/デフォルトオプション/i)).toBeInTheDocument();
-    expect(screen.getByLabelText(/最大Deep Research回数/i)).toBeInTheDocument();
-    expect(screen.getByLabelText(/最大LLM修正回数/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/最大Targeted rerun回数/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/最大LLM patch回数/i)).toBeInTheDocument();
   });
 
   it("renders API-aligned factory defaults", () => {
     render(<App />);
 
-    expect(screen.getByLabelText(/最大Deep Research回数/i)).toHaveValue(2);
-    expect(screen.getByLabelText(/最大LLM修正回数/i)).toHaveValue(3);
+    expect(screen.getByLabelText(/最大Targeted rerun回数/i)).toHaveValue(2);
+    expect(screen.getByLabelText(/最大Full rerun回数/i)).toHaveValue(1);
+    expect(screen.getByLabelText(/最大LLM patch回数/i)).toHaveValue(3);
+    expect(screen.getByLabelText(/最大Verification回数/i)).toHaveValue(3);
     expect(screen.getByLabelText(/最大反復回数/i)).toHaveValue(5);
-    expect(screen.getByLabelText(/最大停滞許容回数/i)).toHaveValue(2);
     expect(screen.getByLabelText(/最大ツール呼び出し数/i)).toHaveValue(120);
     expect(screen.queryByLabelText(/最大コスト/i)).not.toBeInTheDocument();
   });
@@ -1689,7 +1849,7 @@ describe("Settings (SCR-7)", () => {
 
     render(<App />);
 
-    expect(screen.getByLabelText(/最大Deep Research回数/i)).toHaveValue(2);
+    expect(screen.getByLabelText(/最大Targeted rerun回数/i)).toHaveValue(2);
     expect(screen.getByLabelText(/最大反復回数/i)).toHaveValue(5);
     expect(screen.getByLabelText(/最大ツール呼び出し数/i)).toHaveValue(120);
   });
@@ -1702,7 +1862,7 @@ describe("Settings (SCR-7)", () => {
 
     render(<App />);
 
-    expect(screen.getByLabelText(/最大Deep Research回数/i)).toHaveValue(3);
+    expect(screen.getByLabelText(/最大Targeted rerun回数/i)).toHaveValue(3);
     expect(screen.getByLabelText(/最大反復回数/i)).toHaveValue(10);
     expect(screen.getByLabelText(/最大ツール呼び出し数/i)).toHaveValue(210);
   });
@@ -1713,7 +1873,7 @@ describe("Settings (SCR-7)", () => {
     const heading = screen.getByRole("heading", { name: /デフォルトオプション/i });
     const section = heading.closest("section");
     expect(section).not.toBeNull();
-    expect(within(section as HTMLElement).getAllByRole("spinbutton")).toHaveLength(5);
+    expect(within(section as HTMLElement).getAllByRole("spinbutton")).toHaveLength(6);
   });
 
   it("persists saved defaults to localStorage", async () => {

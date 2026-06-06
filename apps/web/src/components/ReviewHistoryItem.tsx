@@ -5,8 +5,12 @@ import { ScoreChip } from "./ScoreChip";
 
 const VERDICT_LINE_COLOR: Record<Verdict, string> = {
   pass: "var(--pass)",
-  needs_llm_fix: "var(--llm)",
-  needs_deep_research: "var(--deep)",
+  needs_llm_patch: "var(--llm)",
+  needs_verification: "var(--deep)",
+  needs_targeted_rerun: "var(--deep)",
+  needs_full_rerun: "var(--deep)",
+  needs_item_revision: "var(--human)",
+  finalize_with_limitation: "var(--llm)",
   human_review: "var(--human)",
 };
 

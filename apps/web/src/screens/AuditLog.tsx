@@ -4,8 +4,7 @@
  * One-shot fetch of getAudit (GAP-6). Six tabs:
  *  Attempts / Reviews / Tool calls / Citations / Cost / Human decisions
  *
- * Reviews tab MUST surface can_be_fixed_by_llm and requires_new_external_research
- * prominently (FlagChip per I-4).
+ * Reviews tab surfaces vFinal item assessments and recommended actions.
  * Human decisions tab is reviewer-scoped — data comes from AuditResponse, no
  * extra header needed here (already included in the audit payload).
  * EmptyState per empty tab. Mono styling for ids.
@@ -16,7 +15,6 @@ import { useState } from "react";
 import {
   BackLink,
   EmptyState,
-  FlagChip,
   ScoreChip,
   Skeleton,
   VerdictBadge,
@@ -39,6 +37,39 @@ const TABS: { id: TabId; label: string }[] = [
 
 interface AuditLogProps {
   runId: string;
+}
+
+const ACTION_LABELS: Record<string, string> = {
+  none: "対応なし",
+  llm_patch: "LLM patch",
+  verify: "Verify",
+  targeted_rerun: "Targeted rerun",
+  full_rerun: "Full rerun",
+  human_review: "Human review",
+  finalize_with_limitation: "制約付き完了",
+  revise_items: "Item見直し",
+};
+
+const ITEM_STATUS_LABELS: Record<string, string> = {
+  answered: "回答済み",
+  partial: "一部回答",
+  unanswered: "未回答",
+  unverifiable: "確認不能",
+  out_of_scope: "対象外",
+};
+
+const ITEM_SEVERITY_LABELS: Record<string, string> = {
+  blocker: "Blocker",
+  major: "Major",
+  minor: "Minor",
+};
+
+function actionSummary(items: AuditResponse["reviews"][number]["item_assessments"]) {
+  const counts = new Map<string, number>();
+  for (const item of items) {
+    counts.set(item.recommended_action, (counts.get(item.recommended_action) ?? 0) + 1);
+  }
+  return Array.from(counts.entries()).sort(([a], [b]) => a.localeCompare(b));
 }
 
 // ── Tab contents ──────────────────────────────────────────────────────────────
@@ -87,19 +118,36 @@ function ReviewsTab({ data }: { data: AuditResponse }) {
             <span className="mono audit-review-no">#{r.review_no}</span>
             <VerdictBadge verdict={r.verdict} />
             <ScoreChip score={r.score} />
-            {/* I-4: Surfaced prominently */}
-            <FlagChip
-              active={r.can_be_fixed_by_llm}
-              label="LLMで修正可能"
-              tone={r.can_be_fixed_by_llm ? "pass" : "neutral"}
-            />
-            <FlagChip
-              active={r.requires_new_external_research}
-              label="新たな外部調査が必要"
-              tone={r.requires_new_external_research ? "deep" : "neutral"}
-            />
+            {actionSummary(r.item_assessments).map(([action, count]) => (
+              <span key={action} className="audit-action-chip">
+                {ACTION_LABELS[action] ?? action} {count}
+              </span>
+            ))}
+            {r.item_assessments.length === 0 && (
+              <span className="audit-action-chip audit-action-chip--empty">
+                Item assessmentなし
+              </span>
+            )}
           </div>
           <p className="audit-review-rationale">{r.rationale}</p>
+          {r.item_assessments.length > 0 && (
+            <details className="audit-review-items" open>
+              <summary>ResearchItem評価 ({r.item_assessments.length}件)</summary>
+              <div className="audit-review-item-list">
+                {r.item_assessments.map((item) => (
+                  <div key={item.item_id} className="audit-review-item-row">
+                    <div className="audit-review-item-main">
+                      <span className="mono">{item.item_id}</span>
+                      <span>{ITEM_STATUS_LABELS[item.status] ?? item.status}</span>
+                      <span>{ITEM_SEVERITY_LABELS[item.severity] ?? item.severity}</span>
+                      <span>{ACTION_LABELS[item.recommended_action] ?? item.recommended_action}</span>
+                    </div>
+                    <p>{item.rationale}</p>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
           {r.gaps.length > 0 && (
             <details className="audit-review-gaps">
               <summary>ギャップ ({r.gaps.length}件)</summary>

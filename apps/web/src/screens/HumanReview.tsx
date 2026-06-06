@@ -6,8 +6,8 @@
  *
  * Guard rules (A4 / A8 Q-4):
  *  - Any action not in payload.allowed_actions → disabled.
- *  - request_deep_research shows a warning when audit_summary.no_progress_count >= 2
- *    so reviewers see the loop-risk context before resuming.
+ *  - request_targeted_rerun shows a warning when audit_summary.no_progress_count >= 2
+ *    so reviewers see the item-loop context before resuming.
  *  - 409 conflict → show detail + refetch payload.
  */
 
@@ -26,10 +26,29 @@ import {
 import { getHumanReviewPayload, resumeRun } from "../api/research";
 import { ApiError } from "../api/client";
 import { navigate, routes } from "../router";
-import { type HumanReviewAction, type HumanReviewPayload } from "../types";
+import {
+  type HumanReviewAction,
+  type HumanReviewPayload,
+  type ResearchItem,
+} from "../types";
 
 const NO_PROGRESS_WARN_THRESHOLD = 2;
 const MAX_COMMENT_CHARS = 10_000;
+
+const ITEM_STATUS_LABEL: Record<ResearchItem["status"], string> = {
+  not_started: "未開始",
+  answered: "回答済み",
+  partial: "一部回答",
+  unanswered: "未回答",
+  unverifiable: "確認不能",
+  out_of_scope: "対象外",
+};
+
+const ITEM_SEVERITY_LABEL: Record<ResearchItem["severity"], string> = {
+  blocker: "Blocker",
+  major: "Major",
+  minor: "Minor",
+};
 
 interface HumanReviewProps {
   runId: string;
@@ -133,6 +152,8 @@ export function HumanReview({ runId }: HumanReviewProps) {
   if (!payload) return null;
 
   const { latest_review, audit_summary, allowed_actions } = payload;
+  const unresolvedItems = payload.unresolved_items ?? [];
+  const latestItemAssessments = latest_review?.item_assessments ?? [];
 
   const noProgressWarn =
     audit_summary.no_progress_count >= NO_PROGRESS_WARN_THRESHOLD;
@@ -140,8 +161,8 @@ export function HumanReview({ runId }: HumanReviewProps) {
   const isAllowed = (action: HumanReviewAction) => allowed_actions.includes(action);
   const canRetryReview = isAllowed("request_review");
 
-  const deepResearchGuardMessage = noProgressWarn
-    ? `改善停滞が${audit_summary.no_progress_count}回続いています。再調査の効果は限定的かもしれません。`
+  const targetedRerunGuardMessage = noProgressWarn
+    ? `改善停滞が${audit_summary.no_progress_count}回続いています。同じitemへの再実行効果は限定的かもしれません。`
     : undefined;
 
   return (
@@ -185,19 +206,24 @@ export function HumanReview({ runId }: HumanReviewProps) {
         <h2 id="investment-heading" className="section-title">これまでの投資</h2>
         <div className="metrics-row">
           <MetricCard
-            label="Deep Research回数"
-            value={audit_summary.deep_research_runs}
+            label="Targeted rerun"
+            value={audit_summary.targeted_rerun_runs}
             icon="ti-search"
           />
           <MetricCard
-            label="LLM修正回数"
-            value={audit_summary.llm_fix_runs}
+            label="Full rerun"
+            value={audit_summary.full_rerun_runs}
+            icon="ti-refresh"
+          />
+          <MetricCard
+            label="LLM patch"
+            value={audit_summary.llm_patch_runs}
             icon="ti-pencil"
           />
           <MetricCard
-            label="レビュー回数"
-            value={audit_summary.total_reviews}
-            icon="ti-repeat"
+            label="Verification"
+            value={audit_summary.verification_runs}
+            icon="ti-shield-check"
           />
           <MetricCard
             label="推定コスト"
@@ -222,19 +248,38 @@ export function HumanReview({ runId }: HumanReviewProps) {
             </div>
 
             <p className="latest-review-rationale">{latest_review.rationale}</p>
+            {latest_review.route_rationale && (
+              <p className="latest-review-route">
+                Route: {latest_review.route_rationale}
+              </p>
+            )}
 
             <div className="latest-review-flags">
               <FlagChip
-                active={latest_review.can_be_fixed_by_llm}
-                label="LLMで修正可能"
-                tone={latest_review.can_be_fixed_by_llm ? "pass" : "neutral"}
+                active={latest_review.verdict === "needs_llm_patch"}
+                label="LLM patch"
+                tone={latest_review.verdict === "needs_llm_patch" ? "pass" : "neutral"}
               />
               <FlagChip
-                active={latest_review.requires_new_external_research}
-                label="新たな外部調査が必要"
-                tone={latest_review.requires_new_external_research ? "deep" : "neutral"}
+                active={latest_review.verdict === "needs_targeted_rerun"}
+                label="Targeted rerun"
+                tone={latest_review.verdict === "needs_targeted_rerun" ? "deep" : "neutral"}
               />
             </div>
+
+            {latestItemAssessments.length > 0 && (
+              <div className="review-gaps">
+                <h3 className="gaps-title">Item assessments</h3>
+                <ul className="gaps-list">
+                  {latestItemAssessments.map((item) => (
+                    <li key={item.item_id}>
+                      {item.item_id}: {item.status} / {item.failure_mode} /{" "}
+                      {item.recommended_action}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
 
             {latest_review.gaps.length > 0 && (
               <div className="review-gaps">
@@ -246,6 +291,47 @@ export function HumanReview({ runId }: HumanReviewProps) {
                 </ul>
               </div>
             )}
+          </div>
+        </section>
+      )}
+
+      {/* ── Unresolved items ─────────────────────────── */}
+      {unresolvedItems.length > 0 && (
+        <section className="review-unresolved-items" aria-labelledby="unresolved-items-heading">
+          <h2 id="unresolved-items-heading" className="section-title">
+            未解決ResearchItems
+          </h2>
+          <div className="item-table-wrap">
+            <table className="item-table">
+              <thead>
+                <tr>
+                  <th scope="col">Item</th>
+                  <th scope="col">Severity</th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Failure mode</th>
+                  <th scope="col">Unresolved reason</th>
+                </tr>
+              </thead>
+              <tbody>
+                {unresolvedItems.map((item) => (
+                  <tr key={item.item_id}>
+                    <td className="item-table-id">{item.item_id}</td>
+                    <td>
+                      <span className={`item-severity item-severity--${item.severity}`}>
+                        {ITEM_SEVERITY_LABEL[item.severity]}
+                      </span>
+                    </td>
+                    <td>{ITEM_STATUS_LABEL[item.status]}</td>
+                    <td className="item-table-mono">
+                      {item.failure_mode ?? "none"}
+                      {item.failure_mode_confidence !== null &&
+                        ` (${item.failure_mode_confidence}%)`}
+                    </td>
+                    <td>{item.unresolved_reason ?? item.question}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </section>
       )}
@@ -298,6 +384,15 @@ export function HumanReview({ runId }: HumanReviewProps) {
             block
             onClick={() => void handleDecision("approve")}
           />
+          <DecisionButton
+            action="approve_with_limitation"
+            label="制約付き承認"
+            consequence="未確認点を明示して完了"
+            tone="success"
+            disabled={!isAllowed("approve_with_limitation") || submitting}
+            block
+            onClick={() => void handleDecision("approve_with_limitation")}
+          />
           {canRetryReview && (
             <DecisionButton
               action="request_review"
@@ -310,24 +405,42 @@ export function HumanReview({ runId }: HumanReviewProps) {
             />
           )}
           <DecisionButton
-            action="request_llm_fix"
-            label="軽微修正"
-            consequence="GPT-5.5で整形"
+            action="request_llm_patch"
+            label="LLM patch"
+            consequence="GPT-5.5で差分修正"
             tone="warning"
-            disabled={!isAllowed("request_llm_fix") || submitting}
+            disabled={!isAllowed("request_llm_patch") || submitting}
             block
-            onClick={() => void handleDecision("request_llm_fix")}
+            onClick={() => void handleDecision("request_llm_patch")}
           />
           <DecisionButton
-            action="request_deep_research"
-            label="再調査"
-            consequence="Deep Research追加"
+            action="request_verification"
+            label="検証"
+            consequence="対象itemだけ検証"
+            tone="neutral"
+            disabled={!isAllowed("request_verification") || submitting}
+            block
+            onClick={() => void handleDecision("request_verification")}
+          />
+          <DecisionButton
+            action="request_targeted_rerun"
+            label="Targeted rerun"
+            consequence="未解決itemだけ再実行"
             tone="neutral"
             costHint={`追加コスト発生予定`}
-            guardMessage={deepResearchGuardMessage}
-            disabled={!isAllowed("request_deep_research") || submitting}
+            guardMessage={targetedRerunGuardMessage}
+            disabled={!isAllowed("request_targeted_rerun") || submitting}
             block
-            onClick={() => void handleDecision("request_deep_research")}
+            onClick={() => void handleDecision("request_targeted_rerun")}
+          />
+          <DecisionButton
+            action="request_item_revision"
+            label="Item revision"
+            consequence="ResearchItemを見直す"
+            tone="warning"
+            disabled={!isAllowed("request_item_revision") || submitting}
+            block
+            onClick={() => void handleDecision("request_item_revision")}
           />
           <DecisionButton
             action="reject"
