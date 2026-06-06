@@ -2,7 +2,7 @@
  * SCR-3: Run Monitor — central hub for a single research run.
  *
  * Polling: statusPollInterval(status) drives getRunStatus; getReviews for history.
- * Header: StatusPill + ContextBadge + WebSearchBadge (from getTrackedRun; hidden if absent).
+ * Header: StatusPill + run metadata.
  * Notifications: fires on transition to completed / needs_human_review.
  * Cancel: calls cancelRun, then refetches.
  * No-progress heuristic: banner shown when needs_human_review OR latest two
@@ -19,8 +19,6 @@ import {
   ScoreChip,
   Skeleton,
   StatusPill,
-  ContextBadge,
-  WebSearchBadge,
   WaitBanner,
   EmptyState,
   type PipelineStep,
@@ -221,15 +219,6 @@ export function RunMonitor({ runId }: RunMonitorProps) {
         <div className="monitor-header-top">
           <div className="monitor-title-row">
             <StatusPill status={status} />
-            {tracked && (
-              <>
-                <ContextBadge context={tracked.context_classification} showLock />
-                <WebSearchBadge
-                  webSearchAllowed={tracked.web_search_allowed}
-                  context={tracked.context_classification}
-                />
-              </>
-            )}
             {connectionUnstable && (
               <span className="connection-warning" role="status">
                 接続が不安定です — 自動再試行中

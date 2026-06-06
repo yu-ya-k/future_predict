@@ -61,9 +61,6 @@ class ResearchRepository:
                     thread_id TEXT NOT NULL,
                     user_prompt TEXT NOT NULL,
                     optimized_prompt TEXT,
-                    context_classification TEXT NOT NULL DEFAULT 'public',
-                    web_search_allowed INTEGER NOT NULL DEFAULT 1,
-                    contains_confidential_context INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL,
                     report TEXT,
                     final_report TEXT,
@@ -194,7 +191,6 @@ class ResearchRepository:
         user_prompt: str,
         options: ResearchRunOptions,
         settings: Settings,
-        contains_confidential_context: bool,
     ) -> ResearchRunRecord:
         now = utc_now()
         run_id = uuid4()
@@ -206,21 +202,17 @@ class ResearchRepository:
             connection.execute(
                 """
                 INSERT INTO research_runs (
-                    id, thread_id, user_prompt, context_classification, web_search_allowed,
-                    contains_confidential_context, status, needs_human_review,
+                    id, thread_id, user_prompt, status, needs_human_review,
                     max_deep_research_runs, max_llm_fix_runs, max_total_iterations,
                     max_no_progress_rounds, max_total_tool_calls, max_cost_usd,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(run_id),
                     thread_id,
                     user_prompt,
-                    options.context_classification,
-                    int(options.allow_web_search),
-                    int(contains_confidential_context),
                     RunStatus.QUEUED.value,
                     options.max_deep_research_runs or settings.default_max_deep_research_runs,
                     options.max_llm_fix_runs or settings.default_max_llm_fix_runs,
@@ -776,9 +768,6 @@ class ResearchRepository:
             thread_id=row["thread_id"],
             user_prompt=row["user_prompt"],
             optimized_prompt=row["optimized_prompt"],
-            context_classification=row["context_classification"],
-            web_search_allowed=bool(row["web_search_allowed"]),
-            contains_confidential_context=bool(row["contains_confidential_context"]),
             status=RunStatus(row["status"]),
             report=row["report"],
             final_report=row["final_report"],

@@ -73,7 +73,7 @@ empty value overrides the code default, so set this explicitly for real Deep
 Research usage.
 
 Deep Research submissions call `responses.create` with `background=True`,
-optional web-search tooling, and a bounded `max_tool_calls`.
+web-search tooling, and a bounded `max_tool_calls`.
 
 ## Azure OpenAI: Reviewer And Finalizer
 
@@ -93,7 +93,7 @@ the Deep Research Azure client while still using
 `GPT5_5_AZURE_OPENAI_DEPLOYMENT_NAME` as the model/deployment name. Partial
 reviewer settings raise an incomplete-settings error.
 
-## Reserved Or Legacy Candidates
+## Reserved Candidate Variables
 
 `.env.example` includes:
 
@@ -103,7 +103,7 @@ reviewer settings raise an incomplete-settings error.
 - `GPT5_4_MINI_AZURE_OPENAI_DEPLOYMENT_NAME`
 
 Current application settings do not define or read these variables. They are
-reserved or legacy candidate values and are ignored by current runtime code.
+reserved candidate values and are ignored by current runtime code.
 
 ## Live API Test Gate
 

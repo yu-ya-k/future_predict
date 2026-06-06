@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-from api.research.schemas import ContextClassification
-
 
 def build_optimized_prompt(
     *,
     user_prompt: str,
-    context_classification: ContextClassification,
 ) -> tuple[str, list[str]]:
     acceptance_criteria = [
         "ユーザーの必須質問に直接回答している",
@@ -15,8 +12,6 @@ def build_optimized_prompt(
         "不確実性、前提、限界を明示している",
         "結論が根拠から過剰に飛躍していない",
     ]
-    if context_classification in {"internal", "confidential", "mixed"}:
-        acceptance_criteria.append("public claims と internal/confidential claims を混同していない")
 
     optimized_prompt = f"""# Research Objective
 {user_prompt}

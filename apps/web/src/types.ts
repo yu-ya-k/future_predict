@@ -29,8 +29,6 @@ export type HumanReviewAction =
   | "request_deep_research"
   | "reject";
 
-export type ContextClassification = "public" | "internal" | "confidential" | "mixed";
-
 // ── Request / response models ───────────────────────────────────────────────
 
 export interface ResearchRunOptions {
@@ -40,8 +38,6 @@ export interface ResearchRunOptions {
   max_no_progress_rounds?: number | null; // 1-10
   max_cost_usd?: number | null;
   max_total_tool_calls?: number | null;
-  allow_web_search?: boolean;
-  context_classification?: ContextClassification;
 }
 
 export interface CreateResearchRunRequest {

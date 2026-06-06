@@ -6,7 +6,7 @@
  *  2. NewResearch: start button disabled until prompt is entered; enabled after.
  *  3. HumanReview: actions not in allowed_actions are disabled; allowed actions enabled.
  *  4. App shell renders nav links.
- *  5. Settings page renders options and policy table.
+ *  5. Settings page renders the default option editor.
  *
  * Strategy:
  *  - Stub VITE_API_BASE_URL via vi.stubEnv.
@@ -17,7 +17,7 @@
  *  - Clean up with cleanup() + localStorage.clear() in afterEach.
  */
 
-import { render, screen, cleanup, waitFor } from "@testing-library/react";
+import { render, screen, cleanup, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -49,7 +49,7 @@ function clearStorage() {
   localStorage.clear();
 }
 
-function legacyFactoryDefaults() {
+function staleSavedFactoryDefaults() {
   return {
     max_deep_research_runs: 3,
     max_llm_fix_runs: 3,
@@ -185,13 +185,14 @@ describe("NewResearch (SCR-1)", () => {
     expect(counter).toBeInTheDocument();
   });
 
-  it("renders all 4 context classification options", () => {
+  it("renders the prompt and active guardrail controls", async () => {
     render(<App />);
 
-    expect(screen.getByText("公開情報")).toBeInTheDocument();
-    expect(screen.getByText("社内情報")).toBeInTheDocument();
-    expect(screen.getByText("機密情報")).toBeInTheDocument();
-    expect(screen.getByText("混合")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: /リサーチ内容/i })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /詳細オプション/i }));
+    const advancedOptions = screen.getByRole("group", { name: /詳細オプション/i });
+    expect(within(advancedOptions).getAllByRole("spinbutton")).toHaveLength(6);
   });
 
   it("submits a run and navigates to monitor on success", async () => {
@@ -221,7 +222,7 @@ describe("NewResearch (SCR-1)", () => {
     });
   });
 
-  it("submits API-aligned factory default guardrails", async () => {
+  it("submits only active API-aligned factory default guardrails", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 202,
@@ -246,12 +247,13 @@ describe("NewResearch (SCR-1)", () => {
     });
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     const body = JSON.parse(String(init.body)) as {
+      user_prompt: string;
       options: Record<string, unknown>;
     };
 
+    expect(Object.keys(body).sort()).toEqual(["options", "user_prompt"]);
+    expect(body.user_prompt).toBe("テスト用プロンプト");
     expect(body.options).toEqual({
-      context_classification: "public",
-      allow_web_search: true,
       max_deep_research_runs: 2,
       max_llm_fix_runs: 3,
       max_total_iterations: 5,
@@ -261,14 +263,14 @@ describe("NewResearch (SCR-1)", () => {
     });
   });
 
-  it("migrates legacy stored factory defaults before submitting", async () => {
-    localStorage.setItem("dro.defaults", JSON.stringify(legacyFactoryDefaults()));
+  it("normalizes stale saved factory defaults before submitting", async () => {
+    localStorage.setItem("dro.defaults", JSON.stringify(staleSavedFactoryDefaults()));
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 202,
       json: () =>
         Promise.resolve({
-          run_id: "run-legacy-defaults-test",
+          run_id: "run-stale-defaults-test",
           thread_id: "thread-1",
           status: "queued",
           created_at: new Date().toISOString(),
@@ -443,8 +445,8 @@ describe("Settings (SCR-7)", () => {
     expect(screen.getByLabelText(/最大ツール呼び出し数/i)).toHaveValue(120);
   });
 
-  it("migrates legacy saved factory defaults in settings", () => {
-    localStorage.setItem("dro.defaults", JSON.stringify(legacyFactoryDefaults()));
+  it("normalizes stale saved factory defaults in settings", () => {
+    localStorage.setItem("dro.defaults", JSON.stringify(staleSavedFactoryDefaults()));
 
     render(<App />);
 
@@ -454,10 +456,10 @@ describe("Settings (SCR-7)", () => {
     expect(screen.getByLabelText(/最大ツール呼び出し数/i)).toHaveValue(120);
   });
 
-  it("keeps user-modified saved defaults instead of migrating them", () => {
+  it("keeps user-modified saved defaults without normalization", () => {
     localStorage.setItem(
       "dro.defaults",
-      JSON.stringify({ ...legacyFactoryDefaults(), max_cost_usd: 7 }),
+      JSON.stringify({ ...staleSavedFactoryDefaults(), max_cost_usd: 7 }),
     );
 
     render(<App />);
@@ -468,13 +470,13 @@ describe("Settings (SCR-7)", () => {
     expect(screen.getByLabelText(/最大ツール呼び出し数/i)).toHaveValue(200);
   });
 
-  it("shows web search policy table with rows for all context types", () => {
+  it("renders only the default numeric editor", () => {
     render(<App />);
 
-    expect(screen.getByText(/Web検索ポリシー/i)).toBeInTheDocument();
-    // Header + 4 data rows = at least 5 rows
-    const rows = screen.getAllByRole("row");
-    expect(rows.length).toBeGreaterThanOrEqual(5);
+    const heading = screen.getByRole("heading", { name: /デフォルトオプション/i });
+    const section = heading.closest("section");
+    expect(section).not.toBeNull();
+    expect(within(section as HTMLElement).getAllByRole("spinbutton")).toHaveLength(6);
   });
 
   it("persists saved defaults to localStorage", async () => {

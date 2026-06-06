@@ -3,27 +3,18 @@
  *
  * No save API (整合注記: settings API not yet implemented).
  * Persists defaults to localStorage key "dro.defaults" so NewResearch can
- * read them. Displays web-search policy table (read-only, ContextBadge + WebSearchBadge).
- * Numeric inputs are bounded by OPTION_BOUNDS.
+ * read them. Numeric inputs are bounded by OPTION_BOUNDS.
  */
 
 import { useEffect, useState } from "react";
 
-import { ContextBadge, WebSearchBadge } from "../components";
 import {
   FACTORY_RESEARCH_DEFAULTS,
   loadResearchDefaults,
   saveResearchDefaults,
   type ResearchDefaults,
 } from "../researchDefaults";
-import { OPTION_BOUNDS, type ContextClassification } from "../types";
-
-const WEB_SEARCH_POLICY: { context: ContextClassification; allowed: boolean; note: string }[] = [
-  { context: "public", allowed: true, note: "Web検索有効" },
-  { context: "internal", allowed: false, note: "機密区分により無効" },
-  { context: "confidential", allowed: false, note: "機密区分により無効" },
-  { context: "mixed", allowed: false, note: "公開主張の範囲のみ（実質無効）" },
-];
+import { OPTION_BOUNDS } from "../types";
 
 export function Settings() {
   const [defaults, setDefaults] = useState<ResearchDefaults>(() => loadResearchDefaults());
@@ -191,39 +182,6 @@ export function Settings() {
         </div>
       </section>
 
-      {/* ── Web search policy (read-only) ─────────────────────────────────── */}
-      <section className="settings-section" aria-labelledby="policy-heading">
-        <h2 id="policy-heading" className="section-title">Web検索ポリシー</h2>
-        <p className="settings-policy-note">
-          機密区分によってWeb検索の可否が自動的に決まります（I-1）。
-        </p>
-        <table className="policy-table" aria-label="機密区分とWeb検索の対応表">
-          <thead>
-            <tr>
-              <th>機密区分</th>
-              <th>Web検索</th>
-              <th>備考</th>
-            </tr>
-          </thead>
-          <tbody>
-            {WEB_SEARCH_POLICY.map((row) => (
-              <tr key={row.context}>
-                <td>
-                  <ContextBadge context={row.context} showLock />
-                </td>
-                <td>
-                  <WebSearchBadge
-                    webSearchAllowed={row.allowed}
-                    context={row.context}
-                    showReason
-                  />
-                </td>
-                <td>{row.note}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </section>
     </div>
   );
 }

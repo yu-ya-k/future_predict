@@ -133,7 +133,7 @@ async def test_resume_api_approves_human_review_run(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_human_review_payload_filters_non_executable_deep_research_action(
+async def test_create_run_rejects_removed_context_and_web_search_options(
     tmp_path: Path,
 ) -> None:
     orchestrator = make_orchestrator(tmp_path, FakeAzure())
@@ -148,20 +148,64 @@ async def test_human_review_payload_filters_non_executable_deep_research_action(
             "/research-runs",
             json={
                 "user_prompt": "市場調査をしてください",
-                "options": {"allow_web_search": False},
+                "options": {
+                    "allow_web_search": False,
+                    "context_classification": "confidential",
+                },
             },
         )
-        run_id = create_response.json()["run_id"]
-        payload_response = await client.get(
-            f"/research-runs/{run_id}/human-review",
-            headers=REVIEWER_HEADERS,
+
+    assert create_response.status_code == 422
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("allow_web_search", False),
+        ("context_classification", "confidential"),
+    ],
+)
+async def test_create_run_rejects_removed_top_level_context_and_web_search_fields(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    orchestrator = make_orchestrator(tmp_path, FakeAzure())
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs",
+            json={
+                "user_prompt": "市場調査をしてください",
+                field: value,
+            },
         )
 
-    assert payload_response.status_code == 200
-    allowed_actions = payload_response.json()["allowed_actions"]
-    assert HumanReviewAction.REQUEST_DEEP_RESEARCH.value not in allowed_actions
-    assert HumanReviewAction.APPROVE.value in allowed_actions
-    assert HumanReviewAction.REJECT.value in allowed_actions
+    assert create_response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_openapi_create_request_does_not_expose_removed_options() -> None:
+    app = create_app()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.get("/openapi.json")
+
+    assert response.status_code == 200
+    schemas = response.json()["components"]["schemas"]
+    assert schemas["CreateResearchRunRequest"]["additionalProperties"] is False
+    option_properties = schemas["ResearchRunOptions"].get("properties", {})
+    assert "allow_web_search" not in option_properties
+    assert "context_classification" not in option_properties
 
 
 @pytest.mark.anyio
@@ -253,5 +297,11 @@ async def test_resume_api_rejects_run_not_waiting_for_human(tmp_path: Path) -> N
 def test_create_request_keeps_options_defaultable() -> None:
     request = CreateResearchRunRequest(user_prompt="調査してください")
 
-    assert request.options.allow_web_search is True
-    assert request.options.context_classification == "public"
+    assert request.options.model_dump() == {
+        "max_deep_research_runs": None,
+        "max_llm_fix_runs": None,
+        "max_total_iterations": None,
+        "max_no_progress_rounds": None,
+        "max_cost_usd": None,
+        "max_total_tool_calls": None,
+    }

@@ -40,6 +40,12 @@ human review, persistence, audit records, and local artifacts.
 The production HTTP path is `ResearchOrchestrator`; the graph module provides
 testable workflow shapes for the same route decisions.
 
+## MVP Scope
+
+The MVP treats every run as public Web Research. Web Search is required for
+Deep Research, reviewer checks, and finalization. The app does not accept or
+route on source categories or a per-run search-toggle policy.
+
 ## Statuses
 
 Runs use these status values:
@@ -78,7 +84,6 @@ guard:
 - `max_no_progress_rounds`
 - `max_cost_usd`
 - `max_total_tool_calls`
-- confidential context combined with web-search allowance
 - malformed or failed review output
 - missing report or missing response id
 - Deep Research terminal failure, unknown status, timeout, or submit failure
@@ -101,8 +106,8 @@ responses with billable metadata, and LLM finalization. Estimated cost is derive
 from the configured per-token and per-web-search rates. Tool calls are counted
 from extracted response tool-call summaries and stored for audit.
 
-Defaults come from `.env.example` and can be overridden per run through
-`ResearchRunOptions`.
+Defaults come from `.env.example` and the limit values can be overridden per
+run through `ResearchRunOptions`.
 
 ## Artifacts
 

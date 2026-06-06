@@ -73,28 +73,15 @@ def _valid_review_payload() -> str:
     )
 
 
-def test_deep_research_submit_applies_public_tool_policy() -> None:
+def test_deep_research_submit_always_includes_public_web_search_tool() -> None:
     fake_client = _FakeClient()
     client = AzureResponsesClient(settings=_settings(), client=fake_client)
 
     client.submit_deep_research(prompt="public research", max_tool_calls=10)
-    blocked_calls: list[dict[str, Any]] = [
-        {"prompt": "public research", "max_tool_calls": 10, "web_search_allowed": False},
-        {
-            "prompt": "public research",
-            "max_tool_calls": 10,
-            "context_classification": "internal",
-            "web_search_enabled": True,
-        },
-        {"prompt": "public research", "max_tool_calls": 10, "context_classification": "mixed"},
-        {"prompt": "社外秘の戦略を調査", "max_tool_calls": 10},
-    ]
-    for kwargs in blocked_calls:
-        with pytest.raises(ValueError, match="requires an enabled public web search"):
-            client.submit_deep_research(**kwargs)
+    client.submit_deep_research(prompt="社外秘の戦略を調査", max_tool_calls=10)
 
     tools_by_call = [call["tools"] for call in fake_client.responses.create_calls]
-    assert tools_by_call == [[{"type": "web_search_preview"}]]
+    assert tools_by_call == [[{"type": "web_search_preview"}]] * 2
 
 
 def test_review_report_falls_back_to_strict_schema_after_parse_api_error() -> None:
@@ -112,7 +99,6 @@ def test_review_report_falls_back_to_strict_schema_after_parse_api_error() -> No
         acceptance_criteria=[],
         report="report",
         citations=[],
-        web_search_enabled=False,
     )
 
     assert review.verdict == "pass"
@@ -120,6 +106,28 @@ def test_review_report_falls_back_to_strict_schema_after_parse_api_error() -> No
     assert raw_response["id"] == "resp_strict"
     assert fake_client.responses.parse_calls
     assert fake_client.responses.create_calls
+    assert fake_client.responses.parse_calls[0]["tools"] == [{"type": "web_search"}]
+    assert fake_client.responses.create_calls[0]["tools"] == [{"type": "web_search"}]
+
+
+def test_finalize_report_always_includes_web_search_tool() -> None:
+    fake_client = _FakeClient()
+    fake_client.responses.create_response = _Response(
+        response_id="resp_finalize",
+        output_text="final report",
+    )
+    client = AzureResponsesClient(settings=_settings(), client=fake_client)
+
+    report, response_id, raw_response = client.finalize_report(
+        user_prompt="prompt",
+        report="draft",
+        review={"rationale": "tighten wording"},
+    )
+
+    assert report == "final report"
+    assert response_id == "resp_finalize"
+    assert raw_response["id"] == "resp_finalize"
+    assert fake_client.responses.create_calls[0]["tools"] == [{"type": "web_search"}]
 
 
 def test_reviewer_client_uses_gpt_settings_when_present(monkeypatch: Any) -> None:

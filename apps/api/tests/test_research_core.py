@@ -28,7 +28,6 @@ from api.research.schemas import (
     Verdict,
     utc_now,
 )
-from api.research.security import should_enable_reviewer_web_search
 from api.research.service import ResearchOrchestrator
 
 
@@ -81,23 +80,13 @@ class FakeAzure:
         *,
         prompt: str,
         max_tool_calls: int,
-        web_search_enabled: bool | None = None,
-        context_classification: object = "public",
-        contains_confidential_context: bool | None = None,
-        web_search_allowed: bool = True,
     ) -> dict[str, object]:
         if self.submit_raises is not None:
             raise self.submit_raises
-        self.deep_research_web_search_enabled = bool(web_search_enabled)
+        self.deep_research_web_search_enabled = True
         self.submitted_prompts.append(prompt)
         self.submitted_max_tool_calls.append(max_tool_calls)
-        _ = (
-            max_tool_calls,
-            web_search_enabled,
-            context_classification,
-            contains_confidential_context,
-            web_search_allowed,
-        )
+        _ = max_tool_calls
         return {
             "id": f"resp_deep_{len(self.submitted_prompts)}",
             "status": "queued",
@@ -154,7 +143,7 @@ class FakeAzure:
         }
 
     def review_report(self, **kwargs: Any) -> tuple[ReviewResult, str, dict[str, object]]:
-        self.review_web_search_enabled = bool(kwargs["web_search_enabled"])
+        self.review_web_search_enabled = True
         verdict = (
             self.verdicts[self.review_calls]
             if self.review_calls < len(self.verdicts)
@@ -181,7 +170,7 @@ class FakeAzure:
                 requires_new_external_research=verdict == Verdict.NEEDS_DEEP_RESEARCH,
                 reviewer_confidence=self.reviewer_confidence,
                 high_risk_flags=self.high_risk_flags,
-                public_web_search_used=bool(kwargs["web_search_enabled"]),
+                public_web_search_used=True,
             ),
             f"resp_review_{self.review_calls}",
             {
@@ -464,22 +453,21 @@ def test_no_progress_ignores_empty_concern_lists_when_gaps_and_report_change() -
     assert no_progress == 0
 
 
-def test_confidential_context_disables_reviewer_web_search() -> None:
-    assert not should_enable_reviewer_web_search(
-        context_classification="confidential",
-        contains_confidential_context=False,
-        web_search_allowed=True,
+def test_confidential_words_in_prompt_do_not_block_public_web_research(
+    tmp_path: Path,
+) -> None:
+    fake = FakeAzure()
+    orchestrator = make_orchestrator(tmp_path, fake)
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(
+            user_prompt="社外秘や confidential internal KPI という語を含む公開調査",
+        )
     )
-    assert not should_enable_reviewer_web_search(
-        context_classification="public",
-        contains_confidential_context=True,
-        web_search_allowed=True,
-    )
-    assert should_enable_reviewer_web_search(
-        context_classification="public",
-        contains_confidential_context=False,
-        web_search_allowed=True,
-    )
+
+    assert run.status == RunStatus.WAITING_DEEP_RESEARCH
+    assert fake.submitted_prompts
+    assert fake.deep_research_web_search_enabled is True
 
 
 def test_completed_deep_research_is_reviewed_and_finalized(tmp_path: Path) -> None:
@@ -1124,65 +1112,25 @@ async def test_poller_tick_survives_repository_exception(tmp_path: Path) -> None
     await poller.tick()
 
 
-@pytest.mark.parametrize(
-    ("prompt", "options", "done_reason"),
-    [
-        (
-            "公開情報を調査してください",
-            ResearchRunOptions(allow_web_search=False),
-            "deep_research_web_search_disabled_by_run_option",
-        ),
-        (
-            "公開情報を調査してください",
-            ResearchRunOptions(context_classification="internal"),
-            "deep_research_web_search_blocked_internal_context",
-        ),
-        (
-            "公開情報を調査してください",
-            ResearchRunOptions(context_classification="confidential"),
-            "deep_research_web_search_blocked_confidential_context",
-        ),
-        (
-            "公開情報を調査してください",
-            ResearchRunOptions(context_classification="mixed"),
-            "deep_research_web_search_blocked_mixed_context",
-        ),
-        (
-            "社外秘: internal strategy を調査してください",
-            ResearchRunOptions(),
-            "deep_research_web_search_blocked_confidential_detected",
-        ),
-    ],
-)
-def test_non_public_or_web_disabled_run_stops_before_deep_research_submit(
+def test_public_web_research_submit_ignores_confidential_keyword_matches(
     tmp_path: Path,
-    prompt: str,
-    options: ResearchRunOptions,
-    done_reason: str,
 ) -> None:
     fake = FakeAzure()
     orchestrator = make_orchestrator(tmp_path, fake)
 
     run = orchestrator.create_run(
         CreateResearchRunRequest(
-            user_prompt=prompt,
-            options=options,
+            user_prompt="社外秘: internal strategy と API key という語を含む公開調査",
+            options=ResearchRunOptions(),
         )
     )
     history = orchestrator.repository.get_history(run.id)
 
-    assert run.status == RunStatus.NEEDS_HUMAN_REVIEW
-    assert run.done_reason == done_reason
-    assert run.deep_research_runs == 0
-    assert fake.submitted_prompts == []
-    assert fake.deep_research_web_search_enabled is None
-    assert history[-2]["step"] == "deep_research_submit_blocked"
-    assert history[-2]["reason"] == done_reason
-    payload = orchestrator.get_human_review_payload(run.id)
-    assert HumanReviewAction.APPROVE in payload.allowed_actions
-    assert HumanReviewAction.REJECT in payload.allowed_actions
-    assert HumanReviewAction.REQUEST_LLM_FIX in payload.allowed_actions
-    assert HumanReviewAction.REQUEST_DEEP_RESEARCH not in payload.allowed_actions
+    assert run.status == RunStatus.WAITING_DEEP_RESEARCH
+    assert run.deep_research_runs == 1
+    assert fake.submitted_prompts
+    assert fake.deep_research_web_search_enabled is True
+    assert not any(event["step"] == "deep_research_submit_blocked" for event in history)
 
 
 def test_human_resume_approve_finalizes_report(tmp_path: Path) -> None:

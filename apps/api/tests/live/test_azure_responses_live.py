@@ -62,7 +62,6 @@ def test_live_reviewer_structured_output_smoke(
             "この短いレポートは smoke test 用であり、詳細調査ではない。"
         ),
         citations=[],
-        web_search_enabled=False,
     )
 
     assert review.verdict in set(Verdict)
@@ -89,10 +88,6 @@ def test_live_deep_research_submit_retrieve_cancel_smoke(
                 "received. Do not perform broad research."
             ),
             max_tool_calls=1,
-            web_search_enabled=False,
-            context_classification="public",
-            contains_confidential_context=False,
-            web_search_allowed=False,
         )
         response_id = get_response_id(response)
         assert response_id
@@ -134,7 +129,6 @@ def test_live_reviewer_finalize_smoke(
             "rationale": "表現を簡潔に整える必要がある。",
             "gaps": ["構成を少し整える"],
         },
-        web_search_enabled=False,
     )
 
     assert report.strip()

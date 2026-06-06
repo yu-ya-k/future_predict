@@ -22,8 +22,6 @@ class RouteState(TypedDict, total=False):
     max_cost_usd: float
     total_tool_calls: int
     max_total_tool_calls: int
-    contains_confidential_context: bool
-    web_search_allowed: bool
 
 
 def route_after_review(state: RouteState) -> ReviewRoute:
@@ -77,9 +75,6 @@ def route_after_review(state: RouteState) -> ReviewRoute:
         return "human_review"
 
     if total_tool_calls >= max_total_tool_calls:
-        return "human_review"
-
-    if state.get("contains_confidential_context", False) and state.get("web_search_allowed", False):
         return "human_review"
 
     if verdict_value == Verdict.NEEDS_DEEP_RESEARCH.value:

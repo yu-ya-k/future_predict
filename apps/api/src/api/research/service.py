@@ -33,11 +33,6 @@ from api.research.schemas import (
     ReviewRecord,
     RunStatus,
 )
-from api.research.security import (
-    build_public_tool_policy,
-    contains_confidential_text,
-    should_enable_reviewer_web_search,
-)
 
 TERMINAL_FAILURE_STATUSES = {"failed", "cancelled", "incomplete"}
 TERMINAL_RUN_STATUSES = {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.FAILED}
@@ -59,12 +54,10 @@ class ResearchOrchestrator:
         self.azure = azure
 
     def create_run(self, request: CreateResearchRunRequest) -> ResearchRunRecord:
-        contains_confidential = contains_confidential_text(request.user_prompt)
         run = self.repository.create_run(
             user_prompt=request.user_prompt,
             options=request.options,
             settings=self.settings,
-            contains_confidential_context=contains_confidential,
         )
         return self.submit_deep_research(run.id)
 
@@ -79,7 +72,6 @@ class ResearchOrchestrator:
         if run.deep_research_runs == 0:
             optimized_prompt, acceptance_criteria = build_optimized_prompt(
                 user_prompt=run.user_prompt,
-                context_classification=run.context_classification,
             )
             prompt = optimized_prompt
             prompt_path, _ = self.artifacts.save_text(
@@ -121,40 +113,12 @@ class ResearchOrchestrator:
             )
 
         try:
-            public_tool_policy = build_public_tool_policy(
-                context_classification=run.context_classification,
-                contains_confidential_context=run.contains_confidential_context,
-                web_search_allowed=run.web_search_allowed,
-                tool_owner="deep_research",
-            )
-            if not public_tool_policy.web_search_enabled:
-                self.repository.append_history_event(
-                    run.id,
-                    {
-                        "step": "deep_research_submit_blocked",
-                        "reason": public_tool_policy.reason,
-                        "context_classification": run.context_classification,
-                        "contains_confidential_context": run.contains_confidential_context,
-                        "web_search_allowed": run.web_search_allowed,
-                    },
-                )
-                return self._enter_human_review(
-                    run.id,
-                    done_reason=public_tool_policy.reason,
-                    optimized_prompt=optimized_prompt,
-                    deep_research_status="blocked_before_submit",
-                )
-
             response = self.azure.submit_deep_research(
                 prompt=prompt,
                 max_tool_calls=min(
                     remaining_tool_calls,
                     self.settings.default_max_total_tool_calls,
                 ),
-                web_search_enabled=public_tool_policy.web_search_enabled,
-                context_classification=run.context_classification,
-                contains_confidential_context=run.contains_confidential_context,
-                web_search_allowed=run.web_search_allowed,
             )
             raw_path, _ = self.artifacts.save_json(
                 run.id,
@@ -414,17 +378,10 @@ class ResearchOrchestrator:
 
         previous_reviews = self.repository.get_reviews(run.id)
         acceptance_criteria = _acceptance_criteria_from_history(self.repository.get_history(run.id))
-        web_search_enabled = should_enable_reviewer_web_search(
-            context_classification=run.context_classification,
-            contains_confidential_context=run.contains_confidential_context,
-            web_search_allowed=run.web_search_allowed,
-        )
-
         try:
             review_result, response_id, raw_response = self._review_with_retry(
                 run=run,
                 acceptance_criteria=acceptance_criteria,
-                web_search_enabled=web_search_enabled,
             )
             run = self.repository.get_run(run.id)
             if _is_terminal_run_status(run.status):
@@ -529,8 +486,6 @@ class ResearchOrchestrator:
                 "max_cost_usd": run.max_cost_usd,
                 "total_tool_calls": next_total_tool_calls,
                 "max_total_tool_calls": run.max_total_tool_calls,
-                "contains_confidential_context": run.contains_confidential_context,
-                "web_search_allowed": run.web_search_allowed,
             }
         )
 
@@ -995,7 +950,6 @@ class ResearchOrchestrator:
         *,
         run: ResearchRunRecord,
         acceptance_criteria: list[str],
-        web_search_enabled: bool,
     ) -> tuple[Any, str | None, dict[str, Any]]:
         last_error: Exception | None = None
         citations = [citation.model_dump() for citation in self.repository.get_citations(run.id)]
@@ -1007,7 +961,6 @@ class ResearchOrchestrator:
                     acceptance_criteria=acceptance_criteria,
                     report=run.report or "",
                     citations=citations,
-                    web_search_enabled=web_search_enabled,
                 )
             except ReviewResponseParseError as error:
                 last_error = error
@@ -1274,16 +1227,10 @@ next_instructions: {review.next_instructions}
             result = custom_finalize(prompt=prompt, run=run)
             return _normalize_llm_finalize_result(result)
 
-        web_search_enabled = should_enable_reviewer_web_search(
-            context_classification=run.context_classification,
-            contains_confidential_context=run.contains_confidential_context,
-            web_search_allowed=run.web_search_allowed,
-        )
         revised_report, response_id, raw_response = self.azure.finalize_report(
             user_prompt=run.user_prompt,
             report=run.report or "",
             review={"prompt": prompt},
-            web_search_enabled=web_search_enabled,
         )
         if not revised_report:
             raise RuntimeError("LLM finalize returned an empty report.")
@@ -1352,16 +1299,6 @@ def _blocked_human_resume_reason(
 
     if run.no_progress_count >= run.max_no_progress_rounds:
         return "max_no_progress_rounds_reached"
-
-    if action == HumanReviewAction.REQUEST_DEEP_RESEARCH:
-        public_tool_policy = build_public_tool_policy(
-            context_classification=run.context_classification,
-            contains_confidential_context=run.contains_confidential_context,
-            web_search_allowed=run.web_search_allowed,
-            tool_owner="deep_research",
-        )
-        if not public_tool_policy.web_search_enabled:
-            return public_tool_policy.reason
 
     if (
         action == HumanReviewAction.REQUEST_DEEP_RESEARCH

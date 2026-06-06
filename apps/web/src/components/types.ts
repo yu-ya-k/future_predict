@@ -11,7 +11,6 @@
 import type { ReactNode } from "react";
 import type {
   Citation,
-  ContextClassification,
   HumanReviewAction,
   ReviewRecord,
   RunStatus,
@@ -23,23 +22,6 @@ export interface StatusPillProps {
   status: RunStatus;
   /** Force-disable progress animation (screenshots etc.). */
   staticMode?: boolean;
-}
-
-// 3-2 ContextBadge
-export interface ContextBadgeProps {
-  context: ContextClassification;
-  /** Add a lock icon (confidential / internal). */
-  showLock?: boolean;
-}
-
-// 3-3 WebSearchBadge
-export interface WebSearchBadgeProps {
-  webSearchAllowed: boolean;
-  context: ContextClassification;
-  /** Show a "disabled by classification" tooltip when off. */
-  showReason?: boolean;
-  /** Larger variant for SCR-1 banner. */
-  size?: "sm" | "lg";
 }
 
 // 3-4 VerdictBadge

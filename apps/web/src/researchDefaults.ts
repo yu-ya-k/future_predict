@@ -18,7 +18,7 @@ export const FACTORY_RESEARCH_DEFAULTS: ResearchDefaults = {
   max_total_tool_calls: 120,
 };
 
-const LEGACY_FACTORY_RESEARCH_DEFAULTS: ResearchDefaults = {
+const STALE_SAVED_FACTORY_DEFAULTS: ResearchDefaults = {
   max_deep_research_runs: 3,
   max_llm_fix_runs: 3,
   max_total_iterations: 10,
@@ -33,7 +33,7 @@ export function loadResearchDefaults(): ResearchDefaults {
     if (!raw) return { ...FACTORY_RESEARCH_DEFAULTS };
 
     const parsed = JSON.parse(raw) as Partial<ResearchDefaults>;
-    if (isLegacyFactoryDefaults(parsed)) {
+    if (isStaleSavedFactoryDefaults(parsed)) {
       saveResearchDefaults(FACTORY_RESEARCH_DEFAULTS);
       return { ...FACTORY_RESEARCH_DEFAULTS };
     }
@@ -52,13 +52,13 @@ export function saveResearchDefaults(defaults: ResearchDefaults): void {
   }
 }
 
-function isLegacyFactoryDefaults(defaults: Partial<ResearchDefaults>): boolean {
+function isStaleSavedFactoryDefaults(defaults: Partial<ResearchDefaults>): boolean {
   return (
-    defaults.max_deep_research_runs === LEGACY_FACTORY_RESEARCH_DEFAULTS.max_deep_research_runs &&
-    defaults.max_llm_fix_runs === LEGACY_FACTORY_RESEARCH_DEFAULTS.max_llm_fix_runs &&
-    defaults.max_total_iterations === LEGACY_FACTORY_RESEARCH_DEFAULTS.max_total_iterations &&
-    defaults.max_no_progress_rounds === LEGACY_FACTORY_RESEARCH_DEFAULTS.max_no_progress_rounds &&
-    defaults.max_cost_usd === LEGACY_FACTORY_RESEARCH_DEFAULTS.max_cost_usd &&
-    defaults.max_total_tool_calls === LEGACY_FACTORY_RESEARCH_DEFAULTS.max_total_tool_calls
+    defaults.max_deep_research_runs === STALE_SAVED_FACTORY_DEFAULTS.max_deep_research_runs &&
+    defaults.max_llm_fix_runs === STALE_SAVED_FACTORY_DEFAULTS.max_llm_fix_runs &&
+    defaults.max_total_iterations === STALE_SAVED_FACTORY_DEFAULTS.max_total_iterations &&
+    defaults.max_no_progress_rounds === STALE_SAVED_FACTORY_DEFAULTS.max_no_progress_rounds &&
+    defaults.max_cost_usd === STALE_SAVED_FACTORY_DEFAULTS.max_cost_usd &&
+    defaults.max_total_tool_calls === STALE_SAVED_FACTORY_DEFAULTS.max_total_tool_calls
   );
 }

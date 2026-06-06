@@ -5,8 +5,6 @@
 import "./components.css";
 
 export { StatusPill } from "./StatusPill";
-export { ContextBadge } from "./ContextBadge";
-export { WebSearchBadge } from "./WebSearchBadge";
 export { VerdictBadge } from "./VerdictBadge";
 export { ScoreChip } from "./ScoreChip";
 export { CostMeter } from "./CostMeter";

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -35,21 +35,20 @@ class HumanReviewAction(StrEnum):
     REJECT = "reject"
 
 
-ContextClassification = Literal["public", "internal", "confidential", "mixed"]
-
-
 class ResearchRunOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     max_deep_research_runs: int | None = Field(default=None, ge=1, le=5)
     max_llm_fix_runs: int | None = Field(default=None, ge=0, le=10)
     max_total_iterations: int | None = Field(default=None, ge=1, le=20)
     max_no_progress_rounds: int | None = Field(default=None, ge=1, le=10)
     max_cost_usd: float | None = Field(default=None, ge=0)
     max_total_tool_calls: int | None = Field(default=None, ge=1)
-    allow_web_search: bool = True
-    context_classification: ContextClassification = "public"
 
 
 class CreateResearchRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     user_prompt: str = Field(min_length=1, max_length=50000)
     options: ResearchRunOptions = Field(default_factory=ResearchRunOptions)
 
@@ -244,9 +243,6 @@ class ResearchRunRecord(BaseModel):
     thread_id: str
     user_prompt: str
     optimized_prompt: str | None
-    context_classification: ContextClassification
-    web_search_allowed: bool
-    contains_confidential_context: bool
     status: RunStatus
     report: str | None
     final_report: str | None

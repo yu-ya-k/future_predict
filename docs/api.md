@@ -16,9 +16,7 @@ curl -sS -X POST http://127.0.0.1:8000/research-runs \
       "max_total_iterations": 5,
       "max_no_progress_rounds": 2,
       "max_cost_usd": 20,
-      "max_total_tool_calls": 120,
-      "allow_web_search": true,
-      "context_classification": "public"
+      "max_total_tool_calls": 120
     }
   }'
 ```
@@ -34,7 +32,10 @@ Response status is `202 Accepted`:
 }
 ```
 
-`options` is optional. Defaults come from the API settings.
+`options` is optional. Defaults come from the API settings. The MVP product
+supports public Web Research only; Web Search is always enabled for research,
+review, and finalization. The create API does not accept source-category or
+search-toggle fields such as `context_classification` or `allow_web_search`.
 
 ## Status And Progress
 

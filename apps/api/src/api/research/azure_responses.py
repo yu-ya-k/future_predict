@@ -12,11 +12,7 @@ from api.research.extractors import (
     get_response_output_text,
     response_to_jsonable,
 )
-from api.research.schemas import REVIEW_RESULT_SCHEMA, ContextClassification, ReviewResult
-from api.research.security import (
-    contains_confidential_text,
-    should_enable_deep_research_web_search,
-)
+from api.research.schemas import REVIEW_RESULT_SCHEMA, ReviewResult
 
 
 class ReviewResponseParseError(ValueError):
@@ -81,29 +77,7 @@ class AzureResponsesClient:
         *,
         prompt: str,
         max_tool_calls: int,
-        web_search_enabled: bool | None = None,
-        context_classification: ContextClassification = "public",
-        contains_confidential_context: bool | None = None,
-        web_search_allowed: bool = True,
     ) -> Any:
-        confidential_detected = (
-            contains_confidential_text(prompt)
-            if contains_confidential_context is None
-            else contains_confidential_context
-        )
-        policy_allows_web_search = should_enable_deep_research_web_search(
-            context_classification=context_classification,
-            contains_confidential_context=confidential_detected,
-            web_search_allowed=web_search_allowed,
-        )
-        web_search_enabled = (
-            policy_allows_web_search
-            if web_search_enabled is None
-            else web_search_enabled and policy_allows_web_search
-        )
-        if not web_search_enabled:
-            raise ValueError("Deep Research requires an enabled public web search tool.")
-
         return self.deep_research_client.responses.create(
             model=self.deep_research_deployment,
             background=True,
@@ -126,7 +100,6 @@ class AzureResponsesClient:
         acceptance_criteria: list[str],
         report: str,
         citations: list[dict[str, Any]],
-        web_search_enabled: bool,
     ) -> tuple[ReviewResult, str | None, dict[str, Any]]:
         prompt = build_review_prompt(
             user_prompt=user_prompt,
@@ -135,7 +108,7 @@ class AzureResponsesClient:
             report=report,
             citations=citations,
         )
-        tools = [{"type": "web_search"}] if web_search_enabled else []
+        tools = [{"type": "web_search"}]
 
         parse_method = getattr(self.reviewer_client.responses, "parse", None)
         if callable(parse_method):
@@ -199,9 +172,8 @@ class AzureResponsesClient:
         user_prompt: str,
         report: str,
         review: dict[str, Any],
-        web_search_enabled: bool,
     ) -> tuple[str, str | None, dict[str, Any]]:
-        tools = [{"type": "web_search"}] if web_search_enabled else []
+        tools = [{"type": "web_search"}]
         response = self.reviewer_client.responses.create(
             model=self.reviewer_deployment,
             input=build_finalize_prompt(
@@ -237,13 +209,13 @@ def build_review_prompt(
 - 公式情報、一次情報、信頼できるソースが優先されているか
 - 出典から結論が過剰に飛躍していないか
 - 不確実性、限界、前提が明示されているか
-- 機密情報や高リスク領域が含まれていないか
+- 高リスク領域で自動判断が不適切ではないか
 
 verdict policy:
 - pass: 目的を達成し、重大な不足、誤り、出典問題がない。
 - needs_llm_fix: 概ね十分。軽微な不足、構成、表現、限定的事実確認のみで直せる。
 - needs_deep_research: 重大な欠落、調査範囲不足、ソース不足、矛盾、多段調査が必要。
-- human_review: 高リスク、機密懸念、判断不能、または自動継続が不適切。
+- human_review: 高リスク、判断不能、または自動継続が不適切。
 
 必ず ReviewResult schema に厳密準拠して返してください。
 

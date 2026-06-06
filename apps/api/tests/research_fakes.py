@@ -52,10 +52,6 @@ class IntegrationFakeAzure:
         *,
         prompt: str,
         max_tool_calls: int,
-        web_search_enabled: bool | None = None,
-        context_classification: object = "public",
-        contains_confidential_context: bool | None = None,
-        web_search_allowed: bool = True,
     ) -> dict[str, object]:
         if self.submit_raises is not None:
             raise self.submit_raises
@@ -64,10 +60,6 @@ class IntegrationFakeAzure:
             {
                 "prompt": prompt,
                 "max_tool_calls": max_tool_calls,
-                "web_search_enabled": web_search_enabled,
-                "context_classification": context_classification,
-                "contains_confidential_context": contains_confidential_context,
-                "web_search_allowed": web_search_allowed,
             }
         )
         return {
@@ -148,7 +140,7 @@ class IntegrationFakeAzure:
                 requires_new_external_research=verdict == Verdict.NEEDS_DEEP_RESEARCH,
                 reviewer_confidence=90,
                 high_risk_flags=[],
-                public_web_search_used=bool(kwargs["web_search_enabled"]),
+                public_web_search_used=True,
             ),
             response_id,
             {"id": response_id, "status": "completed", "usage": self.review_usage},

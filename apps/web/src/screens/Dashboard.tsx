@@ -14,12 +14,10 @@
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 
 import {
-  ContextBadge,
   EmptyState,
   ScoreChip,
   Skeleton,
   StatusPill,
-  WebSearchBadge,
 } from "../components";
 import { listHumanReviews, getRunStatus } from "../api/research";
 import { ApiError } from "../api/client";
@@ -86,11 +84,6 @@ function RunCard({ tracked, liveStatus }: RunCardProps) {
       <div className="run-card-header">
         <div className="run-card-badges">
           <StatusPill status={status} />
-          <ContextBadge context={tracked.context_classification} showLock />
-          <WebSearchBadge
-            webSearchAllowed={tracked.web_search_allowed}
-            context={tracked.context_classification}
-          />
         </div>
         {score !== null && <ScoreChip score={score} />}
       </div>

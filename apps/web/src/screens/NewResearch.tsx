@@ -2,7 +2,6 @@
  * SCR-1: New Research — create a new research run.
  *
  * Integrations:
- *  - I-1: web_search is disabled for internal/confidential; mixed → public-claim note.
  *  - OPTION_BOUNDS: bounded numeric inputs.
  *  - requestNotificationPermission before submit.
  *  - createRun → trackRun → navigate to monitor.
@@ -14,7 +13,6 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import { WebSearchBadge } from "../components";
 import { createRun } from "../api/research";
 import { ApiError } from "../api/client";
 import { requestNotificationPermission } from "../notifications";
@@ -25,27 +23,14 @@ import {
 } from "../researchDefaults";
 import { navigate, routes } from "../router";
 import { trackRun } from "../runStore";
-import { OPTION_BOUNDS, type ContextClassification } from "../types";
+import { OPTION_BOUNDS } from "../types";
 
 const MAX_PROMPT_CHARS = 50_000;
-
-function deriveWebSearch(ctx: ContextClassification): boolean {
-  // I-1: only public allows web search
-  return ctx === "public";
-}
-
-const CONTEXT_OPTIONS: { value: ContextClassification; label: string; description: string }[] = [
-  { value: "public", label: "公開情報", description: "公開情報のみ。Web検索を有効化できます。" },
-  { value: "internal", label: "社内情報", description: "社内情報を含む。Web検索は無効です。" },
-  { value: "confidential", label: "機密情報", description: "機密扱い。Web検索は無効です。" },
-  { value: "mixed", label: "混合", description: "公開・社内が混在。公開主張の範囲のみ。" },
-];
 
 export function NewResearch() {
   const defaults = useRef(loadResearchDefaults());
 
   const [prompt, setPrompt] = useState("");
-  const [context, setContext] = useState<ContextClassification>("public");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -86,7 +71,6 @@ export function NewResearch() {
     return () => window.removeEventListener("storage", onStorage);
   }, []);
 
-  const webSearchAllowed = deriveWebSearch(context);
   const promptTrimmed = prompt.trim();
   const canSubmit = promptTrimmed.length > 0 && promptTrimmed.length <= MAX_PROMPT_CHARS && !submitting;
 
@@ -102,8 +86,6 @@ export function NewResearch() {
       const response = await createRun({
         user_prompt: promptTrimmed,
         options: {
-          context_classification: context,
-          allow_web_search: webSearchAllowed,
           max_deep_research_runs: maxDeepResearch,
           max_llm_fix_runs: maxLlmFix,
           max_total_iterations: maxIterations,
@@ -119,8 +101,6 @@ export function NewResearch() {
       trackRun({
         run_id: response.run_id,
         title,
-        context_classification: context,
-        web_search_allowed: webSearchAllowed,
         max_cost_usd: maxCost,
         max_total_iterations: maxIterations,
         created_at: response.created_at,
@@ -180,48 +160,6 @@ export function NewResearch() {
                 ? `${Math.abs(remaining).toLocaleString()} 文字オーバー`
                 : `残り ${remaining.toLocaleString()} 文字`}
             </span>
-          </div>
-        </section>
-
-        {/* Context classification */}
-        <section className="form-section">
-          <div className="form-label-row">
-            <span className="form-label" id="context-label">機密区分</span>
-            <WebSearchBadge
-              webSearchAllowed={webSearchAllowed}
-              context={context}
-              showReason
-              size="sm"
-            />
-          </div>
-          {context === "mixed" && (
-            <p className="mixed-note" role="note">
-              混合区分では公開情報の主張範囲のみWeb検索が許可されます。
-            </p>
-          )}
-          <div
-            className="context-cards"
-            role="radiogroup"
-            aria-labelledby="context-label"
-          >
-            {CONTEXT_OPTIONS.map((opt) => (
-              <label
-                key={opt.value}
-                className={`context-card${context === opt.value ? " context-card--selected" : ""}`}
-              >
-                <input
-                  type="radio"
-                  name="context"
-                  value={opt.value}
-                  checked={context === opt.value}
-                  onChange={() => setContext(opt.value)}
-                  disabled={submitting}
-                  className="sr-only"
-                />
-                <span className="context-card-label">{opt.label}</span>
-                <span className="context-card-desc">{opt.description}</span>
-              </label>
-            ))}
           </div>
         </section>
 

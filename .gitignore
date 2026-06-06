@@ -28,6 +28,7 @@ build/
 
 # Local temporary files
 tmp/
+.data/
 
 # Node / frontend
 node_modules/
