@@ -53,10 +53,12 @@ from api.research.schemas import (
     ForkPreviewResponse,
     ForkSubmitResponse,
     HumanReviewAction,
+    HumanReviewActionState,
     HumanReviewAuditSummary,
     HumanReviewPayload,
     HumanReviewQueueItem,
     HumanReviewResumeRequest,
+    HumanReviewRouteSummary,
     ItemStatus,
     QueryPolicyDecision,
     RecommendedAction,
@@ -71,6 +73,8 @@ from api.research.schemas import (
     ReviewRecord,
     RunStatus,
     Severity,
+    SuggestedRerunPrompt,
+    Verdict,
     VerificationQuery,
     utc_now,
 )
@@ -78,6 +82,11 @@ from api.research.schemas import (
 TERMINAL_FAILURE_STATUSES = {"failed", "cancelled", "incomplete"}
 TERMINAL_RUN_STATUSES = {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.FAILED}
 NON_TERMINAL_RUN_STATUSES = set(RunStatus) - TERMINAL_RUN_STATUSES
+MANUAL_RERUN_PROMPT_BLOCKED_REASON = "manual_rerun_prompt_blocked_by_query_policy"
+MANUAL_RERUN_ACTION_SCOPES = {
+    HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN: "targeted_gap_closure",
+    HumanReviewAction.REQUEST_MANUAL_FULL_RERUN: "full_rerun",
+}
 
 
 class ResearchOrchestrator:
@@ -117,11 +126,7 @@ class ResearchOrchestrator:
         mode = rerun_execution_mode or (
             RerunExecutionMode.API if allow_api_reruns else RerunExecutionMode.DISABLED
         )
-        if mode == RerunExecutionMode.MANUAL_CHATGPT and not allow_api_reruns:
-            raise ValueError(
-                "manual_chatgpt rerun execution requires allow_api_reruns=true."
-            )
-        if not allow_api_reruns:
+        if not allow_api_reruns and mode == RerunExecutionMode.API:
             mode = RerunExecutionMode.DISABLED
         if mode == RerunExecutionMode.DISABLED:
             options = options.model_copy(
@@ -529,10 +534,6 @@ class ResearchOrchestrator:
         report_text: str,
     ) -> ResearchRunRecord:
         run = self.repository.get_run(run_id)
-        if not self._is_manual_upload_run(run.id):
-            raise ValueError("Manual rerun results are only accepted for manual imports.")
-        if run.rerun_execution_mode != RerunExecutionMode.MANUAL_CHATGPT:
-            raise ValueError("Run is not configured for manual ChatGPT reruns.")
 
         result = report_text.strip()
         if not result:
@@ -1601,6 +1602,11 @@ class ResearchOrchestrator:
             latest_review=self._latest_review(run.id),
         )
         pending_manual_rerun = self.repository.get_active_manual_rerun_request(run.id)
+        query_policy_blocked_actions = (
+            {}
+            if pending_manual_rerun
+            else self._manual_rerun_query_policy_blocked_actions(run)
+        )
         return HumanReviewPayload(
             run_id=run.id,
             reason=run.done_reason or (latest_review.rationale if latest_review else ""),
@@ -1617,10 +1623,27 @@ class ResearchOrchestrator:
                     ItemStatus.UNVERIFIABLE,
                 }
             ],
-            allowed_actions=[] if pending_manual_rerun else _allowed_human_review_actions(run),
+            allowed_actions=[]
+            if pending_manual_rerun
+            else _allowed_human_review_actions(
+                run,
+                query_policy_blocked_actions=query_policy_blocked_actions,
+            ),
+            action_states=_human_review_action_states(
+                run,
+                pending_manual_rerun=pending_manual_rerun is not None,
+                query_policy_blocked_actions=query_policy_blocked_actions,
+            ),
+            route_summary=_human_review_route_summary(
+                self.repository.get_history(run.id),
+                latest_review=latest_review,
+            ),
             audit_summary=self._human_review_audit_summary(run),
             warnings=run.warnings,
             pending_manual_rerun=pending_manual_rerun,
+            suggested_rerun=None
+            if pending_manual_rerun
+            else self._build_suggested_rerun_prompt(run, latest_review=latest_review),
         )
 
     def get_cost_events(self, run_id: UUID) -> list[CostEvent]:
@@ -2226,6 +2249,31 @@ class ResearchOrchestrator:
                 f"Human review action {request.action.value!r} is blocked by {blocked_reason}."
             )
 
+        query_policy_decision = self._manual_rerun_query_policy_decision(
+            pending_run,
+            action=request.action,
+            human_comment=request.comment,
+        )
+        if (
+            query_policy_decision is not None
+            and query_policy_decision.status != "allowed"
+        ):
+            self.repository.append_history_event(
+                pending_run.id,
+                {
+                    "step": "human_review_resume_blocked",
+                    "action": request.action.value,
+                    "reason": MANUAL_RERUN_PROMPT_BLOCKED_REASON,
+                    "comment": request.comment,
+                    "policy_status": query_policy_decision.status,
+                    "policy_reason": query_policy_decision.blocked_reason,
+                },
+            )
+            raise ValueError(
+                f"Human review action {request.action.value!r} is blocked by "
+                f"{MANUAL_RERUN_PROMPT_BLOCKED_REASON}."
+            )
+
         claimed = self.repository.claim_human_review_decision(
             run_id,
             action=request.action,
@@ -2315,6 +2363,19 @@ class ResearchOrchestrator:
                     scope="full_rerun",
                 )
             return self.submit_deep_research(
+                run.id,
+                human_comment=request.comment,
+                scope="full_rerun",
+            )
+
+        if request.action == HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN:
+            return self._request_manual_chatgpt_rerun(
+                run.id,
+                human_comment=request.comment,
+            )
+
+        if request.action == HumanReviewAction.REQUEST_MANUAL_FULL_RERUN:
+            return self._request_manual_chatgpt_rerun(
                 run.id,
                 human_comment=request.comment,
                 scope="full_rerun",
@@ -2865,9 +2926,103 @@ class ResearchOrchestrator:
         )
 
     def _should_use_manual_chatgpt_rerun(self, run: ResearchRunRecord) -> bool:
-        return (
-            run.rerun_execution_mode == RerunExecutionMode.MANUAL_CHATGPT
-            and self._is_manual_upload_run(run.id)
+        return run.rerun_execution_mode == RerunExecutionMode.MANUAL_CHATGPT
+
+    def _manual_rerun_query_policy_decision(
+        self,
+        run: ResearchRunRecord,
+        *,
+        action: HumanReviewAction,
+        human_comment: str | None,
+    ) -> QueryPolicyDecision | None:
+        scope = MANUAL_RERUN_ACTION_SCOPES.get(action)
+        if scope is None:
+            return None
+        if _blocked_human_resume_reason(run, action) is not None:
+            return None
+        plan = self._build_rerun_plan(run, human_comment=human_comment, scope=scope)
+        prompt = self._build_rerun_brief(
+            run,
+            human_comment=human_comment,
+            plan=plan,
+        )
+        return _deep_research_query_policy_decision(prompt)
+
+    def _manual_rerun_query_policy_blocked_actions(
+        self,
+        run: ResearchRunRecord,
+    ) -> dict[HumanReviewAction, QueryPolicyDecision]:
+        blocked: dict[HumanReviewAction, QueryPolicyDecision] = {}
+        for action in MANUAL_RERUN_ACTION_SCOPES:
+            decision = self._manual_rerun_query_policy_decision(
+                run,
+                action=action,
+                human_comment=None,
+            )
+            if decision is not None and decision.status != "allowed":
+                blocked[action] = decision
+        return blocked
+
+    def _build_suggested_rerun_prompt(
+        self,
+        run: ResearchRunRecord,
+        *,
+        latest_review: ReviewRecord | None,
+    ) -> SuggestedRerunPrompt | None:
+        manual_full_allowed = (
+            _blocked_human_resume_reason(
+                run,
+                HumanReviewAction.REQUEST_MANUAL_FULL_RERUN,
+            )
+            is None
+        )
+        manual_targeted_allowed = (
+            _blocked_human_resume_reason(
+                run,
+                HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN,
+            )
+            is None
+        )
+        done_reason = run.done_reason or ""
+        scope: str | None = None
+        if (
+            manual_full_allowed
+            and (
+                (
+                    latest_review is not None
+                    and latest_review.verdict == Verdict.NEEDS_FULL_RERUN
+                )
+                or "full_rerun" in done_reason
+            )
+        ):
+            scope = "full_rerun"
+        elif (
+            manual_targeted_allowed
+            and (
+                (
+                    latest_review is not None
+                    and latest_review.verdict == Verdict.NEEDS_TARGETED_RERUN
+                )
+                or "targeted_rerun" in done_reason
+            )
+        ):
+            scope = "targeted_rerun"
+        if scope is None:
+            return None
+
+        plan = self._build_rerun_plan(run, human_comment=None, scope=scope)
+        prompt = self._build_rerun_brief(run, human_comment=None, plan=plan)
+        query_policy = _deep_research_query_policy_decision(prompt)
+        if query_policy.status != "allowed":
+            return None
+        return SuggestedRerunPrompt(
+            scope=scope,
+            expected_output_kind=_expected_rerun_output_kind(scope),
+            expected_run_no=run.deep_research_runs + 1,
+            prompt=prompt,
+            target_item_ids=plan.target_item_ids,
+            query_policy=query_policy,
+            base_report_hash=report_hash(run.report) if run.report else None,
         )
 
     def _build_rerun_brief(
@@ -2902,6 +3057,15 @@ rationale: {latest_review.rationale}"""
             else latest_review.next_instructions
         )
         human_block = human_comment or "None."
+        output_contract = (
+            """Expected output: complete_replacement_report.
+Return the final report body only. Do not return rerun analysis, a plan, a checklist,
+or commentary about what you would do."""
+            if plan.scope == "full_rerun"
+            else """Expected output: targeted_delta_sections.
+Return only the item-scoped additions or replacement sections needed to patch the
+previous report. Do not return a full merged report."""
+        )
         rerun_policy = (
             """You are rebuilding the report because the current report or contract execution
 was judged unusable. Address the full Objective Contract and all ResearchItems.
@@ -2918,6 +3082,9 @@ Do not rewrite preserved sections or preserved ResearchItems."""
         )
         return f"""# Original User Prompt
 {run.user_prompt}
+
+# Output Contract
+{output_contract}
 
 # Original Research Brief
 {run.optimized_prompt or run.user_prompt}
@@ -2987,6 +3154,17 @@ previous report, review, or human comment is in another language.
         if not target_item_ids:
             target_item_ids = [item.item_id for item in items[:1]]
         target_items = [item for item in items if item.item_id in set(target_item_ids)]
+        forbidden_changes = (
+            [
+                "Do not omit required Objective Contract sections.",
+                "Do not return rerun analysis or a plan instead of the final report.",
+            ]
+            if scope == "full_rerun"
+            else [
+                "Do not rewrite accepted sections.",
+                "Do not return a full merged report.",
+            ]
+        )
         return RerunPlan(
             rerun_id=f"RR-{uuid4()}",
             scope=scope,
@@ -3002,10 +3180,8 @@ previous report, review, or human comment is in another language.
                 for tool in self.repository.get_tool_calls(run.id)
                 if tool.query
             ],
-            forbidden_changes=[
-                "Do not rewrite accepted sections.",
-                "Do not return a full merged report.",
-            ],
+            forbidden_changes=forbidden_changes,
+            output_mode=_expected_rerun_output_kind(scope),
             max_tool_calls=min(
                 80 if scope == "full_rerun" else 25,
                 max(1, run.max_total_tool_calls - run.total_tool_calls),
@@ -3624,12 +3800,85 @@ def _human_review_route_reason(review: ReviewRecord) -> str:
     return f"review_route_{review.verdict.value}"
 
 
-def _allowed_human_review_actions(run: ResearchRunRecord) -> list[HumanReviewAction]:
+def _allowed_human_review_actions(
+    run: ResearchRunRecord,
+    *,
+    query_policy_blocked_actions: (
+        dict[HumanReviewAction, QueryPolicyDecision] | None
+    ) = None,
+) -> list[HumanReviewAction]:
+    query_policy_blocked_actions = query_policy_blocked_actions or {}
     return [
         action
         for action in HumanReviewAction
         if _blocked_human_resume_reason(run, action) is None
+        and action not in query_policy_blocked_actions
     ]
+
+
+def _human_review_action_states(
+    run: ResearchRunRecord,
+    *,
+    pending_manual_rerun: bool = False,
+    query_policy_blocked_actions: (
+        dict[HumanReviewAction, QueryPolicyDecision] | None
+    ) = None,
+) -> list[HumanReviewActionState]:
+    query_policy_blocked_actions = query_policy_blocked_actions or {}
+    states: list[HumanReviewActionState] = []
+    for action in HumanReviewAction:
+        blocked_reason = (
+            "manual_chatgpt_rerun_pending"
+            if pending_manual_rerun
+            else _blocked_human_resume_reason(run, action)
+        )
+        if blocked_reason is None and action in query_policy_blocked_actions:
+            blocked_reason = MANUAL_RERUN_PROMPT_BLOCKED_REASON
+        states.append(
+            HumanReviewActionState(
+                action=action,
+                allowed=blocked_reason is None,
+                blocked_reason=blocked_reason,
+            )
+        )
+    return states
+
+
+def _expected_rerun_output_kind(scope: str) -> str:
+    return (
+        "complete_replacement_report"
+        if scope == "full_rerun"
+        else "targeted_delta_sections"
+    )
+
+
+def _human_review_route_summary(
+    history: list[dict[str, Any]],
+    *,
+    latest_review: ReviewRecord | None,
+) -> HumanReviewRouteSummary | None:
+    route_events = [
+        event
+        for event in history
+        if event.get("step") == "route_after_review"
+    ]
+    if not route_events and latest_review is None:
+        return None
+    latest_event: dict[str, Any] = route_events[-1] if route_events else {}
+    dominant_actions_raw = latest_event.get("dominant_actions")
+    dominant_actions: list[str] = []
+    if isinstance(dominant_actions_raw, list):
+        dominant_actions = [
+            str(action) for action in cast(list[object], dominant_actions_raw)
+        ]
+    return HumanReviewRouteSummary(
+        candidate_route=cast(str | None, latest_event.get("candidate_route")),
+        selected_route=cast(str | None, latest_event.get("selected_route")),
+        blocked_reason=cast(str | None, latest_event.get("blocked_reason")),
+        dominant_actions=dominant_actions,
+        latest_review_no=latest_review.review_no if latest_review else None,
+        latest_verdict=latest_review.verdict if latest_review else None,
+    )
 
 
 def _route_budget_snapshot(route_state: RouteState) -> dict[str, object]:
@@ -3680,13 +3929,18 @@ def _blocked_human_resume_reason(
     if action == HumanReviewAction.REQUEST_VERIFICATION and run.total_reviews == 0:
         return "missing_review_for_verification"
 
-    if action == HumanReviewAction.REQUEST_TARGETED_RERUN and not run.report:
+    if action in {
+        HumanReviewAction.REQUEST_TARGETED_RERUN,
+        HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN,
+    } and not run.report:
         return "missing_report_for_targeted_rerun_use_full_rerun"
 
     if action not in {
         HumanReviewAction.REQUEST_LLM_PATCH,
         HumanReviewAction.REQUEST_TARGETED_RERUN,
         HumanReviewAction.REQUEST_FULL_RERUN,
+        HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN,
+        HumanReviewAction.REQUEST_MANUAL_FULL_RERUN,
         HumanReviewAction.REQUEST_VERIFICATION,
         HumanReviewAction.REQUEST_ITEM_REVISION,
     }:
@@ -3701,6 +3955,8 @@ def _blocked_human_resume_reason(
     if run.no_progress_count >= 2 and action not in {
         HumanReviewAction.REQUEST_TARGETED_RERUN,
         HumanReviewAction.REQUEST_FULL_RERUN,
+        HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN,
+        HumanReviewAction.REQUEST_MANUAL_FULL_RERUN,
         HumanReviewAction.REQUEST_ITEM_REVISION,
     }:
         return "max_no_progress_count_reached"

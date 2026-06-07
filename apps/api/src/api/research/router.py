@@ -715,12 +715,7 @@ def _parse_rerun_execution_mode(
             status_code=422,
             detail="rerun_execution_mode must be one of: api, manual_chatgpt, disabled.",
         ) from error
-    if mode == RerunExecutionMode.MANUAL_CHATGPT and not allow_api_reruns:
-        raise HTTPException(
-            status_code=422,
-            detail="manual_chatgpt rerun execution requires allow_api_reruns=true.",
-        )
-    if not allow_api_reruns:
+    if not allow_api_reruns and mode == RerunExecutionMode.API:
         return RerunExecutionMode.DISABLED
     return mode
 

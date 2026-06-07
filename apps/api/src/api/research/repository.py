@@ -1986,6 +1986,11 @@ class ResearchRepository:
         return ManualRerunPrompt(
             rerun_id=plan.rerun_id,
             scope=plan.scope,
+            expected_output_kind=(
+                "complete_replacement_report"
+                if plan.scope == "full_rerun"
+                else "targeted_delta_sections"
+            ),
             expected_run_no=expected_run_no,
             prompt=prompt,
             prompt_artifact_path=prompt_artifact_path,
@@ -2748,6 +2753,11 @@ class ResearchRepository:
         return ManualRerunPrompt(
             rerun_id=row["rerun_id"],
             scope=row["scope"],
+            expected_output_kind=(
+                "complete_replacement_report"
+                if row["scope"] == "full_rerun"
+                else "targeted_delta_sections"
+            ),
             expected_run_no=int(row["expected_run_no"]),
             prompt=row["prompt"],
             prompt_artifact_path=row["prompt_artifact_path"],

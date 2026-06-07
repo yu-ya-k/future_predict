@@ -55,10 +55,82 @@ const ITEM_SEVERITY_LABEL: Record<ResearchItem["severity"], string> = {
   minor: "Minor",
 };
 
+const BLOCKED_REASON_LABELS: Record<string, string> = {
+  manual_chatgpt_rerun_pending: "ChatGPT手動rerunの結果アップロード待ちです。",
+  missing_report_for_approval: "承認できるレポート本文がありません。",
+  missing_report_for_review_retry: "再レビューできるレポート本文がありません。",
+  missing_report_for_llm_patch: "差分修正できるレポート本文がありません。",
+  missing_review_for_verification: "検証には先にLLMレビューが必要です。",
+  missing_report_for_targeted_rerun_use_full_rerun:
+    "対象itemだけ再実行できるレポート本文がありません。全面再実行を使ってください。",
+  max_total_tool_calls_reached: "総ツール呼び出し上限に達しています。",
+  max_total_iterations_reached: "総反復回数の上限に達しています。",
+  max_no_progress_count_reached: "改善停滞が続いたため、この自動処理は停止しています。",
+  max_targeted_rerun_runs_reached: "API Targeted rerun回数の上限に達しています。",
+  max_full_rerun_runs_reached: "API Full rerun回数の上限に達しています。",
+  max_llm_patch_runs_reached: "LLM patch回数の上限に達しています。",
+  max_verification_runs_reached: "Verification回数の上限に達しています。",
+  review_retry_available_only_after_review_error:
+    "レビュー再実行はレビューエラー後だけ選択できます。",
+};
+
+function formatBlockedReason(reason?: string | null): string | undefined {
+  if (!reason) return undefined;
+  return BLOCKED_REASON_LABELS[reason] ?? `停止理由: ${reason}`;
+}
+
+function expectedOutputLabel(kind?: string | null, scope?: string | null): string {
+  if (kind === "complete_replacement_report" || scope === "full_rerun") {
+    return "完成版レポート全文";
+  }
+  return "差分セクション";
+}
+
+function stopReasonSummary(payload: HumanReviewPayload): string | null {
+  const reason = payload.reason;
+  const summary = payload.route_summary;
+  const verdict = summary?.latest_verdict ?? payload.latest_review?.verdict ?? null;
+  if (
+    reason === "max_full_rerun_runs_reached" ||
+    summary?.blocked_reason === "max_full_rerun_runs_reached"
+  ) {
+    return `LLMレビューは完了しています。判定は ${verdict ?? "needs_full_rerun"} で、API自動Full rerunは上限に達しました。ChatGPT手動Fullが有効なら、完成版レポート全文を手動で作成してアップロードできます。`;
+  }
+  if (
+    reason === "max_targeted_rerun_runs_reached" ||
+    summary?.blocked_reason === "max_targeted_rerun_runs_reached"
+  ) {
+    return `LLMレビューは完了しています。判定は ${verdict ?? "needs_targeted_rerun"} で、API自動Targeted rerunは上限に達しました。ChatGPT手動Targetedが有効なら、未解決item向けの差分を手動で作成してアップロードできます。`;
+  }
+  if (summary?.candidate_route || summary?.selected_route || summary?.blocked_reason) {
+    return [
+      summary.candidate_route ? `候補: ${summary.candidate_route}` : null,
+      summary.selected_route ? `選択: ${summary.selected_route}` : null,
+      summary.blocked_reason ? `ブロック: ${summary.blocked_reason}` : null,
+    ]
+      .filter(Boolean)
+      .join(" / ");
+  }
+  return null;
+}
+
 function safeManualRerunFilename(runId: string, rerunId: string): string {
   const safeRunId = runId.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
   const safeRerunId = rerunId.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
   return `${safeRunId || "research-run"}-${safeRerunId || "manual-rerun"}-prompt.md`;
+}
+
+function safeSuggestedRerunFilename(runId: string, scope: string): string {
+  const safeRunId = runId.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  const safeScope = scope.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return `${safeRunId || "research-run"}-${safeScope || "rerun"}-suggested-prompt.md`;
+}
+
+function isManualRerunRequest(action: HumanReviewAction): boolean {
+  return (
+    action === "request_manual_targeted_rerun" ||
+    action === "request_manual_full_rerun"
+  );
 }
 
 function downloadMarkdown(filename: string, markdown: string) {
@@ -147,6 +219,10 @@ export function HumanReview({ runId }: HumanReviewProps) {
         action,
         comment: comment.trim() || null,
       });
+      if (isManualRerunRequest(action)) {
+        await fetchPayload();
+        return;
+      }
       navigate(routes().monitor(runId));
     } catch (err) {
       if (err instanceof ApiError && err.isConflict) {
@@ -165,8 +241,7 @@ export function HumanReview({ runId }: HumanReviewProps) {
     }
   }
 
-  async function handleCopyManualPrompt() {
-    const prompt = payload?.pending_manual_rerun?.prompt;
+  async function handleCopyPrompt(prompt: string | null | undefined) {
     if (!prompt) return;
     if (!navigator.clipboard?.writeText) {
       setCopyStatus("コピーできませんでした");
@@ -199,6 +274,15 @@ export function HumanReview({ runId }: HumanReviewProps) {
     const pending = payload?.pending_manual_rerun;
     if (!pending) return;
     downloadMarkdown(safeManualRerunFilename(runId, pending.rerun_id), pending.prompt);
+  }
+
+  function handleDownloadSuggestedPrompt() {
+    const suggested = payload?.suggested_rerun;
+    if (!suggested) return;
+    downloadMarkdown(
+      safeSuggestedRerunFilename(runId, suggested.scope),
+      suggested.prompt,
+    );
   }
 
   async function handleManualRerunUpload(e: React.FormEvent) {
@@ -275,6 +359,7 @@ export function HumanReview({ runId }: HumanReviewProps) {
 
   const { latest_review, audit_summary, allowed_actions } = payload;
   const pendingManualRerun = payload.pending_manual_rerun ?? null;
+  const suggestedRerun = payload.suggested_rerun ?? null;
   const unresolvedItems = payload.unresolved_items ?? [];
   const latestItemAssessments = latest_review?.item_assessments ?? [];
 
@@ -282,22 +367,38 @@ export function HumanReview({ runId }: HumanReviewProps) {
     audit_summary.no_progress_count >= NO_PROGRESS_WARN_THRESHOLD;
   const latestReportIsEmpty = payload.latest_report.trim().length === 0;
 
-  const isAllowed = (action: HumanReviewAction) => allowed_actions.includes(action);
-  const canRetryReview = isAllowed("request_review");
+  const actionState = (action: HumanReviewAction) =>
+    payload.action_states?.find((state) => state.action === action) ?? null;
+  const isAllowed = (action: HumanReviewAction) =>
+    actionState(action)?.allowed ?? allowed_actions.includes(action);
+  const disabledReason = (action: HumanReviewAction) =>
+    formatBlockedReason(actionState(action)?.blocked_reason);
+  const reasonSummary = stopReasonSummary(payload);
 
   const targetedRerunGuardMessage = noProgressWarn
     ? `改善停滞が${audit_summary.no_progress_count}回続いています。同じitemへの再実行効果は限定的かもしれません。`
     : undefined;
-  const fullRerunButton = (
+  const fullRerunGuardMessage = noProgressWarn
+    ? `改善停滞が${audit_summary.no_progress_count}回続いています。全面再実行でも同じ失敗を繰り返す可能性があります。`
+    : undefined;
+  const renderDecision = (
+    action: HumanReviewAction,
+    label: string,
+    consequence: string,
+    tone: "success" | "warning" | "danger" | "neutral",
+    options: { costHint?: string; guardMessage?: string } = {},
+  ) => (
     <DecisionButton
-      action="request_full_rerun"
-      label="全体再実行"
-      consequence="Deep Researchを最初から再実行"
-      tone="warning"
-      costHint="追加コスト発生予定"
-      disabled={!isAllowed("request_full_rerun") || submitting}
+      action={action}
+      label={label}
+      consequence={consequence}
+      tone={tone}
+      costHint={options.costHint}
+      guardMessage={options.guardMessage}
+      disabled={!isAllowed(action) || submitting}
+      disabledReason={disabledReason(action)}
       block
-      onClick={() => void handleDecision("request_full_rerun")}
+      onClick={() => void handleDecision(action)}
     />
   );
 
@@ -312,11 +413,14 @@ export function HumanReview({ runId }: HumanReviewProps) {
       <div className="review-reason-banner" role="note">
         <span className="review-reason-label">停止理由</span>
         <p className="review-reason-text">{payload.reason}</p>
+        {reasonSummary && (
+          <p className="review-reason-summary">{reasonSummary}</p>
+        )}
       </div>
 
       {/* ── Warnings ──────────────────────────────────── */}
       {payload.warnings.length > 0 && (
-        <div className="review-warnings" role="alert">
+        <div className="review-warnings" role="note">
           <ul>
             {payload.warnings.map((w, i) => (
               <li key={i}>{w}</li>
@@ -327,7 +431,7 @@ export function HumanReview({ runId }: HumanReviewProps) {
 
       {/* ── High-risk flags ───────────────────────────── */}
       {latest_review?.high_risk_flags && latest_review.high_risk_flags.length > 0 && (
-        <div className="review-risk-flags" role="alert">
+        <div className="review-risk-flags" role="note">
           <strong>リスクフラグ:</strong>
           <ul>
             {latest_review.high_risk_flags.map((flag, i) => (
@@ -431,6 +535,64 @@ export function HumanReview({ runId }: HumanReviewProps) {
         </section>
       )}
 
+      {suggestedRerun && !pendingManualRerun && (
+        <section className="review-manual-rerun" aria-labelledby="suggested-rerun-heading">
+          <h2 id="suggested-rerun-heading" className="section-title">
+            Rerun向けプロンプト
+          </h2>
+          <div className="latest-review-card">
+            <div className="latest-review-header">
+              <span className="reviewer-confidence">
+                {suggestedRerun.scope === "full_rerun" ? "Full rerun" : "Targeted rerun"}
+              </span>
+              <span className="reviewer-confidence">
+                出力: {expectedOutputLabel(
+                  suggestedRerun.expected_output_kind,
+                  suggestedRerun.scope,
+                )}
+              </span>
+              <span className="reviewer-confidence">
+                Deep Research {suggestedRerun.expected_run_no}回目
+              </span>
+              {suggestedRerun.target_item_ids.length > 0 && (
+                <span className="reviewer-confidence">
+                  {suggestedRerun.target_item_ids.join(", ")}
+                </span>
+              )}
+            </div>
+            {suggestedRerun.query_policy.status !== "allowed" && (
+              <p className="manual-rerun-note" role="note">
+                Query policy:{" "}
+                {suggestedRerun.query_policy.blocked_reason ??
+                  suggestedRerun.query_policy.status}
+              </p>
+            )}
+            <pre className="prompt-attempt-body">{suggestedRerun.prompt}</pre>
+            <div className="form-actions">
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => void handleCopyPrompt(suggestedRerun.prompt)}
+              >
+                コピー
+              </button>
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={handleDownloadSuggestedPrompt}
+              >
+                .md ダウンロード
+              </button>
+              {copyStatus && (
+                <span className="char-counter" aria-live="polite">
+                  {copyStatus}
+                </span>
+              )}
+            </div>
+          </div>
+        </section>
+      )}
+
       {/* ── Unresolved items ─────────────────────────── */}
       {unresolvedItems.length > 0 && (
         <section className="review-unresolved-items" aria-labelledby="unresolved-items-heading">
@@ -491,18 +653,33 @@ export function HumanReview({ runId }: HumanReviewProps) {
                 {pendingManualRerun.scope === "full_rerun" ? "Full rerun" : "Targeted rerun"}
               </span>
               <span className="reviewer-confidence">
+                出力: {expectedOutputLabel(
+                  pendingManualRerun.expected_output_kind,
+                  pendingManualRerun.scope,
+                )}
+              </span>
+              <span className="reviewer-confidence">
                 {pendingManualRerun.rerun_id}
               </span>
               <span className="reviewer-confidence">
                 Deep Research {pendingManualRerun.expected_run_no}回目
               </span>
             </div>
+            <ol className="manual-rerun-steps">
+              <li>プロンプトをコピーまたはダウンロードする</li>
+              <li>ChatGPTのDeep Researchで実行する</li>
+              <li>
+                {pendingManualRerun.scope === "full_rerun"
+                  ? "完成版レポート全文をアップロードする"
+                  : "既存レポートへ追加する差分セクションをアップロードする"}
+              </li>
+            </ol>
             <pre className="prompt-attempt-body">{pendingManualRerun.prompt}</pre>
             <div className="form-actions">
               <button
                 type="button"
                 className="btn-secondary"
-                onClick={() => void handleCopyManualPrompt()}
+                onClick={() => void handleCopyPrompt(pendingManualRerun.prompt)}
               >
                 コピー
               </button>
@@ -523,7 +700,11 @@ export function HumanReview({ runId }: HumanReviewProps) {
 
           <form className="manual-rerun-upload" onSubmit={handleManualRerunUpload}>
             <fieldset className="source-fieldset">
-              <legend className="form-label">Rerun結果</legend>
+              <legend className="form-label">
+                {pendingManualRerun.scope === "full_rerun"
+                  ? "完成版レポート全文"
+                  : "差分セクション"}
+              </legend>
               <div className="source-switch">
                 <label>
                   <input
@@ -623,85 +804,96 @@ export function HumanReview({ runId }: HumanReviewProps) {
       {/* ── Decision buttons (I-4) ────────────────────── */}
       <section className="review-decisions" aria-labelledby="decision-heading">
         <h2 id="decision-heading" className="section-title">判断を選択してください</h2>
-        <div className="decision-buttons">
-          {latestReportIsEmpty && fullRerunButton}
-          <DecisionButton
-            action="approve"
-            label="承認"
-            consequence="現状で最終化"
-            tone="success"
-            disabled={!isAllowed("approve") || submitting}
-            block
-            onClick={() => void handleDecision("approve")}
-          />
-          <DecisionButton
-            action="approve_with_limitation"
-            label="制約付き承認"
-            consequence="未確認点を明示して完了"
-            tone="success"
-            disabled={!isAllowed("approve_with_limitation") || submitting}
-            block
-            onClick={() => void handleDecision("approve_with_limitation")}
-          />
-          {canRetryReview && (
-            <DecisionButton
-              action="request_review"
-              label="レビュー再実行"
-              consequence="GPT-5.5で再レビュー"
-              tone="neutral"
-              disabled={submitting}
-              block
-              onClick={() => void handleDecision("request_review")}
-            />
-          )}
-          <DecisionButton
-            action="request_llm_patch"
-            label="LLM patch"
-            consequence="GPT-5.5で差分修正"
-            tone="warning"
-            disabled={!isAllowed("request_llm_patch") || submitting}
-            block
-            onClick={() => void handleDecision("request_llm_patch")}
-          />
-          <DecisionButton
-            action="request_verification"
-            label="検証"
-            consequence="対象itemだけ検証"
-            tone="neutral"
-            disabled={!isAllowed("request_verification") || submitting}
-            block
-            onClick={() => void handleDecision("request_verification")}
-          />
-          <DecisionButton
-            action="request_targeted_rerun"
-            label="Targeted rerun"
-            consequence="未解決itemだけ再実行"
-            tone="neutral"
-            costHint={`追加コスト発生予定`}
-            guardMessage={targetedRerunGuardMessage}
-            disabled={!isAllowed("request_targeted_rerun") || submitting}
-            block
-            onClick={() => void handleDecision("request_targeted_rerun")}
-          />
-          {!latestReportIsEmpty && fullRerunButton}
-          <DecisionButton
-            action="request_item_revision"
-            label="Item revision"
-            consequence="ResearchItemを見直す"
-            tone="warning"
-            disabled={!isAllowed("request_item_revision") || submitting}
-            block
-            onClick={() => void handleDecision("request_item_revision")}
-          />
-          <DecisionButton
-            action="reject"
-            label="却下"
-            consequence="部分版で停止"
-            tone="danger"
-            disabled={!isAllowed("reject") || submitting}
-            block
-            onClick={() => void handleDecision("reject")}
-          />
+        <div className="decision-groups">
+          <div className="decision-group">
+            <h3 className="decision-group-title">完了する</h3>
+            <div className="decision-buttons">
+              {renderDecision("approve", "承認", "現状で最終化", "success")}
+              {renderDecision(
+                "approve_with_limitation",
+                "制約付き承認",
+                "未確認点を明示して完了",
+                "success",
+              )}
+              {renderDecision("reject", "却下", "部分版で停止", "danger")}
+            </div>
+          </div>
+
+          <div className="decision-group">
+            <h3 className="decision-group-title">APIで自動改善</h3>
+            <div className="decision-buttons">
+              {renderDecision(
+                "request_review",
+                "レビュー再実行",
+                "GPT-5.5で再レビュー",
+                "neutral",
+              )}
+              {renderDecision(
+                "request_llm_patch",
+                "LLM patch",
+                "GPT-5.5で差分修正",
+                "warning",
+              )}
+              {renderDecision(
+                "request_verification",
+                "検証",
+                "対象itemだけ検証",
+                "neutral",
+              )}
+              {renderDecision(
+                "request_targeted_rerun",
+                "APIで部分再調査 (Targeted)",
+                "未解決itemだけDeep Research再実行",
+                "neutral",
+                {
+                  costHint: "追加コスト発生予定",
+                  guardMessage: targetedRerunGuardMessage,
+                },
+              )}
+              {renderDecision(
+                "request_full_rerun",
+                latestReportIsEmpty ? "APIで空レポート復旧 (Full)" : "APIで全面再調査 (Full)",
+                "Deep Researchを最初から再実行",
+                "warning",
+                {
+                  costHint: "追加コスト発生予定",
+                  guardMessage: fullRerunGuardMessage,
+                },
+              )}
+            </div>
+          </div>
+
+          <div className="decision-group">
+            <h3 className="decision-group-title">ChatGPTで手動実行</h3>
+            <div className="decision-buttons">
+              {renderDecision(
+                "request_manual_targeted_rerun",
+                "ChatGPTで部分補強 (Targeted)",
+                "未解決itemだけの差分を作成してアップロード",
+                "neutral",
+                { guardMessage: targetedRerunGuardMessage },
+              )}
+              {renderDecision(
+                "request_manual_full_rerun",
+                "ChatGPTで全面作り直し (Full)",
+                "完成版レポート全文を作成してアップロード",
+                "warning",
+                { guardMessage: fullRerunGuardMessage },
+              )}
+            </div>
+          </div>
+
+          <div className="decision-group">
+            <h3 className="decision-group-title">構造を見直す</h3>
+            <div className="decision-buttons">
+              {renderDecision(
+                "request_item_revision",
+                "ResearchItem見直し",
+                "評価項目や分解を見直す",
+                "warning",
+              )}
+            </div>
+          </div>
         </div>
       </section>
         </>

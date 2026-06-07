@@ -463,23 +463,13 @@ async def test_manual_import_manual_chatgpt_mode_creates_pending_prompt_without_
         transport=ASGITransport(app=app),
         base_url="http://testserver",
     ) as client:
-        rejected = await client.post(
-            "/research-runs/manual-import",
-            data={
-                "input_prompt_text": "公開情報だけで調べてください。",
-                "report_text": "追加調査が必要なレポート本文",
-                "allow_remote_review": "true",
-                "allow_api_reruns": "false",
-                "rerun_execution_mode": "manual_chatgpt",
-            },
-        )
         create_response = await client.post(
             "/research-runs/manual-import",
             data={
                 "input_prompt_text": "公開情報だけで調べてください。",
                 "report_text": "追加調査が必要なレポート本文",
                 "allow_remote_review": "true",
-                "allow_api_reruns": "true",
+                "allow_api_reruns": "false",
                 "rerun_execution_mode": "manual_chatgpt",
             },
         )
@@ -493,7 +483,6 @@ async def test_manual_import_manual_chatgpt_mode_creates_pending_prompt_without_
             json={"action": "approve", "comment": None},
         )
 
-    assert rejected.status_code == 422
     assert fake.review_calls == 1
     assert fake.submitted_prompts == []
     status_json = status_response.json()
@@ -505,8 +494,11 @@ async def test_manual_import_manual_chatgpt_mode_creates_pending_prompt_without_
     assert payload["allowed_actions"] == []
     pending = payload["pending_manual_rerun"]
     assert pending["rerun_id"].startswith("RR-")
+    assert pending["expected_output_kind"] == "targeted_delta_sections"
     assert pending["expected_run_no"] == 2
     assert pending["prompt"]
+    assert "Expected output: targeted_delta_sections" in pending["prompt"]
+    assert "Do not return a full merged report." in pending["prompt"]
     assert pending["query_policy"]["status"] == "allowed"
     assert blocked_action.status_code == 409
     audit_json = audit_response.json()
@@ -823,7 +815,76 @@ async def test_manual_chatgpt_query_policy_blocked_prompt_has_no_pending_rerun(
     assert status_json["done_reason"] == "manual_rerun_prompt_blocked_by_query_policy"
     payload = payload_response.json()
     assert payload["pending_manual_rerun"] is None
+    assert payload["suggested_rerun"] is None
     assert payload["allowed_actions"]
+    assert HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN.value not in payload[
+        "allowed_actions"
+    ]
+    assert HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value not in payload[
+        "allowed_actions"
+    ]
+    states = {state["action"]: state for state in payload["action_states"]}
+    assert states[HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN.value] == {
+        "action": HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN.value,
+        "allowed": False,
+        "blocked_reason": "manual_rerun_prompt_blocked_by_query_policy",
+    }
+    assert states[HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value] == {
+        "action": HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value,
+        "allowed": False,
+        "blocked_reason": "manual_rerun_prompt_blocked_by_query_policy",
+    }
+
+
+@pytest.mark.anyio
+async def test_resume_api_rejects_query_policy_blocked_manual_rerun(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure(verdict=Verdict.HUMAN_REVIEW)
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "api_key を含む内容を公開情報だけで調べてください。",
+                "report_text": "追加調査が必要なレポート本文",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "true",
+                "rerun_execution_mode": "manual_chatgpt",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+
+        payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+        resume_response = await client.post(
+            f"/research-runs/{run_id}/resume",
+            json={
+                "action": HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value,
+                "comment": "ChatGPTで全面作り直し",
+            },
+        )
+        pending_payload_response = await client.get(
+            f"/research-runs/{run_id}/human-review"
+        )
+
+    assert payload_response.status_code == 200
+    payload = payload_response.json()
+    assert HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value not in payload[
+        "allowed_actions"
+    ]
+    assert resume_response.status_code == 409
+    assert (
+        "manual_rerun_prompt_blocked_by_query_policy"
+        in resume_response.json()["detail"]
+    )
+    assert pending_payload_response.json()["pending_manual_rerun"] is None
 
 
 @pytest.mark.anyio
@@ -2310,6 +2371,239 @@ async def test_human_review_api_does_not_require_reviewer_identity(tmp_path: Pat
     assert payload_response.status_code == 200
     assert decisions_response.status_code == 200
     assert resume_response.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_human_review_payload_includes_suggested_rerun_prompt(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_v2_orchestrator(
+        tmp_path,
+        V2FakeAzure(verdict=Verdict.HUMAN_REVIEW),
+    )
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs",
+            json={
+                "user_prompt": "市場調査をしてください",
+            },
+        )
+        run_id = create_response.json()["run_id"]
+        run = orchestrator.collect_deep_research(run_id)
+        orchestrator.repository.update_run(
+            run.id,
+            done_reason="review_route_needs_full_rerun",
+        )
+
+        payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+
+    assert payload_response.status_code == 200
+    payload = payload_response.json()
+    suggested = payload["suggested_rerun"]
+    assert suggested["scope"] == "full_rerun"
+    assert suggested["expected_output_kind"] == "complete_replacement_report"
+    assert suggested["expected_run_no"] == 2
+    assert suggested["query_policy"]["status"] == "allowed"
+    assert "Original User Prompt" in suggested["prompt"]
+    assert "Expected output: complete_replacement_report" in suggested["prompt"]
+    assert "final report body only" in suggested["prompt"]
+    assert "Do not return a full merged report." not in suggested["prompt"]
+    assert "Rerun Policy" in suggested["prompt"]
+    assert suggested["target_item_ids"]
+
+
+@pytest.mark.anyio
+async def test_resume_api_can_request_manual_chatgpt_full_rerun(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure(verdicts=[Verdict.HUMAN_REVIEW, Verdict.PASS])
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs",
+            json={
+                "user_prompt": "市場調査をしてください",
+            },
+        )
+        run_id = create_response.json()["run_id"]
+        run = orchestrator.collect_deep_research(run_id)
+        orchestrator.repository.update_run(
+            run.id,
+            done_reason="review_route_needs_full_rerun",
+        )
+        fake.submitted_prompts.clear()
+
+        payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+        resume_response = await client.post(
+            f"/research-runs/{run_id}/resume",
+            json={
+                "action": HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value,
+                "comment": "ChatGPTで手動実行します。",
+            },
+        )
+        pending_payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+        pending = pending_payload_response.json()["pending_manual_rerun"]
+        upload_response = await client.post(
+            f"/research-runs/{run_id}/manual-rerun-result",
+            data={
+                "rerun_id": pending["rerun_id"],
+                "report_text": "Complete replacement report from ChatGPT.",
+            },
+        )
+        audit_response = await client.get(f"/research-runs/{run_id}/audit")
+
+    assert payload_response.status_code == 200
+    allowed_actions = payload_response.json()["allowed_actions"]
+    assert HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value in allowed_actions
+    assert resume_response.status_code == 200
+    assert resume_response.json()["status"] == "needs_human_review"
+    assert resume_response.json()["done_reason"] == "manual_chatgpt_rerun_pending"
+    assert fake.submitted_prompts == []
+    assert pending["scope"] == "full_rerun"
+    assert pending["expected_output_kind"] == "complete_replacement_report"
+    assert pending["expected_run_no"] == 2
+    assert "ChatGPTで手動実行します。" in pending["prompt"]
+    assert upload_response.status_code == 200
+    assert upload_response.json()["status"] == "completed"
+    assert fake.review_calls == 2
+    assert [attempt["source"] for attempt in audit_response.json()["attempts"]] == [
+        "api",
+        "manual_chatgpt_rerun",
+    ]
+
+
+@pytest.mark.anyio
+async def test_manual_full_rerun_bypasses_api_full_rerun_limit(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_v2_orchestrator(
+        tmp_path,
+        V2FakeAzure(verdict=Verdict.HUMAN_REVIEW),
+    )
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs",
+            json={
+                "user_prompt": "市場調査をしてください",
+                "options": {"max_full_rerun_runs": 1},
+            },
+        )
+        run_id = create_response.json()["run_id"]
+        run = orchestrator.collect_deep_research(run_id)
+        orchestrator.repository.update_run(
+            run.id,
+            full_rerun_runs=1,
+            done_reason="max_full_rerun_runs_reached",
+        )
+
+        payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+        api_full_response = await client.post(
+            f"/research-runs/{run_id}/resume",
+            json={
+                "action": HumanReviewAction.REQUEST_FULL_RERUN.value,
+                "comment": None,
+            },
+        )
+        manual_full_response = await client.post(
+            f"/research-runs/{run_id}/resume",
+            json={
+                "action": HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value,
+                "comment": "ChatGPTで全面作り直し",
+            },
+        )
+
+    payload = payload_response.json()
+    assert HumanReviewAction.REQUEST_FULL_RERUN.value not in payload["allowed_actions"]
+    assert HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value in payload["allowed_actions"]
+    states = {state["action"]: state for state in payload["action_states"]}
+    assert states[HumanReviewAction.REQUEST_FULL_RERUN.value]["blocked_reason"] == (
+        "max_full_rerun_runs_reached"
+    )
+    assert states[HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value]["allowed"] is True
+    assert payload["suggested_rerun"]["scope"] == "full_rerun"
+    assert payload["suggested_rerun"]["expected_output_kind"] == (
+        "complete_replacement_report"
+    )
+    assert api_full_response.status_code == 409
+    assert manual_full_response.status_code == 200
+    assert manual_full_response.json()["done_reason"] == "manual_chatgpt_rerun_pending"
+
+
+@pytest.mark.anyio
+async def test_manual_targeted_rerun_bypasses_api_targeted_rerun_limit(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_v2_orchestrator(
+        tmp_path,
+        V2FakeAzure(verdict=Verdict.HUMAN_REVIEW),
+    )
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs",
+            json={
+                "user_prompt": "市場調査をしてください",
+                "options": {"max_targeted_rerun_runs": 1},
+            },
+        )
+        run_id = create_response.json()["run_id"]
+        run = orchestrator.collect_deep_research(run_id)
+        orchestrator.repository.update_run(
+            run.id,
+            targeted_rerun_runs=1,
+            done_reason="max_targeted_rerun_runs_reached",
+        )
+
+        payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+        api_targeted_response = await client.post(
+            f"/research-runs/{run_id}/resume",
+            json={
+                "action": HumanReviewAction.REQUEST_TARGETED_RERUN.value,
+                "comment": None,
+            },
+        )
+        manual_targeted_response = await client.post(
+            f"/research-runs/{run_id}/resume",
+            json={
+                "action": HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN.value,
+                "comment": "ChatGPTで不足itemだけ補強",
+            },
+        )
+
+    payload = payload_response.json()
+    assert HumanReviewAction.REQUEST_TARGETED_RERUN.value not in payload["allowed_actions"]
+    assert HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN.value in payload["allowed_actions"]
+    states = {state["action"]: state for state in payload["action_states"]}
+    assert states[HumanReviewAction.REQUEST_TARGETED_RERUN.value]["blocked_reason"] == (
+        "max_targeted_rerun_runs_reached"
+    )
+    assert states[HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN.value]["allowed"] is True
+    assert api_targeted_response.status_code == 409
+    assert manual_targeted_response.status_code == 200
+    assert manual_targeted_response.json()["done_reason"] == "manual_chatgpt_rerun_pending"
 
 
 @pytest.mark.anyio

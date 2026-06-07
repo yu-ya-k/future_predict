@@ -1312,7 +1312,7 @@ describe("NewResearch (SCR-1)", () => {
     expect(options.max_full_rerun_runs).toBe(1);
   });
 
-  it("sends manual ChatGPT rerun execution mode for manual imports", async () => {
+  it("sends manual ChatGPT rerun mode without enabling API reruns", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 202,
@@ -1346,7 +1346,7 @@ describe("NewResearch (SCR-1)", () => {
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
     const body = fetchMock.mock.calls[0][1]?.body as FormData;
-    expect(body.get("allow_api_reruns")).toBe("true");
+    expect(body.get("allow_api_reruns")).toBe("false");
     expect(body.get("rerun_execution_mode")).toBe("manual_chatgpt");
   });
 
@@ -4783,6 +4783,7 @@ describe("HumanReview (SCR-4)", () => {
       prompt: "# Manual rerun prompt\nFind better official sources.",
       prompt_artifact_path: "prompts/rerun_prompt_002.txt",
       target_item_ids: ["RI-001"],
+      expected_output_kind: "targeted_delta_sections",
       query_policy: { status: "allowed", safe_queries: [], blocked_reason: null },
       base_report_hash: "hash-base",
       created_at: "2026-06-06T01:02:03.000Z",
@@ -4797,7 +4798,10 @@ describe("HumanReview (SCR-4)", () => {
       latest_review: null;
       reason: string;
       pending_manual_rerun: NonNullable<HumanReviewPayload["pending_manual_rerun"]>;
+      suggested_rerun: NonNullable<HumanReviewPayload["suggested_rerun"]>;
       allowed_actions: string[];
+      action_states: HumanReviewPayload["action_states"];
+      route_summary: HumanReviewPayload["route_summary"];
     }> = {},
   ) {
     return {
@@ -4826,6 +4830,8 @@ describe("HumanReview (SCR-4)", () => {
         public_web_search_used: false,
       },
       allowed_actions: overrides.allowed_actions ?? allowedActions,
+      action_states: overrides.action_states,
+      route_summary: overrides.route_summary ?? null,
       audit_summary: {
         deep_research_runs: 1,
         targeted_rerun_runs: 2,
@@ -4839,6 +4845,7 @@ describe("HumanReview (SCR-4)", () => {
       },
       warnings: [],
       pending_manual_rerun: overrides.pending_manual_rerun ?? null,
+      suggested_rerun: overrides.suggested_rerun ?? null,
     };
   }
 
@@ -4858,6 +4865,140 @@ describe("HumanReview (SCR-4)", () => {
     expect(await screen.findByText("スコアが閾値以下です")).toBeInTheDocument();
   });
 
+  it("shows a suggested rerun prompt during human review", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve(
+          makePayload(["request_full_rerun", "reject"], {
+            reason: "review_route_needs_full_rerun",
+            suggested_rerun: {
+              scope: "full_rerun",
+              expected_output_kind: "complete_replacement_report",
+              expected_run_no: 2,
+              prompt: "# Suggested rerun prompt\nRebuild the full report.",
+              target_item_ids: ["RI-001", "RI-002"],
+              query_policy: { status: "allowed", safe_queries: [], blocked_reason: null },
+              base_report_hash: "hash-base",
+            },
+          }),
+        ),
+    } as Response);
+
+    render(<App />);
+
+    expect(await screen.findByText("Rerun向けプロンプト")).toBeInTheDocument();
+    expect(screen.getByText("Deep Research 2回目")).toBeInTheDocument();
+    expect(screen.getByText("RI-001, RI-002")).toBeInTheDocument();
+    expect(screen.getByText(/Rebuild the full report/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "コピー" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: ".md ダウンロード" })).toBeInTheDocument();
+  });
+
+  it.each([
+    {
+      action: "request_manual_targeted_rerun",
+      buttonName: /ChatGPTで部分補強/i,
+      scope: "targeted_gap_closure",
+      expectedOutputKind: "targeted_delta_sections",
+      reason: "review_route_needs_targeted_rerun",
+      uploadStep: "既存レポートへ追加する差分セクションをアップロードする",
+    },
+    {
+      action: "request_manual_full_rerun",
+      buttonName: /ChatGPTで全面作り直し/i,
+      scope: "full_rerun",
+      expectedOutputKind: "complete_replacement_report",
+      reason: "review_route_needs_full_rerun",
+      uploadStep: "完成版レポート全文をアップロードする",
+    },
+  ] as const)(
+    "refetches HumanReview after $action so the pending manual rerun flow appears",
+    async ({
+      action,
+      buttonName,
+      scope,
+      expectedOutputKind,
+      reason,
+      uploadStep,
+    }) => {
+      let payloadFetches = 0;
+      const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith(`/research-runs/${runId}/resume`)) {
+          expect(init?.method).toBe("POST");
+          expect(JSON.parse(String(init?.body))).toEqual({
+            action,
+            comment: null,
+          });
+          return Promise.resolve(
+            jsonResponse({
+              run_id: runId,
+              status: "needs_human_review",
+              done_reason: "manual_chatgpt_rerun_pending",
+              needs_human_review: true,
+            }),
+          );
+        }
+        payloadFetches += 1;
+        if (payloadFetches > 1) {
+          return Promise.resolve(
+            jsonResponse(
+              makePayload([], {
+                reason: "manual_chatgpt_rerun_pending",
+                pending_manual_rerun: makePendingManualRerun({
+                  rerun_id: "RR-manual-after-request",
+                  scope,
+                  expected_output_kind: expectedOutputKind,
+                  prompt: "# Pending manual rerun prompt\nRun this in ChatGPT.",
+                }),
+                allowed_actions: [],
+              }),
+            ),
+          );
+        }
+        return Promise.resolve(
+          jsonResponse(
+            makePayload([action, "reject"], {
+              reason,
+              suggested_rerun: {
+                scope,
+                expected_output_kind: expectedOutputKind,
+                expected_run_no: 2,
+                prompt: "# Suggested rerun prompt\nRebuild the full report.",
+                target_item_ids: ["RI-001"],
+                query_policy: { status: "allowed", safe_queries: [], blocked_reason: null },
+                base_report_hash: "hash-base",
+              },
+            }),
+          ),
+        );
+      });
+      globalThis.fetch = fetchMock;
+
+      render(<App />);
+
+      await userEvent.click(
+        await screen.findByRole("button", { name: buttonName }),
+      );
+
+      await waitFor(() =>
+        expect(fetchMock).toHaveBeenCalledWith(
+          `http://localhost:8000/research-runs/${runId}/resume`,
+          expect.objectContaining({ method: "POST" }),
+        ),
+      );
+      await waitFor(() => expect(payloadFetches).toBe(2));
+      expect(window.location.hash).toBe(`#/runs/${runId}/review`);
+      expect(await screen.findByText("ChatGPT手動rerun")).toBeInTheDocument();
+      expect(screen.getByText("プロンプトをコピーまたはダウンロードする")).toBeInTheDocument();
+      expect(screen.getByText("ChatGPTのDeep Researchで実行する")).toBeInTheDocument();
+      expect(screen.getByText(uploadStep)).toBeInTheDocument();
+      expect(screen.getByText(/Run this in ChatGPT/i)).toBeInTheDocument();
+    },
+  );
+
   it("disables actions not in allowed_actions", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
@@ -4869,12 +5010,145 @@ describe("HumanReview (SCR-4)", () => {
 
     // Wait for payload to load (buttons are rendered after fetch)
     const llmPatchBtn = await screen.findByRole("button", { name: /LLM patch/i });
-    const targetedRerunBtn = screen.getByRole("button", { name: /Targeted rerun/i });
-    const fullRerunBtn = screen.getByRole("button", { name: /全体再実行/i });
+    const targetedRerunBtn = screen.getByRole("button", { name: /APIで部分再調査/i });
+    const fullRerunBtn = screen.getByRole("button", { name: /APIで全面再調査/i });
 
     expect(llmPatchBtn).toBeDisabled();
     expect(targetedRerunBtn).toBeDisabled();
     expect(fullRerunBtn).toBeDisabled();
+  });
+
+  it("shows action state disabled reasons and route stop context", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve(
+          makePayload(["request_manual_full_rerun", "reject"], {
+            reason: "max_full_rerun_runs_reached",
+            latest_review: null,
+            action_states: [
+              {
+                action: "request_full_rerun",
+                allowed: false,
+                blocked_reason: "max_full_rerun_runs_reached",
+              },
+              {
+                action: "request_manual_full_rerun",
+                allowed: true,
+                blocked_reason: null,
+              },
+            ],
+            route_summary: {
+              candidate_route: "full_rerun_submit",
+              selected_route: "human_review",
+              blocked_reason: "max_full_rerun_runs_reached",
+              dominant_actions: ["full_rerun"],
+              latest_review_no: 2,
+              latest_verdict: "needs_full_rerun",
+            },
+          }),
+        ),
+    } as Response);
+
+    render(<App />);
+
+    expect(await screen.findByText("max_full_rerun_runs_reached")).toBeInTheDocument();
+    expect(screen.getByText(/LLMレビューは完了しています/)).toBeInTheDocument();
+    expect(screen.getByText(/API自動Full rerunは上限/)).toBeInTheDocument();
+    expect(screen.getByText("API Full rerun回数の上限に達しています。")).toBeInTheDocument();
+    const fullRerunButton = screen.getByRole("button", { name: /APIで全面再調査/i });
+    expect(fullRerunButton).toBeDisabled();
+    const fullDescriptionIds = fullRerunButton
+      .getAttribute("aria-describedby")
+      ?.split(/\s+/);
+    expect(fullDescriptionIds?.some((id) =>
+      document.getElementById(id)?.textContent ===
+        "API Full rerun回数の上限に達しています。",
+    )).toBe(true);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /ChatGPTで全面作り直し/i }),
+    ).not.toBeDisabled();
+  });
+
+  it("shows max targeted rerun as a disabled API action while manual targeted remains available", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve(
+          makePayload(["request_manual_targeted_rerun", "reject"], {
+            reason: "max_targeted_rerun_runs_reached",
+            action_states: [
+              {
+                action: "request_targeted_rerun",
+                allowed: false,
+                blocked_reason: "max_targeted_rerun_runs_reached",
+              },
+              {
+                action: "request_manual_targeted_rerun",
+                allowed: true,
+                blocked_reason: null,
+              },
+            ],
+            route_summary: {
+              candidate_route: "targeted_rerun_submit",
+              selected_route: "human_review",
+              blocked_reason: "max_targeted_rerun_runs_reached",
+              dominant_actions: ["targeted_rerun"],
+              latest_review_no: 2,
+              latest_verdict: "needs_targeted_rerun",
+            },
+          }),
+        ),
+    } as Response);
+
+    render(<App />);
+
+    expect(await screen.findByText("max_targeted_rerun_runs_reached")).toBeInTheDocument();
+    expect(screen.getByText(/API自動Targeted rerunは上限/)).toBeInTheDocument();
+    const targetedRerunButton = screen.getByRole("button", {
+      name: /APIで部分再調査/i,
+    });
+    expect(targetedRerunButton).toBeDisabled();
+    const targetedDescriptionIds = targetedRerunButton
+      .getAttribute("aria-describedby")
+      ?.split(/\s+/);
+    expect(targetedDescriptionIds?.some((id) =>
+      document.getElementById(id)?.textContent ===
+        "API Targeted rerun回数の上限に達しています。",
+    )).toBe(true);
+    expect(
+      screen.getByRole("button", { name: /ChatGPTで部分補強/i }),
+    ).not.toBeDisabled();
+  });
+
+  it("shows no-progress warnings even when rerun actions are enabled", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve({
+          ...makePayload([
+            "request_targeted_rerun",
+            "request_manual_targeted_rerun",
+            "reject",
+          ]),
+          audit_summary: {
+            ...makePayload([]).audit_summary,
+            no_progress_count: 2,
+          },
+        }),
+    } as Response);
+
+    render(<App />);
+
+    const targetedButton = await screen.findByRole("button", {
+      name: /APIで部分再調査/i,
+    });
+    expect(targetedButton).not.toBeDisabled();
+    expect(screen.getAllByText(/改善停滞が2回続いています/).length).toBeGreaterThan(0);
   });
 
   it("shows full rerun as the empty-report recovery action", async () => {
@@ -4897,17 +5171,13 @@ describe("HumanReview (SCR-4)", () => {
       name: /現状で最終化/i,
     });
     const targetedRerunBtn = await screen.findByRole("button", {
-      name: /Targeted rerun/i,
+      name: /APIで部分再調査/i,
     });
-    const fullRerunBtn = screen.getByRole("button", { name: /全体再実行/i });
-    const firstDecisionButton = document.querySelector<HTMLButtonElement>(
-      ".decision-buttons button",
-    );
+    const fullRerunBtn = screen.getByRole("button", { name: /APIで空レポート復旧/i });
 
     expect(approveBtn).toBeDisabled();
     expect(targetedRerunBtn).toBeDisabled();
     expect(fullRerunBtn).not.toBeDisabled();
-    expect(firstDecisionButton?.dataset.action).toBe("request_full_rerun");
   });
 
   it("shows pending manual rerun prompt and preserves typed result after 409 refetch", async () => {
@@ -4945,6 +5215,12 @@ describe("HumanReview (SCR-4)", () => {
 
     expect(await screen.findByText("ChatGPT手動rerun")).toBeInTheDocument();
     expect(screen.getByText(/Find better official sources/i)).toBeInTheDocument();
+    expect(screen.getByText("プロンプトをコピーまたはダウンロードする")).toBeInTheDocument();
+    expect(screen.getByText("ChatGPTのDeep Researchで実行する")).toBeInTheDocument();
+    expect(
+      screen.getByText("既存レポートへ追加する差分セクションをアップロードする"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("差分セクション")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "承認" })).not.toBeInTheDocument();
 
     const resultBox = screen.getByRole("textbox", { name: "Rerun結果テキスト" });
@@ -5223,7 +5499,7 @@ describe("HumanReview (SCR-4)", () => {
     expect(rejectBtn).not.toBeDisabled();
   });
 
-  it("shows review retry only when the backend allows it", async () => {
+  it("enables review retry when the backend allows it", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -5240,6 +5516,37 @@ describe("HumanReview (SCR-4)", () => {
     expect(
       await screen.findByRole("button", { name: /レビュー再実行/i }),
     ).toBeInTheDocument();
+  });
+
+  it("renders blocked review retry as disabled with its backend reason", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve(
+          makePayload(["approve", "reject"], {
+            action_states: [
+              {
+                action: "request_review",
+                allowed: false,
+                blocked_reason: "review_retry_available_only_after_review_error",
+              },
+            ],
+          }),
+        ),
+    } as Response);
+
+    render(<App />);
+
+    const retryButton = await screen.findByRole("button", {
+      name: /レビュー再実行/i,
+    });
+    expect(retryButton).toBeDisabled();
+    const descriptionIds = retryButton.getAttribute("aria-describedby")?.split(/\s+/);
+    expect(descriptionIds?.some((id) =>
+      document.getElementById(id)?.textContent ===
+        "レビュー再実行はレビューエラー後だけ選択できます。",
+    )).toBe(true);
   });
 
   it("ignores stale payload responses after the review run id changes", async () => {

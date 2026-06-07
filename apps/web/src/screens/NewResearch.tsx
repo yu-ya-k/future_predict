@@ -203,7 +203,7 @@ export function NewResearch() {
                   : { source: "text", text: manualReportText.trim() },
               options: requestOptions,
               allow_remote_review: true,
-              allow_api_reruns: rerunExecutionMode !== "disabled",
+              allow_api_reruns: rerunExecutionMode === "api",
               rerun_execution_mode: rerunExecutionMode,
             });
 

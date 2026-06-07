@@ -1,3 +1,5 @@
+import { useId } from "react";
+
 import type { DecisionButtonProps } from "./types";
 
 export function DecisionButton({
@@ -8,10 +10,16 @@ export function DecisionButton({
   costHint,
   disabled = false,
   guardMessage,
+  disabledReason,
   block = false,
   type = "button",
   onClick,
 }: DecisionButtonProps) {
+  const descriptionBaseId = useId();
+  const guardId = guardMessage ? `${descriptionBaseId}-guard` : undefined;
+  const blockedId =
+    disabled && disabledReason ? `${descriptionBaseId}-blocked` : undefined;
+  const describedBy = [guardId, blockedId].filter(Boolean).join(" ") || undefined;
   const classes = [
     "decision-button",
     `decision-button--${tone}`,
@@ -29,6 +37,7 @@ export function DecisionButton({
         disabled={disabled}
         onClick={disabled ? undefined : onClick}
         aria-disabled={disabled}
+        aria-describedby={describedBy}
         data-action={action}
       >
         <span className="decision-button__label">{label}</span>
@@ -43,9 +52,14 @@ export function DecisionButton({
           </span>
         )}
       </button>
-      {disabled && guardMessage && (
-        <p className="decision-button__guard" role="alert">
+      {guardMessage && (
+        <p id={guardId} className="decision-button__guard" role="note">
           {guardMessage}
+        </p>
+      )}
+      {disabled && disabledReason && (
+        <p id={blockedId} className="decision-button__blocked">
+          {disabledReason}
         </p>
       )}
     </div>
