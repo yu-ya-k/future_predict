@@ -72,3 +72,13 @@ class ResearchPoller:
                 await asyncio.to_thread(self.orchestrator.collect_deep_research, claimed.id)
             except Exception:
                 logger.exception("Failed to collect research run %s", run.id)
+
+        stale_collecting = self.orchestrator.repository.list_stale_collecting_runs(
+            stale_seconds=settings.research_deep_research_collecting_stale_seconds,
+            timeout_seconds=settings.research_deep_research_timeout_seconds,
+        )
+        for run in stale_collecting:
+            try:
+                await asyncio.to_thread(self.orchestrator.collect_deep_research, run.id)
+            except Exception:
+                logger.exception("Failed to recover stale collecting research run %s", run.id)

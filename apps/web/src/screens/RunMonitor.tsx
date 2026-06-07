@@ -9,7 +9,15 @@
  *   review scores didn't improve.
  */
 
-import { useCallback, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+} from "react";
 
 import {
   CostMeter,
@@ -26,21 +34,29 @@ import {
   getAudit,
   getAttempts,
   getItems,
+  getRunCheckpoints,
+  getRunLineage,
+  previewCheckpointFork,
+  createCheckpointFork,
   cancelRun,
 } from "../api/research";
 import { ApiError } from "../api/client";
 import { usePolling } from "../hooks/usePolling";
 import { useElapsed, formatElapsed } from "../hooks/useElapsed";
 import { statusPollInterval } from "../polling";
-import { routes, Link } from "../router";
-import { getTrackedRun, updateTrackedStatus } from "../runStore";
+import { navigate, routes, Link } from "../router";
+import { getTrackedRun, trackRun, updateTrackedStatus } from "../runStore";
 import { notify } from "../notifications";
 import {
   isTerminal,
   type AuditResponse,
   type ResearchRunStatusResponse,
   type ResearchAttempt,
+  type ResearchCheckpoint,
+  type ResearchForkPreviewResponse,
+  type ResearchForkSubmitResponse,
   type ResearchItem,
+  type ResearchRunLineage,
   type ReviewRecord,
   type RunStatus,
 } from "../types";
@@ -127,7 +143,14 @@ function isUnresolved(item: ResearchItem): boolean {
 }
 
 type DagNodeStatus = "done" | "active" | "pending" | "blocked";
-type DagNodeTone = "brief" | "research" | "review" | "patch" | "verify" | "finalize";
+type DagNodeTone =
+  | "brief"
+  | "research"
+  | "review"
+  | "patch"
+  | "verify"
+  | "finalize"
+  | "fork";
 type FollowUpKind =
   | "llm_patch"
   | "verification"
@@ -145,9 +168,13 @@ interface ExecutionDagNode {
   tone: DagNodeTone;
   lane: number;
   col: number;
-  href?: string;
+  nodeAnchor?: string;
+  resultHref?: string;
+  auditHref?: string;
   ariaLabel?: string;
   score?: number;
+  checkpoint?: ResearchCheckpoint;
+  forkCount?: number;
 }
 
 interface ExecutionDagEdge {
@@ -185,6 +212,139 @@ const DAG_STATUS_LABEL: Record<DagNodeStatus, string> = {
   pending: "待機",
   blocked: "停止",
 };
+
+const CHECKPOINT_KIND_LABEL: Record<string, string> = {
+  deep_research_collected: "Deep Research収集後",
+  review_recorded: "LLMレビュー後",
+  llm_patch_applied: "LLMパッチ後",
+  verification_completed: "検証後",
+  human_review_required: "人間判断要求",
+  finalized: "最終化",
+};
+
+function checkpointKindLabel(kind: string): string {
+  return CHECKPOINT_KIND_LABEL[kind] ?? kind;
+}
+
+function shortId(value: string | null | undefined, length = 10): string | null {
+  if (!value) return null;
+  return value.length > length ? `${value.slice(0, length)}...` : value;
+}
+
+function formatDateTime(value: string | null | undefined): string {
+  if (!value) return "不明";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("ja-JP", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function snapshotNumber(snapshot: Record<string, unknown> | null | undefined, key: string): number | null {
+  const value = snapshot?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function checkpointChildForks(checkpoint: ResearchCheckpoint | undefined) {
+  return Array.isArray(checkpoint?.child_forks) ? checkpoint.child_forks : [];
+}
+
+function checkpointForkCount(checkpoint: ResearchCheckpoint | undefined): number {
+  return checkpointChildForks(checkpoint).length;
+}
+
+function nodeNumber(nodeId: string, prefix: string): number | null {
+  const match = nodeId.match(new RegExp(`^${prefix}-(\\d+)$`));
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isInteger(value) ? value : null;
+}
+
+function checkpointMatchesNodeAnchor(checkpoint: ResearchCheckpoint, node: ExecutionDagNode): boolean {
+  const anchors = new Set([node.id, node.nodeAnchor].filter(Boolean));
+  return anchors.has(checkpoint.node_anchor);
+}
+
+function checkpointMatchesNodeFallback(
+  checkpoint: ResearchCheckpoint,
+  node: ExecutionDagNode,
+): boolean {
+  const researchNo = nodeNumber(node.id, "research");
+  if (
+    researchNo !== null &&
+    checkpoint.kind === "deep_research_collected" &&
+    checkpoint.source_attempt_no === researchNo
+  ) {
+    return true;
+  }
+
+  const reviewNo = nodeNumber(node.id, "review");
+  if (
+    reviewNo !== null &&
+    checkpoint.kind === "review_recorded" &&
+    checkpoint.source_review_no === reviewNo
+  ) {
+    return true;
+  }
+
+  if (node.id.startsWith("followup-")) {
+    const sourceReviewNo = nodeNumber(node.id, "followup");
+    if (checkpoint.source_review_no !== sourceReviewNo) return false;
+    if (node.tone === "patch" && checkpoint.kind === "llm_patch_applied") return true;
+    if (node.tone === "verify" && checkpoint.kind === "verification_completed") return true;
+  }
+
+  if (node.id === "human-review") return checkpoint.kind === "human_review_required";
+  if (node.id === "final") return checkpoint.kind === "finalized";
+  return false;
+}
+
+function enrichDagNodes(
+  nodes: ExecutionDagNode[],
+  checkpoints: ResearchCheckpoint[],
+): ExecutionDagNode[] {
+  const used = new Set<string>();
+  const exactMatches = new Map<string, ResearchCheckpoint>();
+  for (const node of nodes) {
+    const checkpoint = checkpoints.find(
+      (candidate) =>
+        !used.has(candidate.checkpoint_id) && checkpointMatchesNodeAnchor(candidate, node),
+    );
+    if (!checkpoint) continue;
+    exactMatches.set(node.id, checkpoint);
+    used.add(checkpoint.checkpoint_id);
+  }
+
+  return nodes.map((node) => {
+    const checkpoint = exactMatches.get(node.id) ?? checkpoints.find(
+      (candidate) =>
+        !used.has(candidate.checkpoint_id) && checkpointMatchesNodeFallback(candidate, node),
+    );
+    if (!checkpoint) return node;
+    used.add(checkpoint.checkpoint_id);
+    return {
+      ...node,
+      checkpoint,
+      nodeAnchor: checkpoint.node_anchor,
+      forkCount: checkpointForkCount(checkpoint),
+    };
+  });
+}
+
+function forkDisabledReason(checkpoint: ResearchCheckpoint | undefined): string {
+  if (!checkpoint) return "このノードには保存済みcheckpointがありません。";
+  if (!checkpoint.forkable) return "このcheckpointはフォーク対象外です。";
+  return "";
+}
 
 function activeDagNodeId(
   status: RunStatus,
@@ -299,6 +459,8 @@ function buildExecutionDag({
   history,
   progress,
   runId,
+  checkpoints,
+  lineage,
 }: {
   status: RunStatus;
   attempts: ResearchAttempt[];
@@ -306,6 +468,8 @@ function buildExecutionDag({
   history: AuditResponse["history"];
   progress?: ResearchRunStatusResponse["progress"];
   runId: string;
+  checkpoints: ResearchCheckpoint[];
+  lineage: ResearchRunLineage | null;
 }): { nodes: ExecutionDagNode[]; edges: ExecutionDagEdge[] } {
   const nodes: ExecutionDagNode[] = [];
   const edges: ExecutionDagEdge[] = [];
@@ -318,17 +482,31 @@ function buildExecutionDag({
   const attemptsByRunNo = new Map(attempts.map((attempt) => [attempt.run_no, attempt]));
   const executedLimits = executedFollowUpLimits(progress, history);
 
-  nodes.push({
-    id: "brief",
-    title: "指示内容",
-    meta: "Objective contract / ResearchItems",
-    status: activeId === "brief" ? "active" : "done",
-    tone: "brief",
-    lane: 1,
-    col: 1,
-  });
+  if (lineage?.parent_run_id) {
+    nodes.push({
+      id: "fork-source",
+      title: "フォーク元",
+      meta: `checkpoint ${shortId(lineage.forked_from_checkpoint_id, 8) ?? ""}`,
+      status: "done",
+      tone: "fork",
+      lane: 1,
+      col: 1,
+      resultHref: routes().monitor(lineage.parent_run_id),
+      ariaLabel: "フォーク元runを選択",
+    });
+  } else {
+    nodes.push({
+      id: "brief",
+      title: "指示内容",
+      meta: "Objective contract / ResearchItems",
+      status: activeId === "brief" ? "active" : "done",
+      tone: "brief",
+      lane: 1,
+      col: 1,
+    });
+  }
 
-  let previousId = "brief";
+  let previousId = lineage?.parent_run_id ? "fork-source" : "brief";
   let col = 2;
   const followUpCounts: Record<FollowUpKind, number> = {
     llm_patch: 0,
@@ -364,7 +542,8 @@ function buildExecutionDag({
       tone: "research",
       lane: 1,
       col,
-      href: routes().report(runId, { attempt: attempt.run_no }),
+      nodeAnchor: researchId,
+      resultHref: routes().report(runId, { attempt: attempt.run_no }),
     });
     edges.push({
       id: `${previousId}-${researchId}`,
@@ -390,7 +569,8 @@ function buildExecutionDag({
       tone: "review",
       lane: 1,
       col,
-      href: routes().audit(runId, { tab: "reviews", review: review.review_no }),
+      nodeAnchor: reviewId,
+      auditHref: routes().audit(runId, { tab: "reviews", review: review.review_no }),
       score: review.score,
     });
     edges.push({
@@ -419,7 +599,8 @@ function buildExecutionDag({
       tone: followUpTone(followUp),
       lane: review.review_no % 2 === 0 ? 2 : 0,
       col,
-      href: routes().audit(runId, { tab: "reviews", review: review.review_no }),
+      nodeAnchor: followId,
+      auditHref: routes().audit(runId, { tab: "reviews", review: review.review_no }),
     });
     edges.push({
       id: `${previousId}-${followId}`,
@@ -450,7 +631,8 @@ function buildExecutionDag({
       tone: "review",
       lane: 1,
       col,
-      href: routes().audit(runId, { tab: "reviews", review: reviews.length + 1 }),
+      nodeAnchor: reviewId,
+      auditHref: routes().audit(runId, { tab: "reviews", review: reviews.length + 1 }),
     });
     edges.push({
       id: `${previousId}-${reviewId}`,
@@ -471,8 +653,9 @@ function buildExecutionDag({
       tone: "review",
       lane: 1,
       col,
-      href: routes().review(runId),
-      ariaLabel: "人間判断画面を開く",
+      nodeAnchor: "human-review",
+      resultHref: routes().review(runId),
+      ariaLabel: "人間判断を選択",
     });
     edges.push({
       id: `${previousId}-human-review`,
@@ -495,7 +678,8 @@ function buildExecutionDag({
     tone: "finalize",
     lane: 1,
     col,
-    href: status === "completed" ? routes().report(runId) : undefined,
+    nodeAnchor: "final",
+    resultHref: status === "completed" ? routes().report(runId) : undefined,
   });
   edges.push({
     id: `${previousId}-final`,
@@ -504,32 +688,28 @@ function buildExecutionDag({
     status: status === "completed" ? "done" : activeId === "final" ? "active" : "pending",
   });
 
-  return { nodes, edges };
+  return { nodes: enrichDagNodes(nodes, checkpoints), edges };
 }
 
 function ExecutionDag({
-  status,
+  nodes,
+  edges,
+  progress,
   attempts,
   reviews,
-  history,
-  progress,
-  runId,
+  selectedNodeId,
+  onSelectNode,
+  inspector,
 }: {
-  status: RunStatus;
+  nodes: ExecutionDagNode[];
+  edges: ExecutionDagEdge[];
   attempts: ResearchAttempt[];
   reviews: ReviewRecord[];
-  history: AuditResponse["history"];
   progress?: ResearchRunStatusResponse["progress"];
-  runId: string;
+  selectedNodeId: string | null;
+  onSelectNode: (nodeId: string) => void;
+  inspector: ReactNode;
 }) {
-  const { nodes, edges } = buildExecutionDag({
-    status,
-    attempts,
-    reviews,
-    history,
-    progress,
-    runId,
-  });
   const maxCol = Math.max(...nodes.map((node) => node.col), 1);
   const maxLane = Math.max(...nodes.map((node) => node.lane), 1);
   const gridStyle = {
@@ -559,74 +739,509 @@ function ExecutionDag({
           補正/検証
         </span>
       </div>
-      <div
-        className="execution-dag-grid"
-        style={gridStyle}
-        aria-label="具体的な実行フロー"
-      >
-        {edges.map((edge) => {
-          const from = byId.get(edge.from);
-          const to = byId.get(edge.to);
-          if (!from || !to) return null;
-          const row = Math.min(from.lane, to.lane) + 1;
-          const rowSpan = Math.abs(from.lane - to.lane) + 1;
-          return (
-            <div
-              key={edge.id}
-              className={`execution-dag-edge execution-dag-edge--${edge.status}`}
-              style={{
-                gridColumn: `${from.col} / ${to.col + 1}`,
-                gridRow: `${row} / span ${rowSpan}`,
-              }}
-              aria-hidden="true"
-            >
-              <span className="execution-dag-edge-line" />
-              {edge.label && <span className="execution-dag-edge-label">{edge.label}</span>}
-            </div>
-          );
-        })}
-        {nodes.map((node) => {
-          const className = `execution-dag-node execution-dag-node--${node.status} execution-dag-node--${node.tone}${node.href ? " execution-dag-node-link" : ""}`;
-          const style = {
-            gridColumn: node.col,
-            gridRow: node.lane + 1,
-          };
-          const content = (
-            <>
-            <div className="execution-dag-node-topline">
-              <span className="execution-dag-dot" aria-hidden="true" />
-              <span className="execution-dag-state">{DAG_STATUS_LABEL[node.status]}</span>
-            </div>
-            <h3 className="execution-dag-title">{node.title}</h3>
-            <p className="execution-dag-meta">{node.meta}</p>
-            {node.score !== undefined && (
-              <span className="execution-dag-score" aria-label={`レビュー点数 ${node.score}点`}>
-                {node.score}点
-              </span>
-            )}
-            </>
-          );
-          if (node.href) {
+      <div className="execution-dag-layout">
+        <div
+          className="execution-dag-grid"
+          style={gridStyle}
+          aria-label="具体的な実行フロー"
+        >
+          {edges.map((edge) => {
+            const from = byId.get(edge.from);
+            const to = byId.get(edge.to);
+            if (!from || !to) return null;
+            const row = Math.min(from.lane, to.lane) + 1;
+            const rowSpan = Math.abs(from.lane - to.lane) + 1;
             return (
-              <Link
+              <div
+                key={edge.id}
+                className={`execution-dag-edge execution-dag-edge--${edge.status}`}
+                style={{
+                  gridColumn: `${from.col} / ${to.col + 1}`,
+                  gridRow: `${row} / span ${rowSpan}`,
+                }}
+                aria-hidden="true"
+              >
+                <span className="execution-dag-edge-line" />
+                {edge.label && <span className="execution-dag-edge-label">{edge.label}</span>}
+              </div>
+            );
+          })}
+          {nodes.map((node) => {
+            const selected = selectedNodeId === node.id;
+            const className = [
+              "execution-dag-node",
+              "execution-dag-node-button",
+              `execution-dag-node--${node.status}`,
+              `execution-dag-node--${node.tone}`,
+              selected ? "execution-dag-node--selected" : "",
+            ].filter(Boolean).join(" ");
+            const style = {
+              gridColumn: node.col,
+              gridRow: node.lane + 1,
+            };
+            return (
+              <button
                 key={node.id}
-                to={node.href}
+                type="button"
                 className={className}
                 style={style}
-                aria-label={node.ariaLabel ?? `${node.title}の結果を開く`}
+                aria-pressed={selected}
+                aria-label={node.ariaLabel ?? `${node.title}を選択`}
+                onClick={() => onSelectNode(node.id)}
               >
-                {content}
-              </Link>
+                <div className="execution-dag-node-topline">
+                  <span className="execution-dag-dot" aria-hidden="true" />
+                  <span className="execution-dag-state">{DAG_STATUS_LABEL[node.status]}</span>
+                </div>
+                <h3 className="execution-dag-title">{node.title}</h3>
+                <p className="execution-dag-meta">{node.meta}</p>
+                {node.score !== undefined && (
+                  <span className="execution-dag-score" aria-label={`レビュー点数 ${node.score}点`}>
+                    {node.score}点
+                  </span>
+                )}
+                {(node.checkpoint || (node.forkCount ?? 0) > 0) && (
+                  <span className="execution-dag-node-footer" aria-hidden="true">
+                    {node.checkpoint && (
+                      <span className="execution-dag-chip">保存済み</span>
+                    )}
+                    {node.checkpoint?.forkable && (
+                      <span className="execution-dag-chip">分岐可</span>
+                    )}
+                    {(node.forkCount ?? 0) > 0 && (
+                      <span className="execution-dag-chip execution-dag-chip--branch">
+                        派生 {node.forkCount}
+                      </span>
+                    )}
+                  </span>
+                )}
+                {(node.forkCount ?? 0) > 0 && (
+                  <span className="execution-dag-branch-stub" aria-hidden="true">
+                    child {node.forkCount}
+                  </span>
+                )}
+              </button>
             );
-          }
-          return (
-            <article key={node.id} className={className} style={style}>
-              {content}
-            </article>
-          );
-        })}
+          })}
+        </div>
+        {inspector}
       </div>
     </section>
+  );
+}
+
+interface CheckpointInspectorProps {
+  node: ExecutionDagNode | null;
+  checkpointsError: unknown;
+  onOpenFork: () => void;
+  forkButtonRef: React.RefObject<HTMLButtonElement | null>;
+}
+
+function CheckpointInspector({
+  node,
+  checkpointsError,
+  onOpenFork,
+  forkButtonRef,
+}: CheckpointInspectorProps) {
+  const checkpoint = node?.checkpoint;
+  const disabledReason = forkDisabledReason(checkpoint);
+  const childForks = checkpointChildForks(checkpoint);
+
+  return (
+    <aside className="checkpoint-inspector" aria-label="選択checkpoint詳細">
+      {!node ? (
+        <div className="checkpoint-inspector-empty">
+          <p className="checkpoint-inspector-title">ノードを選択</p>
+          <p className="checkpoint-inspector-note">
+            実行フローのノードを選ぶと、保存checkpointとフォーク操作を確認できます。
+          </p>
+        </div>
+      ) : (
+        <>
+          <div className="checkpoint-inspector-header">
+            <span className="checkpoint-inspector-kicker">選択中</span>
+            <p className="checkpoint-inspector-title">{node.title}</p>
+            <p className="checkpoint-inspector-note">{node.meta}</p>
+          </div>
+
+          <div className="checkpoint-inspector-links" aria-label="関連リンク">
+            {node.resultHref && (
+              <Link to={node.resultHref} className="btn-secondary btn-sm">
+                結果を開く
+              </Link>
+            )}
+            {node.auditHref && (
+              <Link to={node.auditHref} className="btn-secondary btn-sm">
+                監査ログを開く
+              </Link>
+            )}
+          </div>
+
+          {checkpoint ? (
+            <div className="checkpoint-detail">
+              <dl className="checkpoint-detail-list">
+                <div>
+                  <dt>Checkpoint</dt>
+                  <dd>#{checkpoint.checkpoint_no} / {checkpointKindLabel(checkpoint.kind)}</dd>
+                </div>
+                <div>
+                  <dt>保存時刻</dt>
+                  <dd>{formatDateTime(checkpoint.created_at)}</dd>
+                </div>
+                <div>
+                  <dt>Anchor</dt>
+                  <dd className="mono">{checkpoint.node_anchor}</dd>
+                </div>
+                {(checkpoint.source_attempt_no ?? null) !== null && (
+                  <div>
+                    <dt>Attempt</dt>
+                    <dd>{checkpoint.source_attempt_no}回目</dd>
+                  </div>
+                )}
+                {(checkpoint.source_review_no ?? null) !== null && (
+                  <div>
+                    <dt>Review</dt>
+                    <dd>{checkpoint.source_review_no}回目</dd>
+                  </div>
+                )}
+                {checkpoint.source_response_id && (
+                  <div>
+                    <dt>Response</dt>
+                    <dd className="mono">{shortId(checkpoint.source_response_id)}</dd>
+                  </div>
+                )}
+                {checkpoint.report_hash && (
+                  <div>
+                    <dt>Report hash</dt>
+                    <dd className="mono">{shortId(checkpoint.report_hash, 12)}</dd>
+                  </div>
+                )}
+              </dl>
+
+              <div className="checkpoint-fork-actions">
+                <button
+                  type="button"
+                  className="btn-primary btn-sm"
+                  onClick={onOpenFork}
+                  disabled={!checkpoint.forkable}
+                  aria-describedby={disabledReason ? "fork-disabled-reason" : undefined}
+                  ref={forkButtonRef}
+                >
+                  ここからフォーク
+                </button>
+                {disabledReason && (
+                  <p id="fork-disabled-reason" className="checkpoint-disabled-reason" role="status">
+                    {disabledReason}
+                  </p>
+                )}
+              </div>
+
+              <div className="checkpoint-child-forks">
+                <p className="checkpoint-child-title">派生run</p>
+                {childForks.length > 0 ? (
+                  <ul>
+                    {childForks.map((fork) => (
+                      <li key={fork.run_id}>
+                        <Link to={routes().monitor(fork.run_id)} className="checkpoint-child-link">
+                          {fork.run_id}
+                        </Link>
+                        {fork.status && (
+                          <span className="checkpoint-child-status">{fork.status}</span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="checkpoint-inspector-note">まだ派生runはありません。</p>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="checkpoint-missing" role={checkpointsError ? "alert" : "note"}>
+              {checkpointsError
+                ? "checkpoint一覧を取得できませんでした。再試行中です。"
+                : "このノードに保存済みcheckpointはありません。"}
+            </div>
+          )}
+        </>
+      )}
+    </aside>
+  );
+}
+
+interface ForkModalProps {
+  runId: string;
+  checkpoint: ResearchCheckpoint;
+  parentTitle: string;
+  onClose: () => void;
+  onCreated: (response: ResearchForkSubmitResponse) => void;
+}
+
+function createIdempotencyKey(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `fork-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function queryPolicyStatus(preview: ResearchForkPreviewResponse | null): string {
+  if (!preview) return "未確認";
+  const policy = preview.policy_decision ?? preview.query_policy;
+  if (policy.status === "allowed") return "許可";
+  if (policy.status === "blocked") return "ブロック";
+  return policy.status;
+}
+
+function ForkModal({
+  runId,
+  checkpoint,
+  parentTitle,
+  onClose,
+  onCreated,
+}: ForkModalProps) {
+  const [additionalPrompt, setAdditionalPrompt] = useState("");
+  const [idempotencyKey] = useState(createIdempotencyKey);
+  const [preview, setPreview] = useState<ResearchForkPreviewResponse | null>(null);
+  const [previewPrompt, setPreviewPrompt] = useState<string | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const latestPromptRef = useRef("");
+  const previewRequestSeqRef = useRef(0);
+  const promptEditSeqRef = useRef(0);
+  const trimmedPrompt = additionalPrompt.trim();
+  const previewMatchesPrompt =
+    !!preview && !!trimmedPrompt && previewPrompt === trimmedPrompt;
+
+  useEffect(() => {
+    textareaRef.current?.focus();
+  }, []);
+
+  function focusableElements() {
+    return Array.from(
+      dialogRef.current?.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ) ?? [],
+    );
+  }
+
+  function handleDialogKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      onClose();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const elements = focusableElements();
+    if (elements.length === 0) return;
+    const first = elements[0];
+    const last = elements[elements.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
+  async function handlePreview() {
+    const prompt = trimmedPrompt;
+    if (!prompt) {
+      setError("追加指示を入力してください。");
+      return;
+    }
+    const requestSeq = previewRequestSeqRef.current + 1;
+    const promptEditSeq = promptEditSeqRef.current;
+    previewRequestSeqRef.current = requestSeq;
+    latestPromptRef.current = prompt;
+    setPreviewing(true);
+    setError(null);
+    setPreview(null);
+    setPreviewPrompt(null);
+    try {
+      const nextPreview = await previewCheckpointFork(runId, checkpoint.checkpoint_id, {
+        additional_prompt: prompt,
+      });
+      if (
+        previewRequestSeqRef.current !== requestSeq ||
+        promptEditSeqRef.current !== promptEditSeq ||
+        latestPromptRef.current !== prompt
+      ) {
+        return;
+      }
+      setPreview(nextPreview);
+      setPreviewPrompt(prompt);
+    } catch (err) {
+      if (
+        previewRequestSeqRef.current !== requestSeq ||
+        promptEditSeqRef.current !== promptEditSeq ||
+        latestPromptRef.current !== prompt
+      ) {
+        return;
+      }
+      if (err instanceof ApiError) {
+        setError(err.detail ?? err.message);
+      } else {
+        setError("プレビューを作成できませんでした。");
+      }
+    } finally {
+      if (previewRequestSeqRef.current === requestSeq) {
+        setPreviewing(false);
+      }
+    }
+  }
+
+  async function handleSubmit() {
+    if (!previewMatchesPrompt || !preview || !previewPrompt) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const response = await createCheckpointFork(runId, checkpoint.checkpoint_id, {
+        additional_prompt: previewPrompt,
+        idempotency_key: idempotencyKey,
+        confirmed_preview_hash: preview.preview_hash,
+      });
+      onCreated(response);
+    } catch (err) {
+      if (err instanceof ApiError) {
+        const prefix = err.isConflict ? "プレビューが古くなっています。" : "";
+        setError(`${prefix}${err.detail ?? err.message}`);
+      } else {
+        setError("フォークを作成できませんでした。");
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="fork-modal-backdrop" role="presentation">
+      <div
+        className="fork-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="fork-modal-title"
+        ref={dialogRef}
+        onKeyDown={handleDialogKeyDown}
+      >
+        <div className="fork-modal-header">
+          <div>
+            <p className="fork-modal-kicker">新しいchild run</p>
+            <h2 id="fork-modal-title" className="fork-modal-title">
+              checkpointからフォーク
+            </h2>
+          </div>
+          <button type="button" className="btn-secondary btn-sm" onClick={onClose}>
+            閉じる
+          </button>
+        </div>
+
+        <div className="fork-modal-source">
+          <span>{parentTitle}</span>
+          <span>checkpoint #{checkpoint.checkpoint_no}</span>
+          <span>{checkpointKindLabel(checkpoint.kind)}</span>
+        </div>
+
+        <label className="fork-field">
+          <span>追加指示</span>
+          <textarea
+            ref={textareaRef}
+            value={additionalPrompt}
+            onChange={(event) => {
+              const nextPrompt = event.target.value;
+              promptEditSeqRef.current += 1;
+              latestPromptRef.current = nextPrompt.trim();
+              setAdditionalPrompt(nextPrompt);
+              setPreview(null);
+              setPreviewPrompt(null);
+              setError(null);
+            }}
+            rows={5}
+            className="comment-textarea fork-textarea"
+            placeholder="このcheckpoint以降で追加調査したい観点を入力してください。"
+          />
+        </label>
+
+        <div className="fork-modal-actions">
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={handlePreview}
+            disabled={previewing || submitting || !trimmedPrompt}
+          >
+            {previewing ? "プレビュー中..." : "フォーク内容をプレビュー"}
+          </button>
+          <button
+            type="button"
+            className="btn-primary"
+            onClick={handleSubmit}
+            disabled={!previewMatchesPrompt || submitting || previewing}
+          >
+            {submitting
+              ? "child run作成中..."
+              : "child runで新しいDeep Researchを開始"}
+          </button>
+        </div>
+
+        {error && (
+          <div className="review-submit-error" role="alert">
+            {error}
+          </div>
+        )}
+
+        <div className="fork-preview-panel" aria-live="polite">
+          <p className="fork-preview-title">プレビュー</p>
+          {preview ? (
+            <>
+              <dl className="checkpoint-detail-list">
+                <div>
+                  <dt>Query policy</dt>
+                  <dd>{queryPolicyStatus(preview)}</dd>
+                </div>
+                {(preview.policy_decision ?? preview.query_policy).blocked_reason && (
+                  <div>
+                    <dt>Blocked reason</dt>
+                    <dd>{(preview.policy_decision ?? preview.query_policy).blocked_reason}</dd>
+                  </div>
+                )}
+                <div>
+                  <dt>Preview hash</dt>
+                  <dd className="mono">{shortId(preview.preview_hash, 12)}</dd>
+                </div>
+              </dl>
+              {preview.warnings.length > 0 && (
+                <div className="fork-preview-warnings" role="alert">
+                  {preview.warnings.map((warning) => (
+                    <p key={warning}>{warning}</p>
+                  ))}
+                </div>
+              )}
+              <div className="fork-preview-grid">
+                <section>
+                  <p className="fork-preview-subtitle">元の指示</p>
+                  <pre>{preview.source_prompt_excerpt}</pre>
+                </section>
+                <section>
+                  <p className="fork-preview-subtitle">元レポート</p>
+                  <pre>{preview.source_report_excerpt}</pre>
+                </section>
+                <section className="fork-preview-composed">
+                  <p className="fork-preview-subtitle">送信される指示</p>
+                  <pre>{preview.composed_prompt}</pre>
+                </section>
+              </div>
+            </>
+          ) : (
+            <p className="checkpoint-inspector-note">
+              送信前にプレビューが必要です。入力を変更すると再プレビューが必要になります。
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -646,6 +1261,16 @@ export function RunMonitor({ runId }: RunMonitorProps) {
   const [attempts, setAttempts] = useState<ResearchAttempt[] | null>(null);
   const [attemptsLoading, setAttemptsLoading] = useState(false);
   const [attemptsError, setAttemptsError] = useState<string | null>(null);
+  const [selectedDagNodeId, setSelectedDagNodeId] = useState<string | null>(null);
+  const [forkCheckpoint, setForkCheckpoint] = useState<ResearchCheckpoint | null>(null);
+  const forkButtonRef = useRef<HTMLButtonElement | null>(null);
+  const userSelectedDagNodeRef = useRef(false);
+
+  useEffect(() => {
+    setSelectedDagNodeId(null);
+    userSelectedDagNodeRef.current = false;
+    setForkCheckpoint(null);
+  }, [runId]);
 
   // ── Status polling ────────────────────────────────────────────────────────
 
@@ -707,6 +1332,38 @@ export function RunMonitor({ runId }: RunMonitorProps) {
     },
   });
 
+  // ── Checkpoint polling ───────────────────────────────────────────────────
+
+  const {
+    data: checkpoints,
+    error: checkpointsError,
+    refetch: refetchCheckpoints,
+  } = usePolling<ResearchCheckpoint[]>({
+    fetcher: async (signal) => {
+      try {
+        return await getRunCheckpoints(runId, true, signal);
+      } catch (err) {
+        if (err instanceof ApiError && err.isNotFound) return [];
+        throw err;
+      }
+    },
+    key: `checkpoints:${runId}`,
+    interval: () => (runStatus && isTerminal(runStatus.status) ? null : 15_000),
+  });
+
+  const { data: lineage } = usePolling<ResearchRunLineage | null>({
+    fetcher: async (signal) => {
+      try {
+        return await getRunLineage(runId, signal);
+      } catch (err) {
+        if (err instanceof ApiError && err.isNotFound) return null;
+        throw err;
+      }
+    },
+    key: `lineage:${runId}`,
+    interval: () => null,
+  });
+
   // ── Item polling ──────────────────────────────────────────────────────────
 
   const { data: items } = usePolling<ResearchItem[]>({
@@ -724,13 +1381,59 @@ export function RunMonitor({ runId }: RunMonitorProps) {
 
   const status = runStatus?.status ?? (tracked?.last_status ?? "queued");
   const progress = runStatus?.progress;
-  const sortedReviews = Array.isArray(audit?.reviews)
-    ? [...audit.reviews].sort((a, b) => a.review_no - b.review_no)
-    : [];
-  const auditHistory = Array.isArray(audit?.history) ? audit.history : [];
-  const sortedAttempts = Array.isArray(dagAttempts)
-    ? dagAttempts
-    : [];
+  const sortedReviews = useMemo(
+    () =>
+      Array.isArray(audit?.reviews)
+        ? [...audit.reviews].sort((a, b) => a.review_no - b.review_no)
+        : [],
+    [audit?.reviews],
+  );
+  const auditHistory = useMemo(
+    () => (Array.isArray(audit?.history) ? audit.history : []),
+    [audit?.history],
+  );
+  const sortedAttempts = useMemo(
+    () => (Array.isArray(dagAttempts) ? dagAttempts : []),
+    [dagAttempts],
+  );
+  const dagData = useMemo(
+    () =>
+      buildExecutionDag({
+        status,
+        attempts: sortedAttempts,
+        reviews: sortedReviews,
+        history: auditHistory,
+        progress,
+        runId,
+        checkpoints: checkpoints ?? [],
+        lineage: lineage ?? null,
+      }),
+    [auditHistory, checkpoints, lineage, progress, runId, sortedAttempts, sortedReviews, status],
+  );
+  const selectedDagNodeById = dagData.nodes.find((node) => node.id === selectedDagNodeId);
+  const preferredDagNode =
+    dagData.nodes.find((node) => node.checkpoint) ??
+    dagData.nodes.find((node) => node.status === "active") ??
+    dagData.nodes[0] ??
+    null;
+  const selectedDagNode =
+    userSelectedDagNodeRef.current && selectedDagNodeById
+      ? selectedDagNodeById
+      : preferredDagNode;
+  const lineageSnapshot = asRecord(lineage?.source_snapshot_json);
+
+  useEffect(() => {
+    if (!preferredDagNode) {
+      if (selectedDagNodeId !== null) setSelectedDagNodeId(null);
+      return;
+    }
+    if (!selectedDagNodeById) {
+      userSelectedDagNodeRef.current = false;
+    }
+    if (!userSelectedDagNodeRef.current && preferredDagNode.id !== selectedDagNodeId) {
+      setSelectedDagNodeId(preferredDagNode.id);
+    }
+  }, [preferredDagNode, selectedDagNodeById, selectedDagNodeId]);
 
   const elapsed = useElapsed(tracked?.created_at, !isTerminal(status));
   const currentDeepResearchStartedAt =
@@ -805,6 +1508,18 @@ export function RunMonitor({ runId }: RunMonitorProps) {
     } finally {
       setAttemptsLoading(false);
     }
+  }
+
+  function handleForkCreated(response: ResearchForkSubmitResponse) {
+    trackRun({
+      run_id: response.child_run_id,
+      title: `フォーク: ${tracked?.title ?? runId}`,
+      created_at: new Date().toISOString(),
+      last_status: response.status,
+    });
+    setForkCheckpoint(null);
+    refetchCheckpoints();
+    navigate(routes().monitor(response.child_run_id));
   }
 
   // Initial loading state
@@ -889,6 +1604,49 @@ export function RunMonitor({ runId }: RunMonitorProps) {
         <div className="monitor-error-banner" role="alert">
           {cancelError}
         </div>
+      )}
+
+      {lineage?.parent_run_id && (
+        <section className="lineage-banner" aria-labelledby="lineage-banner-title">
+          <div className="lineage-banner-main">
+            <span className="lineage-banner-kicker">child run</span>
+            <h2 id="lineage-banner-title" className="lineage-banner-title">
+              checkpointからフォークされたrunです
+            </h2>
+            <dl className="lineage-banner-meta">
+              <div>
+                <dt>Parent</dt>
+                <dd>
+                  <Link to={routes().monitor(lineage.parent_run_id)} className="lineage-banner-link">
+                    {lineage.parent_run_id}
+                  </Link>
+                </dd>
+              </div>
+              <div>
+                <dt>Checkpoint</dt>
+                <dd className="mono">{shortId(lineage.forked_from_checkpoint_id, 12)}</dd>
+              </div>
+              <div>
+                <dt>Source</dt>
+                <dd>
+                  {snapshotNumber(lineageSnapshot, "source_attempt_no")
+                    ? `Attempt ${snapshotNumber(lineageSnapshot, "source_attempt_no")} `
+                    : ""}
+                  {snapshotNumber(lineageSnapshot, "source_review_no")
+                    ? `Review ${snapshotNumber(lineageSnapshot, "source_review_no")}`
+                    : ""}
+                  {!snapshotNumber(lineageSnapshot, "source_attempt_no") &&
+                    !snapshotNumber(lineageSnapshot, "source_review_no") &&
+                    "snapshot保存済み"}
+                </dd>
+              </div>
+            </dl>
+          </div>
+          <div className="lineage-banner-prompt">
+            <span>追加指示</span>
+            <p>{lineage.additional_prompt}</p>
+          </div>
+        </section>
       )}
 
       {promptPanelOpen && (
@@ -1068,13 +1826,42 @@ export function RunMonitor({ runId }: RunMonitorProps) {
       </div>
 
       <ExecutionDag
-        status={status}
+        nodes={dagData.nodes}
+        edges={dagData.edges}
+        progress={progress}
         attempts={sortedAttempts}
         reviews={sortedReviews}
-        history={auditHistory}
-        progress={progress}
-        runId={runId}
+        selectedNodeId={selectedDagNode?.id ?? null}
+        onSelectNode={(nodeId) => {
+          userSelectedDagNodeRef.current = true;
+          setSelectedDagNodeId(nodeId);
+        }}
+        inspector={
+          <CheckpointInspector
+            node={selectedDagNode}
+            checkpointsError={checkpointsError}
+            onOpenFork={() => {
+              if (selectedDagNode?.checkpoint?.forkable) {
+                setForkCheckpoint(selectedDagNode.checkpoint);
+              }
+            }}
+            forkButtonRef={forkButtonRef}
+          />
+        }
       />
+
+      {forkCheckpoint && (
+        <ForkModal
+          runId={runId}
+          checkpoint={forkCheckpoint}
+          parentTitle={tracked?.title ?? runId}
+          onClose={() => {
+            setForkCheckpoint(null);
+            window.setTimeout(() => forkButtonRef.current?.focus(), 0);
+          }}
+          onCreated={handleForkCreated}
+        />
+      )}
 
       {/* ── Wait banner ───────────────────────────────── */}
       {isWaiting && (

@@ -22,7 +22,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
-import type { AuditResponse, ItemAssessment, ReviewRecord } from "./types";
+import type { AuditResponse, ItemAssessment, ResearchCheckpoint, ReviewRecord } from "./types";
 
 // ── Global jsdom stubs ────────────────────────────────────────────────────────
 
@@ -112,6 +112,26 @@ function makeAuditResponse(overrides: Partial<AuditResponse> = {}): AuditRespons
     cost_events: [],
     human_decisions: [],
     history: [],
+    ...overrides,
+  };
+}
+
+function makeCheckpoint(overrides: Partial<ResearchCheckpoint> = {}): ResearchCheckpoint {
+  return {
+    checkpoint_id: "chk-research-1",
+    run_id: "run-checkpoint-fixture",
+    checkpoint_no: 1,
+    kind: "deep_research_collected",
+    node_anchor: "research-1",
+    forkable: true,
+    dedupe_key: "deep-research-1",
+    source_attempt_no: 1,
+    source_review_no: null,
+    source_response_id: "resp_research_1",
+    report_hash: "report-hash-1",
+    snapshot_json: {},
+    created_at: "2026-06-06T03:10:00.000Z",
+    child_forks: [],
     ...overrides,
   };
 }
@@ -1285,7 +1305,7 @@ describe("RunMonitor (SCR-3)", () => {
     expect(screen.getByText("復旧したレビュー履歴です")).toBeInTheDocument();
   });
 
-  it("links execution DAG nodes to their result screens", async () => {
+  it("selects execution DAG nodes and exposes result links in the inspector", async () => {
     globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith(`/research-runs/${runId}/audit`)) {
@@ -1367,6 +1387,38 @@ describe("RunMonitor (SCR-3)", () => {
             ]),
         } as Response);
       }
+      if (url.includes(`/research-runs/${runId}/checkpoints`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              run_id: runId,
+              checkpoints: [
+                makeCheckpoint({
+                  run_id: runId,
+                  checkpoint_id: "chk-research-1",
+                  node_anchor: "research-1",
+                  source_attempt_no: 1,
+                  child_forks: [
+                    {
+                      run_id: "child-run-1",
+                      status: "waiting_deep_research",
+                      created_at: "2026-06-06T04:10:00.000Z",
+                    },
+                  ],
+                }),
+              ],
+            }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/lineage`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, lineage: null }),
+        } as Response);
+      }
       if (url.endsWith(`/research-runs/${runId}/items`)) {
         return Promise.resolve({
           ok: true,
@@ -1401,16 +1453,621 @@ describe("RunMonitor (SCR-3)", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("link", { name: "Deep Research 1回目の結果を開く" }))
+    const researchNode = await screen.findByRole("button", {
+      name: "Deep Research 1回目を選択",
+    });
+    await userEvent.click(researchNode);
+    expect(screen.getByRole("link", { name: "結果を開く" }))
       .toHaveAttribute("href", `#/runs/${runId}/report?tab=research&attempt=1`);
-    expect(screen.getByRole("link", { name: "LLMレビュー 1回目の結果を開く" }))
+    const inspector = screen.getByRole("complementary", { name: "選択checkpoint詳細" });
+    expect(
+      within(inspector).getByText(
+        (_content, element) => element?.textContent === "#1 / Deep Research収集後",
+      ),
+    ).toBeInTheDocument();
+    expect(within(inspector).getByRole("button", { name: "ここからフォーク" }))
+      .toBeEnabled();
+    expect(within(inspector).getByRole("link", { name: "child-run-1" }))
+      .toHaveAttribute("href", "#/runs/child-run-1");
+
+    await userEvent.click(screen.getByRole("button", { name: "LLMレビュー 1回目を選択" }));
+    expect(screen.getByRole("link", { name: "監査ログを開く" }))
       .toHaveAttribute("href", `#/runs/${runId}/audit?tab=reviews&review=1`);
-    expect(screen.getByRole("link", { name: "LLMパッチ 1回目の結果を開く" }))
+
+    await userEvent.click(screen.getByRole("button", { name: "LLMパッチ 1回目を選択" }));
+    expect(screen.getByRole("link", { name: "監査ログを開く" }))
       .toHaveAttribute("href", `#/runs/${runId}/audit?tab=reviews&review=1`);
-    expect(screen.getByRole("link", { name: "最終レポートの結果を開く" }))
+
+    await userEvent.click(screen.getByRole("button", { name: "最終レポートを選択" }));
+    expect(screen.getByRole("link", { name: "結果を開く" }))
       .toHaveAttribute("href", `#/runs/${runId}/report`);
     expect(screen.getByRole("link", { name: "最終レポートを開く" }))
       .toHaveAttribute("href", `#/runs/${runId}/report`);
+  });
+
+  it("shows checkpoint details and child forks in the inspector", async () => {
+    const checkpoint = makeCheckpoint({
+      run_id: runId,
+      child_forks: [
+        {
+          run_id: "child-run-1",
+          status: "waiting_deep_research",
+          created_at: "2026-06-06T03:20:00.000Z",
+        },
+      ],
+    });
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/checkpoints?include_forks=true`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, checkpoints: [checkpoint] }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/lineage`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, lineage: null }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/audit`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(makeAuditResponse({ run_id: runId, reviews: [] })),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve([
+              {
+                run_no: 1,
+                response_id: "resp_research_1",
+                status: "completed",
+                model: "o3-deep-research",
+                prompt: "# 指示 1",
+                report: "# Deep Research 1",
+                citations: [],
+                tool_calls_summary: [],
+                error: null,
+              },
+            ]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/items`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, items: [] }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "completed",
+            done_reason: "passed_review",
+            needs_human_review: false,
+            progress: {
+              deep_research_runs: 1,
+              targeted_rerun_runs: 0,
+              full_rerun_runs: 0,
+              llm_patch_runs: 0,
+              verification_runs: 0,
+              total_reviews: 0,
+              latest_verdict: null,
+              latest_score: null,
+              total_tool_calls: 0,
+              estimated_cost_usd: 1,
+            },
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    const researchNode = await screen.findByRole("button", {
+      name: "Deep Research 1回目を選択",
+    });
+    expect(within(researchNode).getByText("保存済み")).toBeInTheDocument();
+    expect(within(researchNode).getByText("分岐可")).toBeInTheDocument();
+    expect(within(researchNode).getByText("派生 1")).toBeInTheDocument();
+    expect(screen.getByText("#1 / Deep Research収集後")).toBeInTheDocument();
+    expect(screen.getByText(/report-hash-/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "child-run-1" }))
+      .toHaveAttribute("href", "#/runs/child-run-1");
+    expect(screen.getByRole("button", { name: "ここからフォーク" })).toBeEnabled();
+  });
+
+  it("requires fork preview before submit and navigates to the child run", async () => {
+    const checkpoint = makeCheckpoint({ run_id: runId });
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/checkpoints/chk-research-1/fork-preview`)) {
+        expect(init?.method).toBe("POST");
+        expect(JSON.parse(String(init?.body))).toEqual({
+          additional_prompt: "追加で競合比較を深掘りしてください。",
+        });
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              composed_prompt: "合成されたフォーク指示",
+              query_policy: { status: "allowed", safe_queries: [] },
+              policy_decision: { status: "allowed", safe_queries: [] },
+              source_prompt_excerpt: "元の指示抜粋",
+              source_report_excerpt: "元レポート抜粋",
+              warnings: ["新しいDeep Researchとして課金されます"],
+              preview_hash: "preview-hash-1",
+            }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/checkpoints/chk-research-1/forks`)) {
+        expect(init?.method).toBe("POST");
+        expect(JSON.parse(String(init?.body))).toEqual({
+          additional_prompt: "追加で競合比較を深掘りしてください。",
+          idempotency_key: expect.any(String),
+          confirmed_preview_hash: "preview-hash-1",
+        });
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              run_id: "child-run-created",
+              parent_run_id: runId,
+              forked_from_checkpoint_id: "chk-research-1",
+              child_run_id: "child-run-created",
+              status: "waiting_deep_research",
+              done_reason: null,
+              needs_human_review: false,
+              source_snapshot_json: {},
+              lineage: {
+                run_id: "child-run-created",
+                root_run_id: runId,
+                parent_run_id: runId,
+                forked_from_checkpoint_id: "chk-research-1",
+                fork_mode: "checkpoint",
+                additional_prompt: "追加で競合比較を深掘りしてください。",
+                confirmed_preview_hash: "preview-hash-1",
+                idempotency_key: "test-idempotency-key",
+                source_snapshot_json: {},
+                created_at: "2026-06-06T04:20:00.000Z",
+              },
+            }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/checkpoints?include_forks=true`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, checkpoints: [checkpoint] }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/lineage`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, lineage: null }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/audit`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(makeAuditResponse({ run_id: runId, reviews: [] })),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve([
+              {
+                run_no: 1,
+                response_id: "resp_research_1",
+                status: "completed",
+                model: "o3-deep-research",
+                prompt: "# 指示 1",
+                report: "# Deep Research 1",
+                citations: [],
+                tool_calls_summary: [],
+                error: null,
+              },
+            ]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/items`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, items: [] }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: url.includes("child-run-created") ? "child-run-created" : runId,
+            status: "completed",
+            done_reason: null,
+            needs_human_review: false,
+            progress: {
+              deep_research_runs: 1,
+              targeted_rerun_runs: 0,
+              full_rerun_runs: 0,
+              llm_patch_runs: 0,
+              verification_runs: 0,
+              total_reviews: 0,
+              latest_verdict: null,
+              latest_score: null,
+              total_tool_calls: 0,
+              estimated_cost_usd: 0,
+            },
+          }),
+      } as Response);
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "ここからフォーク" }));
+    const submitButton = screen.getByRole("button", {
+      name: "child runで新しいDeep Researchを開始",
+    });
+    expect(submitButton).toBeDisabled();
+
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "追加指示" }),
+      "追加で競合比較を深掘りしてください。",
+    );
+    expect(submitButton).toBeDisabled();
+
+    await userEvent.click(screen.getByRole("button", { name: "フォーク内容をプレビュー" }));
+    expect(await screen.findByText("合成されたフォーク指示")).toBeInTheDocument();
+    expect(submitButton).toBeEnabled();
+
+    await userEvent.click(submitButton);
+    await waitFor(() => {
+      expect(window.location.hash).toBe("#/runs/child-run-created");
+    });
+  });
+
+  it("invalidates fork preview when the additional prompt changes", async () => {
+    const checkpoint = makeCheckpoint({ run_id: runId });
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/checkpoints/chk-research-1/fork-preview`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              composed_prompt: "合成されたフォーク指示",
+              query_policy: { status: "allowed", safe_queries: [] },
+              policy_decision: { status: "allowed", safe_queries: [] },
+              source_prompt_excerpt: "元の指示抜粋",
+              source_report_excerpt: "元レポート抜粋",
+              warnings: [],
+              preview_hash: "preview-hash-1",
+            }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/checkpoints?include_forks=true`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, checkpoints: [checkpoint] }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/lineage`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, lineage: null }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/audit`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(makeAuditResponse({ run_id: runId, reviews: [] })),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/items`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, items: [] }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "completed",
+            done_reason: null,
+            needs_human_review: false,
+            progress: {
+              deep_research_runs: 1,
+              targeted_rerun_runs: 0,
+              full_rerun_runs: 0,
+              llm_patch_runs: 0,
+              verification_runs: 0,
+              total_reviews: 0,
+              latest_verdict: null,
+              latest_score: null,
+              total_tool_calls: 0,
+              estimated_cost_usd: 0,
+            },
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "ここからフォーク" }));
+    const textarea = screen.getByRole("textbox", { name: "追加指示" });
+    const submitButton = screen.getByRole("button", {
+      name: "child runで新しいDeep Researchを開始",
+    });
+    await userEvent.type(textarea, "追加調査");
+    await userEvent.click(screen.getByRole("button", { name: "フォーク内容をプレビュー" }));
+    await screen.findByText("合成されたフォーク指示");
+    expect(submitButton).toBeEnabled();
+
+    await userEvent.type(textarea, "を変更");
+    expect(submitButton).toBeDisabled();
+    expect(screen.getByText(/再プレビューが必要/)).toBeInTheDocument();
+  });
+
+  it("does not adopt an in-flight stale fork preview response", async () => {
+    const checkpoint = makeCheckpoint({ run_id: runId });
+    let resolveFirstPreview: (response: Response) => void = () => {
+      throw new Error("First preview request was not started.");
+    };
+    globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/checkpoints/chk-research-1/fork-preview`)) {
+        const body = JSON.parse(String(init?.body)) as { additional_prompt: string };
+        if (body.additional_prompt === "古い指示") {
+          return new Promise<Response>((resolve) => {
+            resolveFirstPreview = resolve;
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              composed_prompt: "現在のフォーク指示",
+              query_policy: { status: "allowed", safe_queries: [] },
+              policy_decision: { status: "allowed", safe_queries: [] },
+              source_prompt_excerpt: "元の指示抜粋",
+              source_report_excerpt: "元レポート抜粋",
+              warnings: [],
+              preview_hash: "preview-hash-current",
+            }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/checkpoints?include_forks=true`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, checkpoints: [checkpoint] }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/lineage`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, lineage: null }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/audit`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(makeAuditResponse({ run_id: runId, reviews: [] })),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/items`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, items: [] }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "completed",
+            done_reason: null,
+            needs_human_review: false,
+            progress: {
+              deep_research_runs: 1,
+              targeted_rerun_runs: 0,
+              full_rerun_runs: 0,
+              llm_patch_runs: 0,
+              verification_runs: 0,
+              total_reviews: 0,
+              latest_verdict: null,
+              latest_score: null,
+              total_tool_calls: 0,
+              estimated_cost_usd: 0,
+            },
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "ここからフォーク" }));
+    const textarea = screen.getByRole("textbox", { name: "追加指示" });
+    const previewButton = screen.getByRole("button", { name: "フォーク内容をプレビュー" });
+    const submitButton = screen.getByRole("button", {
+      name: "child runで新しいDeep Researchを開始",
+    });
+
+    await userEvent.type(textarea, "古い指示");
+    await userEvent.click(previewButton);
+    await userEvent.type(textarea, " updated");
+    expect(submitButton).toBeDisabled();
+
+    resolveFirstPreview({
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve({
+          composed_prompt: "古いフォーク指示",
+          query_policy: { status: "allowed", safe_queries: [] },
+          policy_decision: { status: "allowed", safe_queries: [] },
+          source_prompt_excerpt: "元の指示抜粋",
+          source_report_excerpt: "元レポート抜粋",
+          warnings: [],
+          preview_hash: "preview-hash-stale",
+        }),
+    } as Response);
+
+    await waitFor(() => expect(previewButton).toBeEnabled());
+    expect(screen.queryByText("古いフォーク指示")).not.toBeInTheDocument();
+    expect(submitButton).toBeDisabled();
+
+    await userEvent.click(previewButton);
+    expect(await screen.findByText("現在のフォーク指示")).toBeInTheDocument();
+    expect(submitButton).toBeEnabled();
+  });
+
+  it("shows fork submit 409 errors in the modal", async () => {
+    const checkpoint = makeCheckpoint({ run_id: runId });
+    globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/checkpoints/chk-research-1/fork-preview`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              composed_prompt: "合成されたフォーク指示",
+              query_policy: { status: "allowed", safe_queries: [] },
+              policy_decision: { status: "allowed", safe_queries: [] },
+              source_prompt_excerpt: "元の指示抜粋",
+              source_report_excerpt: "元レポート抜粋",
+              warnings: [],
+              preview_hash: "preview-hash-1",
+            }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/checkpoints/chk-research-1/forks`)) {
+        expect(init?.method).toBe("POST");
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          json: () => Promise.resolve({ detail: "preview hash mismatch" }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/checkpoints?include_forks=true`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, checkpoints: [checkpoint] }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/lineage`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, lineage: null }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/audit`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(makeAuditResponse({ run_id: runId, reviews: [] })),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/items`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, items: [] }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "completed",
+            done_reason: null,
+            needs_human_review: false,
+            progress: {
+              deep_research_runs: 1,
+              targeted_rerun_runs: 0,
+              full_rerun_runs: 0,
+              llm_patch_runs: 0,
+              verification_runs: 0,
+              total_reviews: 0,
+              latest_verdict: null,
+              latest_score: null,
+              total_tool_calls: 0,
+              estimated_cost_usd: 0,
+            },
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "ここからフォーク" }));
+    await userEvent.type(screen.getByRole("textbox", { name: "追加指示" }), "追加調査");
+    await userEvent.click(screen.getByRole("button", { name: "フォーク内容をプレビュー" }));
+    await screen.findByText("合成されたフォーク指示");
+    await userEvent.click(
+      screen.getByRole("button", { name: "child runで新しいDeep Researchを開始" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "プレビューが古くなっています。preview hash mismatch",
+    );
   });
 
   it("does not render a third verification node when only two verification runs executed", async () => {
@@ -1743,10 +2400,16 @@ describe("RunMonitor (SCR-3)", () => {
 
     render(<App />);
 
-    const decisionNode = await screen.findByRole("link", { name: "人間判断画面を開く" });
-    expect(decisionNode).toHaveAttribute("href", `#/runs/${runId}/review`);
+    const decisionNode = await screen.findByRole("button", { name: "人間判断を選択" });
+    await userEvent.click(decisionNode);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "人間判断を選択" }))
+        .toHaveAttribute("aria-pressed", "true"),
+    );
     expect(within(decisionNode).getByText("人間判断")).toBeInTheDocument();
     expect(within(decisionNode).getByText("実行中")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "結果を開く" }))
+      .toHaveAttribute("href", `#/runs/${runId}/review`);
   });
 
   it("uses progress Deep Research count for the active DAG node when attempts lag", async () => {
@@ -1813,12 +2476,349 @@ describe("RunMonitor (SCR-3)", () => {
 
     render(<App />);
 
-    const activeResearchNode = await screen.findByRole("link", {
-      name: "Deep Research 2回目の結果を開く",
+    const activeResearchNode = await screen.findByRole("button", {
+      name: "Deep Research 2回目を選択",
     });
-    expect(activeResearchNode)
-      .toHaveAttribute("href", `#/runs/${runId}/report?tab=research&attempt=2`);
+    await userEvent.click(activeResearchNode);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Deep Research 2回目を選択" }))
+        .toHaveAttribute("aria-pressed", "true"),
+    );
     expect(within(activeResearchNode).getByText("実行中")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "結果を開く" }))
+      .toHaveAttribute("href", `#/runs/${runId}/report?tab=research&attempt=2`);
+  });
+
+  it("shows child run lineage and starts the DAG with a fork source node", async () => {
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/lineage`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              run_id: runId,
+              lineage: {
+                run_id: runId,
+                root_run_id: "root-run",
+                parent_run_id: "parent-run",
+                forked_from_checkpoint_id: "chk-parent-1",
+                fork_mode: "checkpoint",
+                additional_prompt: "未調査の国内事例を追加してください。",
+                source_snapshot_json: {
+                  source_attempt_no: 1,
+                  source_review_no: 2,
+                },
+                created_at: "2026-06-06T04:00:00.000Z",
+              },
+            }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/checkpoints?include_forks=true`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, checkpoints: [] }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/audit`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(makeAuditResponse({ run_id: runId, reviews: [] })),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve([
+              {
+                run_no: 1,
+                response_id: "resp_child_1",
+                status: "running",
+                model: "o3-deep-research",
+                prompt: "# child 指示",
+                report: "",
+                citations: [],
+                tool_calls_summary: [],
+                error: null,
+              },
+            ]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/items`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, items: [] }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "collecting",
+            done_reason: null,
+            needs_human_review: false,
+            progress: {
+              deep_research_runs: 1,
+              targeted_rerun_runs: 0,
+              full_rerun_runs: 0,
+              llm_patch_runs: 0,
+              verification_runs: 0,
+              total_reviews: 0,
+              latest_verdict: null,
+              latest_score: null,
+              total_tool_calls: 2,
+              estimated_cost_usd: 0.2,
+            },
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("checkpointからフォークされたrunです")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "parent-run" }))
+      .toHaveAttribute("href", "#/runs/parent-run");
+    expect(screen.getByText("未調査の国内事例を追加してください。")).toBeInTheDocument();
+    expect(screen.getByText("Attempt 1 Review 2")).toBeInTheDocument();
+
+    const dag = screen.getByRole("region", { name: "具体的な実行フロー" });
+    const nodeTitles = within(dag)
+      .getAllByRole("heading", { level: 3 })
+      .map((heading) => heading.textContent);
+    expect(nodeTitles.slice(0, 2)).toEqual(["フォーク元", "Deep Research 1回目"]);
+  });
+
+  it("resets DAG node selection when the run id changes", async () => {
+    const nextRunId = "run-reset-target";
+    localStorage.setItem(
+      "dro.trackedRuns",
+      JSON.stringify([
+        {
+          run_id: runId,
+          title: "選択リセット元",
+          created_at: new Date().toISOString(),
+          last_status: "completed",
+        },
+        {
+          run_id: nextRunId,
+          title: "選択リセット先",
+          created_at: new Date().toISOString(),
+          last_status: "completed",
+        },
+      ]),
+    );
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      const currentRunId = url.includes(`/research-runs/${nextRunId}`) ? nextRunId : runId;
+      if (url.endsWith(`/research-runs/${currentRunId}/checkpoints?include_forks=true`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              run_id: currentRunId,
+              checkpoints:
+                currentRunId === nextRunId
+                  ? [makeCheckpoint({ run_id: nextRunId })]
+                  : [],
+            }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${currentRunId}/lineage`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: currentRunId, lineage: null }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${currentRunId}/audit`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(makeAuditResponse({ run_id: currentRunId, reviews: [] })),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${currentRunId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${currentRunId}/items`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: currentRunId, items: [] }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: currentRunId,
+            status: "completed",
+            done_reason: "passed_review",
+            needs_human_review: false,
+            progress: {
+              deep_research_runs: 1,
+              targeted_rerun_runs: 0,
+              full_rerun_runs: 0,
+              llm_patch_runs: 0,
+              verification_runs: 0,
+              total_reviews: 0,
+              latest_verdict: null,
+              latest_score: null,
+              total_tool_calls: 0,
+              estimated_cost_usd: 0,
+            },
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    const finalNode = await screen.findByRole("button", { name: "最終レポートを選択" });
+    await userEvent.click(finalNode);
+    expect(finalNode).toHaveAttribute("aria-pressed", "true");
+
+    act(() => {
+      window.location.hash = `#/runs/${nextRunId}`;
+      window.dispatchEvent(new Event("hashchange"));
+    });
+
+    expect(await screen.findByText(nextRunId)).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "ここからフォーク" })).toBeEnabled();
+  });
+
+  it("matches follow-up checkpoints by exact anchor before guarded fallback", async () => {
+    const exactFollowUpCheckpoint = makeCheckpoint({
+      checkpoint_id: "chk-followup-exact",
+      run_id: runId,
+      checkpoint_no: 2,
+      kind: "llm_patch_applied",
+      node_anchor: "followup-2",
+      source_attempt_no: null,
+      source_review_no: 1,
+    });
+    const legacyFollowUpCheckpoint = makeCheckpoint({
+      checkpoint_id: "chk-followup-legacy",
+      run_id: runId,
+      checkpoint_no: 3,
+      kind: "llm_patch_applied",
+      node_anchor: "legacy-patch",
+      source_attempt_no: null,
+      source_review_no: null,
+    });
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/checkpoints?include_forks=true`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              run_id: runId,
+              checkpoints: [legacyFollowUpCheckpoint, exactFollowUpCheckpoint],
+            }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/lineage`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, lineage: null }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/audit`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve(
+              makeAuditResponse({
+                run_id: runId,
+                reviews: [
+                  makeReviewRecord({
+                    review_no: 1,
+                    verdict: "needs_llm_patch",
+                    recommended_route: "needs_llm_patch",
+                  }),
+                  makeReviewRecord({
+                    review_no: 2,
+                    verdict: "needs_llm_patch",
+                    recommended_route: "needs_llm_patch",
+                    reviewer_response_id: "resp_review_2",
+                  }),
+                ],
+                history: [
+                  { step: "route_after_review", total_reviews: 1, route: "llm_patch" },
+                  { step: "llm_patch" },
+                  { step: "route_after_review", total_reviews: 2, route: "llm_patch" },
+                  { step: "llm_patch" },
+                ],
+              }),
+            ),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/items`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, items: [] }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "completed",
+            done_reason: "passed_review",
+            needs_human_review: false,
+            progress: {
+              deep_research_runs: 1,
+              targeted_rerun_runs: 0,
+              full_rerun_runs: 0,
+              llm_patch_runs: 2,
+              verification_runs: 0,
+              total_reviews: 2,
+              latest_verdict: "needs_llm_patch",
+              latest_score: 70,
+              total_tool_calls: 0,
+              estimated_cost_usd: 0,
+            },
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    const firstPatch = await screen.findByRole("button", {
+      name: "LLMパッチ 1回目を選択",
+    });
+    const secondPatch = await screen.findByRole("button", {
+      name: "LLMパッチ 2回目を選択",
+    });
+    expect(within(firstPatch).queryByText("保存済み")).not.toBeInTheDocument();
+    expect(within(secondPatch).getByText("保存済み")).toBeInTheDocument();
   });
 });
 

@@ -17,7 +17,10 @@ from api.research.schemas import (
     RecommendedAction,
     RerunPlan,
     ResearchAttempt,
+    ResearchCheckpoint,
+    ResearchCheckpointChildFork,
     ResearchItem,
+    ResearchRunLineage,
     ResearchRunOptions,
     ResearchRunRecord,
     ReviewRecord,
@@ -72,6 +75,21 @@ def _legacy_review_flags(review: ReviewRecord) -> dict[str, int]:
         "can_be_fixed_by_llm": int(can_be_fixed_by_llm),
         "requires_new_external_research": int(requires_new_external_research),
     }
+
+
+def _validate_existing_lineage_request(
+    lineage: ResearchRunLineage,
+    *,
+    additional_prompt: str,
+    confirmed_preview_hash: str,
+) -> None:
+    if (
+        lineage.additional_prompt != additional_prompt
+        or lineage.confirmed_preview_hash != confirmed_preview_hash
+    ):
+        raise ValueError(
+            "Fork idempotency key already exists with a different prompt or preview hash."
+        )
 
 
 class ResearchRepository:
@@ -252,6 +270,49 @@ class ResearchRepository:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS research_checkpoints (
+                    checkpoint_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
+                    checkpoint_no INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    node_anchor TEXT NOT NULL,
+                    forkable INTEGER NOT NULL DEFAULT 0,
+                    dedupe_key TEXT NOT NULL,
+                    source_attempt_no INTEGER,
+                    source_review_no INTEGER,
+                    source_response_id TEXT,
+                    report_hash TEXT,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS research_run_lineage (
+                    run_id TEXT PRIMARY KEY REFERENCES research_runs(id) ON DELETE CASCADE,
+                    root_run_id TEXT NOT NULL,
+                    parent_run_id TEXT NOT NULL,
+                    forked_from_checkpoint_id TEXT NOT NULL,
+                    fork_mode TEXT NOT NULL,
+                    additional_prompt TEXT NOT NULL,
+                    confirmed_preview_hash TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    source_snapshot_json TEXT NOT NULL,
+                    source_report_artifact_path TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS research_checkpoints_run_no_unique
+                ON research_checkpoints(run_id, checkpoint_no);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS research_checkpoints_run_dedupe_unique
+                ON research_checkpoints(run_id, dedupe_key);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS research_run_lineage_parent_request_unique
+                ON research_run_lineage(
+                    parent_run_id,
+                    forked_from_checkpoint_id,
+                    idempotency_key
+                );
+
                 CREATE UNIQUE INDEX IF NOT EXISTS research_cost_events_response_dedupe
                 ON research_cost_events(run_id, step, response_id)
                 WHERE response_id IS NOT NULL AND response_id != '';
@@ -338,6 +399,135 @@ class ResearchRepository:
 
         return self.get_run(run_id)
 
+    def create_fork_run(
+        self,
+        *,
+        parent: ResearchRunRecord,
+        root_run_id: UUID,
+        checkpoint: ResearchCheckpoint,
+        additional_prompt: str,
+        confirmed_preview_hash: str,
+        idempotency_key: str,
+        source_snapshot_json: dict[str, Any],
+        source_report_artifact_path: str | None,
+        seed_report: str,
+    ) -> tuple[ResearchRunRecord, ResearchRunLineage, bool]:
+        existing = self.get_lineage_by_fork_request(
+            parent_run_id=parent.id,
+            checkpoint_id=checkpoint.checkpoint_id,
+            idempotency_key=idempotency_key,
+        )
+        if existing is not None:
+            _validate_existing_lineage_request(
+                existing,
+                additional_prompt=additional_prompt,
+                confirmed_preview_hash=confirmed_preview_hash,
+            )
+            return self.get_run(existing.run_id), existing, False
+
+        now = utc_now()
+        child_run_id = uuid4()
+        thread_id = str(uuid4())
+        lineage = ResearchRunLineage(
+            run_id=child_run_id,
+            root_run_id=root_run_id,
+            parent_run_id=parent.id,
+            forked_from_checkpoint_id=checkpoint.checkpoint_id,
+            fork_mode="deep_research_delta",
+            additional_prompt=additional_prompt,
+            confirmed_preview_hash=confirmed_preview_hash,
+            idempotency_key=idempotency_key,
+            source_snapshot_json=source_snapshot_json,
+            source_report_artifact_path=source_report_artifact_path,
+            created_at=now,
+        )
+
+        try:
+            with self.connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO research_runs (
+                        id, thread_id, user_prompt, optimized_prompt, status, report,
+                        needs_human_review, context_classification,
+                        max_targeted_rerun_runs, max_full_rerun_runs,
+                        max_llm_patch_runs, max_verification_runs,
+                        max_total_iterations, max_total_tool_calls,
+                        total_tool_calls, estimated_cost_usd,
+                        warnings, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+                    """,
+                    (
+                        str(child_run_id),
+                        thread_id,
+                        parent.user_prompt,
+                        parent.optimized_prompt,
+                        RunStatus.QUEUED.value,
+                        seed_report,
+                        getattr(parent, "context_classification", "public"),
+                        parent.max_targeted_rerun_runs,
+                        parent.max_full_rerun_runs,
+                        parent.max_llm_patch_runs,
+                        parent.max_verification_runs,
+                        parent.max_total_iterations,
+                        parent.max_total_tool_calls,
+                        _json_dump([]),
+                        now.isoformat(),
+                        now.isoformat(),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO research_run_lineage (
+                        run_id, root_run_id, parent_run_id, forked_from_checkpoint_id,
+                        fork_mode, additional_prompt, confirmed_preview_hash,
+                        idempotency_key, source_snapshot_json,
+                        source_report_artifact_path, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(lineage.run_id),
+                        str(lineage.root_run_id),
+                        str(lineage.parent_run_id),
+                        str(lineage.forked_from_checkpoint_id),
+                        lineage.fork_mode,
+                        lineage.additional_prompt,
+                        lineage.confirmed_preview_hash,
+                        lineage.idempotency_key,
+                        _json_dump(lineage.source_snapshot_json),
+                        lineage.source_report_artifact_path,
+                        lineage.created_at.isoformat(),
+                    ),
+                )
+                self.append_history(
+                    connection,
+                    child_run_id,
+                    {
+                        "step": "research_run_forked",
+                        "parent_run_id": str(parent.id),
+                        "root_run_id": str(root_run_id),
+                        "forked_from_checkpoint_id": str(checkpoint.checkpoint_id),
+                        "checkpoint_kind": checkpoint.kind,
+                    },
+                )
+        except sqlite3.IntegrityError:
+            existing = self.get_lineage_by_fork_request(
+                parent_run_id=parent.id,
+                checkpoint_id=checkpoint.checkpoint_id,
+                idempotency_key=idempotency_key,
+            )
+            if existing is None:
+                raise
+            _validate_existing_lineage_request(
+                existing,
+                additional_prompt=additional_prompt,
+                confirmed_preview_hash=confirmed_preview_hash,
+            )
+            return self.get_run(existing.run_id), existing, False
+
+        return self.get_run(child_run_id), lineage, True
+
     def get_run(self, run_id: UUID) -> ResearchRunRecord:
         with self.connect() as connection:
             row = connection.execute(
@@ -374,6 +564,44 @@ class ResearchRepository:
 
         runs = [self._row_to_run(row) for row in rows]
         return runs
+
+    def list_stale_collecting_runs(
+        self,
+        *,
+        stale_seconds: int,
+        timeout_seconds: int,
+    ) -> list[ResearchRunRecord]:
+        cutoff = utc_now() - timedelta(seconds=stale_seconds)
+        timeout_cutoff = utc_now() - timedelta(seconds=timeout_seconds)
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT r.*
+                FROM research_runs r
+                JOIN research_attempts a
+                  ON a.run_id = r.id
+                 AND a.response_id = r.pending_deep_research_response_id
+                WHERE r.status = ?
+                  AND r.pending_deep_research_response_id IS NOT NULL
+                  AND r.updated_at <= ?
+                  AND a.created_at > ?
+                  AND a.created_at = (
+                      SELECT MIN(created_at)
+                      FROM research_attempts
+                      WHERE run_id = r.id
+                        AND response_id = r.pending_deep_research_response_id
+                  )
+                ORDER BY r.updated_at ASC
+                LIMIT 25
+                """,
+                (
+                    RunStatus.COLLECTING.value,
+                    cutoff.isoformat(),
+                    timeout_cutoff.isoformat(),
+                ),
+            ).fetchall()
+
+        return [self._row_to_run(row) for row in rows]
 
     def claim_deep_research_run(self, run_id: UUID) -> ResearchRunRecord | None:
         now = utc_now().isoformat()
@@ -1313,6 +1541,243 @@ class ResearchRepository:
             for row in rows
         ]
 
+    def add_checkpoint(
+        self,
+        run_id: UUID,
+        *,
+        kind: str,
+        node_anchor: str,
+        forkable: bool,
+        dedupe_key: str,
+        snapshot_json: dict[str, Any],
+        source_attempt_no: int | None = None,
+        source_review_no: int | None = None,
+        source_response_id: str | None = None,
+        checkpoint_report_hash: str | None = None,
+    ) -> ResearchCheckpoint:
+        now = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for _ in range(5):
+                existing = connection.execute(
+                    """
+                    SELECT *
+                    FROM research_checkpoints
+                    WHERE run_id = ? AND dedupe_key = ?
+                    """,
+                    (str(run_id), dedupe_key),
+                ).fetchone()
+                if existing is not None:
+                    return self._row_to_checkpoint(existing, child_forks=[])
+
+                row = connection.execute(
+                    """
+                    SELECT COALESCE(MAX(checkpoint_no), 0) + 1 AS next_checkpoint_no
+                    FROM research_checkpoints
+                    WHERE run_id = ?
+                    """,
+                    (str(run_id),),
+                ).fetchone()
+                checkpoint_no = int(row["next_checkpoint_no"])
+                checkpoint_id = uuid4()
+                checkpoint_snapshot = {
+                    **snapshot_json,
+                    "run_id": str(run_id),
+                    "checkpoint_id": str(checkpoint_id),
+                }
+                try:
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO research_checkpoints (
+                            checkpoint_id, run_id, checkpoint_no, kind, node_anchor,
+                            forkable, dedupe_key, source_attempt_no, source_review_no,
+                            source_response_id, report_hash, snapshot_json, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(checkpoint_id),
+                            str(run_id),
+                            checkpoint_no,
+                            kind,
+                            node_anchor,
+                            int(forkable),
+                            dedupe_key,
+                            source_attempt_no,
+                            source_review_no,
+                            source_response_id,
+                            checkpoint_report_hash,
+                            _json_dump(checkpoint_snapshot),
+                            now.isoformat(),
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    existing = connection.execute(
+                        """
+                        SELECT *
+                        FROM research_checkpoints
+                        WHERE run_id = ? AND dedupe_key = ?
+                        """,
+                        (str(run_id), dedupe_key),
+                    ).fetchone()
+                    if existing is not None:
+                        return self._row_to_checkpoint(existing, child_forks=[])
+                    continue
+                if cursor.rowcount != 1:
+                    existing = connection.execute(
+                        """
+                        SELECT *
+                        FROM research_checkpoints
+                        WHERE run_id = ? AND dedupe_key = ?
+                        """,
+                        (str(run_id), dedupe_key),
+                    ).fetchone()
+                    if existing is not None:
+                        return self._row_to_checkpoint(existing, child_forks=[])
+                    continue
+
+                inserted = connection.execute(
+                    "SELECT * FROM research_checkpoints WHERE checkpoint_id = ?",
+                    (str(checkpoint_id),),
+                ).fetchone()
+                if inserted is None:
+                    raise RuntimeError("Checkpoint insert could not be read back.")
+                self.append_history(
+                    connection,
+                    run_id,
+                    {
+                        "step": "research_checkpoint_saved",
+                        "checkpoint_id": str(checkpoint_id),
+                        "checkpoint_no": checkpoint_no,
+                        "kind": kind,
+                        "node_anchor": node_anchor,
+                        "forkable": forkable,
+                    },
+                )
+                return self._row_to_checkpoint(inserted, child_forks=[])
+            raise RuntimeError("Checkpoint insert collided repeatedly.")
+
+    def list_checkpoints(
+        self,
+        run_id: UUID,
+        *,
+        include_forks: bool = False,
+    ) -> list[ResearchCheckpoint]:
+        with self.connect() as connection:
+            checkpoint_rows = connection.execute(
+                """
+                SELECT *
+                FROM research_checkpoints
+                WHERE run_id = ?
+                ORDER BY checkpoint_no ASC
+                """,
+                (str(run_id),),
+            ).fetchall()
+            forks_by_checkpoint = (
+                self._child_forks_by_checkpoint(connection, parent_run_id=run_id)
+                if include_forks
+                else {}
+            )
+
+        return [
+            self._row_to_checkpoint(
+                row,
+                child_forks=forks_by_checkpoint.get(row["checkpoint_id"], []),
+            )
+            for row in checkpoint_rows
+        ]
+
+    def get_checkpoint(
+        self,
+        run_id: UUID,
+        checkpoint_id: UUID,
+        *,
+        include_forks: bool = False,
+    ) -> ResearchCheckpoint:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM research_checkpoints
+                WHERE run_id = ? AND checkpoint_id = ?
+                """,
+                (str(run_id), str(checkpoint_id)),
+            ).fetchone()
+            if row is None:
+                raise KeyError(str(checkpoint_id))
+            child_forks = (
+                self._child_forks_by_checkpoint(
+                    connection,
+                    parent_run_id=run_id,
+                    checkpoint_id=checkpoint_id,
+                ).get(str(checkpoint_id), [])
+                if include_forks
+                else []
+            )
+        return self._row_to_checkpoint(row, child_forks=child_forks)
+
+    def get_lineage(self, run_id: UUID) -> ResearchRunLineage | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM research_run_lineage
+                WHERE run_id = ?
+                """,
+                (str(run_id),),
+            ).fetchone()
+        return None if row is None else self._row_to_lineage(row)
+
+    def get_lineage_by_fork_request(
+        self,
+        *,
+        parent_run_id: UUID,
+        checkpoint_id: UUID,
+        idempotency_key: str,
+    ) -> ResearchRunLineage | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM research_run_lineage
+                WHERE parent_run_id = ?
+                  AND forked_from_checkpoint_id = ?
+                  AND idempotency_key = ?
+                """,
+                (str(parent_run_id), str(checkpoint_id), idempotency_key),
+            ).fetchone()
+        return None if row is None else self._row_to_lineage(row)
+
+    def update_lineage_source_report_artifact_path(
+        self,
+        run_id: UUID,
+        source_report_artifact_path: str,
+    ) -> ResearchRunLineage:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE research_run_lineage
+                SET source_report_artifact_path = ?
+                WHERE run_id = ?
+                """,
+                (source_report_artifact_path, str(run_id)),
+            )
+        lineage = self.get_lineage(run_id)
+        if lineage is None:
+            raise KeyError(str(run_id))
+        return lineage
+
+    def list_child_forks(self, parent_run_id: UUID) -> list[ResearchCheckpointChildFork]:
+        with self.connect() as connection:
+            rows_by_checkpoint = self._child_forks_by_checkpoint(
+                connection,
+                parent_run_id=parent_run_id,
+            )
+        forks: list[ResearchCheckpointChildFork] = []
+        for checkpoint_forks in rows_by_checkpoint.values():
+            forks.extend(checkpoint_forks)
+        return forks
+
     def get_history(self, run_id: UUID) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
@@ -1483,6 +1948,81 @@ class ResearchRepository:
                 utc_now().isoformat(),
             ),
         )
+
+    def _row_to_checkpoint(
+        self,
+        row: sqlite3.Row,
+        *,
+        child_forks: list[ResearchCheckpointChildFork],
+    ) -> ResearchCheckpoint:
+        return ResearchCheckpoint(
+            checkpoint_id=UUID(row["checkpoint_id"]),
+            run_id=UUID(row["run_id"]),
+            checkpoint_no=int(row["checkpoint_no"]),
+            kind=row["kind"],
+            node_anchor=row["node_anchor"],
+            forkable=bool(row["forkable"]),
+            dedupe_key=row["dedupe_key"],
+            source_attempt_no=row["source_attempt_no"],
+            source_review_no=row["source_review_no"],
+            source_response_id=row["source_response_id"],
+            report_hash=row["report_hash"],
+            snapshot_json=_json_load(row["snapshot_json"], {}),
+            created_at=_parse_dt(row["created_at"]),
+            forks=child_forks,
+            child_forks=child_forks,
+        )
+
+    def _row_to_lineage(self, row: sqlite3.Row) -> ResearchRunLineage:
+        return ResearchRunLineage(
+            run_id=UUID(row["run_id"]),
+            root_run_id=UUID(row["root_run_id"]),
+            parent_run_id=UUID(row["parent_run_id"]),
+            forked_from_checkpoint_id=UUID(row["forked_from_checkpoint_id"]),
+            fork_mode=row["fork_mode"],
+            additional_prompt=row["additional_prompt"],
+            confirmed_preview_hash=row["confirmed_preview_hash"],
+            idempotency_key=row["idempotency_key"],
+            source_snapshot_json=_json_load(row["source_snapshot_json"], {}),
+            source_report_artifact_path=row["source_report_artifact_path"],
+            created_at=_parse_dt(row["created_at"]),
+        )
+
+    def _child_forks_by_checkpoint(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        parent_run_id: UUID,
+        checkpoint_id: UUID | None = None,
+    ) -> dict[str, list[ResearchCheckpointChildFork]]:
+        values: list[Any] = [str(parent_run_id)]
+        checkpoint_filter = ""
+        if checkpoint_id is not None:
+            checkpoint_filter = "AND l.forked_from_checkpoint_id = ?"
+            values.append(str(checkpoint_id))
+        rows = connection.execute(
+            f"""
+            SELECT l.forked_from_checkpoint_id, r.id, r.status, r.done_reason, r.created_at
+            FROM research_run_lineage l
+            JOIN research_runs r
+              ON r.id = l.run_id
+            WHERE l.parent_run_id = ?
+              {checkpoint_filter}
+            ORDER BY l.created_at ASC
+            """,
+            values,
+        ).fetchall()
+        forks_by_checkpoint: dict[str, list[ResearchCheckpointChildFork]] = {}
+        for row in rows:
+            forks_by_checkpoint.setdefault(row["forked_from_checkpoint_id"], []).append(
+                ResearchCheckpointChildFork(
+                    run_id=UUID(row["id"]),
+                    status=RunStatus(row["status"]),
+                    done_reason=row["done_reason"],
+                    created_at=_parse_dt(row["created_at"]),
+                )
+            )
+        return forks_by_checkpoint
 
     def _db_value(self, value: Any) -> Any:
         if isinstance(value, bool):

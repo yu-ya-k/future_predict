@@ -55,6 +55,38 @@ validated with evals.
     systemic source failure.
 12. Human review is a resumable control point. Payloads include unresolved
     items, failure modes, attempted actions, and allowed next actions.
+13. Phase-boundary checkpoints are saved for the execution-flow UI. A user can
+    preview and then fork from a forkable checkpoint into an independent child
+    run without mutating the parent.
+
+## Checkpoint Forks
+
+Checkpoint rows are persisted in `research_checkpoints`; the API does not infer
+them from audit history. Automatic checkpoints are written at major boundaries:
+Deep Research collection, review recording, LLM patch application, verification
+completion, human-review stop, and finalization. Writes use a dedupe key so
+poller retries and stale-claim recovery do not create duplicate checkpoints.
+
+Forking is preview-confirm, never one click. Preview composes the fork prompt
+from the source prompt, source report snapshot, checkpoint metadata, and required
+additional user instructions. It also returns the query-policy decision and a
+`preview_hash`. Submit requires a non-empty additional prompt, an idempotency
+key, and the confirmed preview hash; stale hashes return `409`.
+
+A child run is independent of the parent. It copies the contract, items, source
+prompt, and source report snapshot into child-local state and saves lineage in
+`research_run_lineage`. Child counters, costs, and tool-call totals start at
+zero and include only the child execution. The checkpoint seed report is not
+counted as a child Deep Research attempt and is not overwritten when child
+attempt 1 is collected.
+
+If query policy blocks the fork prompt, no remote Deep Research call is made.
+The child is still created for auditability in `needs_human_review` with
+`done_reason=fork_deep_research_blocked_by_query_policy`.
+
+Deleting or cancelling a parent does not affect child runs. Parent deletion may
+remove parent artifacts, but child lineage remains readable from the child-local
+snapshot.
 
 ## Query Policy
 
@@ -202,4 +234,5 @@ Artifacts are written under `RESEARCH_ARTIFACT_DIR`:
 - `reports/final_report.md`
 
 SQLite state, including objective contracts, research items, rerun plans, and
-verification query decisions, is stored at `RESEARCH_DB_PATH`.
+verification query decisions, checkpoints, and run lineage is stored at
+`RESEARCH_DB_PATH`.

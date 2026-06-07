@@ -13,6 +13,10 @@ from api.research.schemas import (
     CostEvent,
     CreateResearchRunRequest,
     CreateResearchRunResponse,
+    ForkPreviewRequest,
+    ForkPreviewResponse,
+    ForkSubmitRequest,
+    ForkSubmitResponse,
     HumanReviewDecision,
     HumanReviewPayload,
     HumanReviewQueueItem,
@@ -24,7 +28,10 @@ from api.research.schemas import (
     ReportResponse,
     RerunPlansResponse,
     ResearchAttempt,
+    ResearchCheckpoint,
+    ResearchCheckpointsResponse,
     ResearchItemsResponse,
+    ResearchRunLineageResponse,
     ResearchRunStatusResponse,
     ReviewRecord,
     RunProgress,
@@ -139,6 +146,133 @@ def get_audit(
         cost_events=cost_events,
         human_decisions=orchestrator.repository.get_human_decisions(run.id),
         history=orchestrator.repository.get_history(run.id),
+    )
+
+
+@router.get("/{run_id}/checkpoints", response_model=ResearchCheckpointsResponse)
+def list_checkpoints(
+    run_id: UUID,
+    orchestrator: OrchestratorDependency,
+    include_forks: bool = True,
+) -> ResearchCheckpointsResponse:
+    run = _get_run_or_404(orchestrator, run_id)
+    return ResearchCheckpointsResponse(
+        run_id=run.id,
+        checkpoints=orchestrator.repository.list_checkpoints(
+            run.id,
+            include_forks=include_forks,
+        ),
+    )
+
+
+@router.get("/{run_id}/checkpoints/{checkpoint_id}", response_model=ResearchCheckpoint)
+def get_checkpoint(
+    run_id: UUID,
+    checkpoint_id: UUID,
+    orchestrator: OrchestratorDependency,
+) -> ResearchCheckpoint:
+    run = _get_run_or_404(orchestrator, run_id)
+    try:
+        return orchestrator.repository.get_checkpoint(
+            run.id,
+            checkpoint_id,
+            include_forks=True,
+        )
+    except KeyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Checkpoint not found.",
+        ) from error
+
+
+@router.post(
+    "/{run_id}/checkpoints/{checkpoint_id}/fork-preview",
+    response_model=ForkPreviewResponse,
+)
+def fork_preview(
+    run_id: UUID,
+    checkpoint_id: UUID,
+    request: ForkPreviewRequest,
+    orchestrator: OrchestratorDependency,
+) -> ForkPreviewResponse:
+    _get_run_or_404(orchestrator, run_id)
+    try:
+        return orchestrator.build_fork_preview(
+            run_id,
+            checkpoint_id,
+            additional_prompt=request.additional_prompt,
+        )
+    except KeyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Checkpoint not found.",
+        ) from error
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        ) from error
+
+
+@router.post(
+    "/{run_id}/checkpoints/{checkpoint_id}/forks",
+    response_model=ForkSubmitResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_fork(
+    run_id: UUID,
+    checkpoint_id: UUID,
+    request: ForkSubmitRequest,
+    orchestrator: OrchestratorDependency,
+) -> ForkSubmitResponse:
+    _get_run_or_404(orchestrator, run_id)
+    try:
+        return orchestrator.fork_from_checkpoint(
+            run_id,
+            checkpoint_id,
+            additional_prompt=request.additional_prompt,
+            idempotency_key=request.idempotency_key,
+            confirmed_preview_hash=request.confirmed_preview_hash,
+        )
+    except KeyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Checkpoint not found.",
+        ) from error
+    except (RuntimeError, ValueError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        ) from error
+
+
+@router.get("/{run_id}/lineage", response_model=ResearchRunLineageResponse)
+def get_lineage(
+    run_id: UUID,
+    orchestrator: OrchestratorDependency,
+) -> ResearchRunLineageResponse:
+    run = _get_run_or_404(orchestrator, run_id)
+    lineage = orchestrator.repository.get_lineage(run.id)
+    if lineage is None:
+        return ResearchRunLineageResponse(
+            run_id=run.id,
+            lineage=None,
+            child_forks=orchestrator.repository.list_child_forks(run.id),
+        )
+    return ResearchRunLineageResponse(
+        run_id=run.id,
+        root_run_id=lineage.root_run_id,
+        parent_run_id=lineage.parent_run_id,
+        forked_from_checkpoint_id=lineage.forked_from_checkpoint_id,
+        fork_mode=lineage.fork_mode,
+        additional_prompt=lineage.additional_prompt,
+        confirmed_preview_hash=lineage.confirmed_preview_hash,
+        idempotency_key=lineage.idempotency_key,
+        source_snapshot_json=lineage.source_snapshot_json,
+        source_report_artifact_path=lineage.source_report_artifact_path,
+        created_at=lineage.created_at,
+        lineage=lineage,
+        child_forks=orchestrator.repository.list_child_forks(run.id),
     )
 
 

@@ -38,6 +38,68 @@ class BlockingReviewFakeAzure(IntegrationFakeAzure):
         return super().review_report(**kwargs)
 
 
+def _records_json(records: list[Any]) -> list[dict[str, Any]]:
+    return [record.model_dump(mode="json") for record in records]
+
+
+def _run_invariant_snapshot(
+    orchestrator: ResearchOrchestrator,
+    run_id: Any,
+) -> dict[str, Any]:
+    run = orchestrator.repository.get_run(run_id)
+    reviews = orchestrator.repository.get_reviews(run.id)
+    latest_review = reviews[-1] if reviews else None
+    return {
+        "status": run.status.value,
+        "done_reason": run.done_reason,
+        "needs_human_review": run.needs_human_review,
+        "report": run.report,
+        "final_report": run.final_report,
+        "progress": {
+            "deep_research_runs": run.deep_research_runs,
+            "targeted_rerun_runs": run.targeted_rerun_runs,
+            "full_rerun_runs": run.full_rerun_runs,
+            "llm_patch_runs": run.llm_patch_runs,
+            "verification_runs": run.verification_runs,
+            "total_reviews": run.total_reviews,
+            "latest_verdict": latest_review.verdict.value if latest_review else None,
+            "latest_score": latest_review.score if latest_review else None,
+            "total_tool_calls": run.total_tool_calls,
+            "estimated_cost_usd": orchestrator.estimate_run_cost_usd(
+                run.id,
+                fallback=run.estimated_cost_usd,
+            ),
+        },
+        "attempts": _records_json(orchestrator.repository.get_attempts(run.id)),
+        "reviews": _records_json(reviews),
+        "cost_events": _records_json(orchestrator.get_cost_events(run.id)),
+    }
+
+
+def _audit_snapshot(
+    orchestrator: ResearchOrchestrator,
+    run_id: Any,
+) -> dict[str, Any]:
+    return {
+        "attempts": _records_json(orchestrator.repository.get_attempts(run_id)),
+        "reviews": _records_json(orchestrator.repository.get_reviews(run_id)),
+        "citations": _records_json(orchestrator.repository.get_citations(run_id)),
+        "tool_calls": _records_json(orchestrator.repository.get_tool_calls(run_id)),
+        "cost_events": _records_json(orchestrator.get_cost_events(run_id)),
+        "history": orchestrator.repository.get_history(run_id),
+    }
+
+
+def _latest_forkable_checkpoint(
+    orchestrator: ResearchOrchestrator,
+    run_id: Any,
+) -> Any:
+    checkpoints = orchestrator.repository.list_checkpoints(run_id, include_forks=True)
+    forkable = [checkpoint for checkpoint in checkpoints if checkpoint.forkable]
+    assert forkable
+    return forkable[-1]
+
+
 @pytest.mark.integration
 @pytest.mark.anyio
 async def test_api_poller_workflow_persists_v2_contract_items_and_audit(
@@ -82,6 +144,165 @@ async def test_api_poller_workflow_persists_v2_contract_items_and_audit(
     assert audit["research_items"]
     assert len(audit["citations"]) == 1
     assert len(audit["tool_calls"]) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_completed_parent_checkpoint_fork_child_poller_completion_preserves_parent(
+    integration_orchestrator_factory: Callable[[IntegrationFakeAzure], ResearchOrchestrator],
+) -> None:
+    fake = IntegrationFakeAzure()
+    orchestrator = integration_orchestrator_factory(fake)
+
+    parent = orchestrator.create_run(
+        CreateResearchRunRequest(
+            user_prompt="公開情報に基づく市場調査をしてください。",
+        )
+    )
+    completed_parent = orchestrator.collect_deep_research(parent.id)
+    assert completed_parent.status == RunStatus.COMPLETED
+
+    checkpoint = _latest_forkable_checkpoint(orchestrator, completed_parent.id)
+    seed_report = checkpoint.snapshot_json["source_report"]
+    assert seed_report == completed_parent.final_report
+
+    parent_before_fork = _run_invariant_snapshot(orchestrator, completed_parent.id)
+    additional_prompt = "2026年の日本市場に関する差分だけを追加調査してください。"
+    preview = orchestrator.build_fork_preview(
+        completed_parent.id,
+        checkpoint.checkpoint_id,
+        additional_prompt=additional_prompt,
+    )
+    fork = orchestrator.fork_from_checkpoint(
+        completed_parent.id,
+        checkpoint.checkpoint_id,
+        additional_prompt=additional_prompt,
+        idempotency_key="integration-child-completes-on-poller",
+        confirmed_preview_hash=preview.preview_hash,
+    )
+
+    child_after_fork = orchestrator.repository.get_run(fork.child_run_id)
+    assert fork.parent_run_id == completed_parent.id
+    assert fork.forked_from_checkpoint_id == checkpoint.checkpoint_id
+    assert child_after_fork.status == RunStatus.WAITING_DEEP_RESEARCH
+    assert child_after_fork.report == seed_report
+    assert child_after_fork.deep_research_runs == 1
+    assert _run_invariant_snapshot(orchestrator, completed_parent.id) == parent_before_fork
+
+    poller = ResearchPoller(orchestrator=orchestrator, interval_seconds=0.01)
+    await poller.tick()
+
+    child = orchestrator.repository.get_run(fork.child_run_id)
+    lineage = orchestrator.repository.get_lineage(child.id)
+    child_attempts = orchestrator.repository.get_attempts(child.id)
+    child_cost_events = orchestrator.get_cost_events(child.id)
+
+    assert child.status == RunStatus.COMPLETED
+    assert child.done_reason == "passed_review"
+    assert child.deep_research_runs == 1
+    assert child.final_report is not None
+    assert seed_report in child.final_report
+    assert "## Targeted Research Updates 1" in child.final_report
+    assert "調査レポート本文 resp_deep_2" in child.final_report
+    assert [attempt.run_no for attempt in child_attempts] == [1]
+    assert child_attempts[0].report == "調査レポート本文 resp_deep_2"
+    assert [event.step for event in child_cost_events] == [
+        "deep_research",
+        "review",
+    ]
+    assert lineage is not None
+    assert lineage.root_run_id == completed_parent.id
+    assert lineage.parent_run_id == completed_parent.id
+    assert lineage.forked_from_checkpoint_id == checkpoint.checkpoint_id
+    assert lineage.source_snapshot_json["source_report"] == seed_report
+    assert len(fake.submit_calls) == 2
+    assert fake.retrieve_calls == ["resp_deep_1", "resp_deep_2"]
+    assert _run_invariant_snapshot(orchestrator, completed_parent.id) == parent_before_fork
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_parent_delete_preserves_completed_child_report_audit_lineage_and_cost(
+    integration_orchestrator_factory: Callable[[IntegrationFakeAzure], ResearchOrchestrator],
+) -> None:
+    orchestrator = integration_orchestrator_factory(IntegrationFakeAzure())
+
+    parent = orchestrator.create_run(
+        CreateResearchRunRequest(
+            user_prompt="公開情報に基づく市場調査をしてください。",
+        )
+    )
+    completed_parent = orchestrator.collect_deep_research(parent.id)
+    checkpoint = _latest_forkable_checkpoint(orchestrator, completed_parent.id)
+    additional_prompt = "親レポートを残したまま、追加の差分だけを調査してください。"
+    preview = orchestrator.build_fork_preview(
+        completed_parent.id,
+        checkpoint.checkpoint_id,
+        additional_prompt=additional_prompt,
+    )
+    fork = orchestrator.fork_from_checkpoint(
+        completed_parent.id,
+        checkpoint.checkpoint_id,
+        additional_prompt=additional_prompt,
+        idempotency_key="integration-parent-delete-preserves-child",
+        confirmed_preview_hash=preview.preview_hash,
+    )
+    poller = ResearchPoller(orchestrator=orchestrator, interval_seconds=0.01)
+    await poller.tick()
+
+    child_before_delete = orchestrator.repository.get_run(fork.child_run_id)
+    lineage_before_delete = orchestrator.repository.get_lineage(child_before_delete.id)
+    audit_before_delete = _audit_snapshot(orchestrator, child_before_delete.id)
+    assert child_before_delete.status == RunStatus.COMPLETED
+    assert lineage_before_delete is not None
+    assert audit_before_delete["cost_events"]
+
+    orchestrator.delete_run(completed_parent.id)
+
+    with pytest.raises(KeyError):
+        orchestrator.repository.get_run(completed_parent.id)
+    child_after_delete = orchestrator.repository.get_run(child_before_delete.id)
+    lineage_after_delete = orchestrator.repository.get_lineage(child_before_delete.id)
+
+    assert child_after_delete.status == RunStatus.COMPLETED
+    assert child_after_delete.report == child_before_delete.report
+    assert child_after_delete.final_report == child_before_delete.final_report
+    assert lineage_after_delete is not None
+    assert lineage_after_delete.model_dump(mode="json") == (
+        lineage_before_delete.model_dump(mode="json")
+    )
+    assert _audit_snapshot(orchestrator, child_before_delete.id) == audit_before_delete
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_poller_recovers_stale_collecting_deep_research_run(
+    integration_orchestrator_factory: Callable[[IntegrationFakeAzure], ResearchOrchestrator],
+) -> None:
+    fake = IntegrationFakeAzure()
+    orchestrator = integration_orchestrator_factory(fake)
+    orchestrator.settings.research_deep_research_collecting_stale_seconds = 0
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(
+            user_prompt="公開情報に基づく市場調査をしてください。",
+        )
+    )
+    claimed = orchestrator.repository.claim_deep_research_run(run.id)
+
+    assert claimed is not None
+    assert claimed.status == RunStatus.COLLECTING
+
+    poller = ResearchPoller(orchestrator=orchestrator, interval_seconds=0.01)
+    await poller.tick()
+
+    completed = orchestrator.repository.get_run(run.id)
+    history_steps = [event["step"] for event in orchestrator.repository.get_history(run.id)]
+
+    assert completed.status == RunStatus.COMPLETED
+    assert fake.retrieve_calls == [claimed.pending_deep_research_response_id]
+    assert "attempt_updated" in history_steps
+    assert "review_recorded" in history_steps
 
 
 @pytest.mark.integration
