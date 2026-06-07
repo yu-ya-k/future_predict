@@ -141,7 +141,40 @@ def test_route_after_review_pass_with_item_action_requires_human_review() -> Non
     assert route == "human_review"
 
 
-def test_route_after_review_uses_deterministic_priority_for_mixed_actions() -> None:
+def test_route_after_review_prefers_explicit_human_action_over_item_revision() -> None:
+    route = route_after_review(
+        {
+            "review": {
+                "verdict": Verdict.NEEDS_ITEM_REVISION.value,
+                "reviewer_confidence": 90,
+                "high_risk_flags": [],
+                "security_concerns": [],
+                "item_assessments": [
+                    {
+                        "item_id": "RI-001",
+                        "status": "partial",
+                        "severity": "major",
+                        "failure_mode": "requires_human_judgment",
+                        "failure_mode_confidence": 90,
+                        "recommended_action": "human_review",
+                    },
+                    {
+                        "item_id": "RI-002",
+                        "status": "partial",
+                        "severity": "minor",
+                        "failure_mode": "criterion_too_ambiguous",
+                        "failure_mode_confidence": 90,
+                        "recommended_action": "revise_items",
+                    },
+                ],
+            }
+        }
+    )
+
+    assert route == "human_review"
+
+
+def test_route_after_review_prefers_rerun_before_patch_for_mixed_actions() -> None:
     route = route_after_review(
         {
             "review": {
@@ -177,7 +210,126 @@ def test_route_after_review_uses_deterministic_priority_for_mixed_actions() -> N
         }
     )
 
-    assert route == "llm_patch"
+    assert route == "build_targeted_rerun_plan"
+
+
+def test_route_after_review_prefers_full_rerun_over_targeted_and_verify() -> None:
+    route = route_after_review(
+        {
+            "review": {
+                "verdict": Verdict.NEEDS_FULL_RERUN.value,
+                "reviewer_confidence": 90,
+                "high_risk_flags": [],
+                "security_concerns": [],
+                "item_assessments": [
+                    {
+                        "item_id": "RI-001",
+                        "status": "partial",
+                        "severity": "major",
+                        "failure_mode": "needs_targeted_verification",
+                        "failure_mode_confidence": 90,
+                        "recommended_action": "verify",
+                    },
+                    {
+                        "item_id": "RI-002",
+                        "status": "partial",
+                        "severity": "major",
+                        "failure_mode": "needs_deeper_search",
+                        "failure_mode_confidence": 90,
+                        "recommended_action": "targeted_rerun",
+                    },
+                    {
+                        "item_id": "RI-003",
+                        "status": "partial",
+                        "severity": "blocker",
+                        "failure_mode": "needs_query_reformulation",
+                        "failure_mode_confidence": 90,
+                        "recommended_action": "full_rerun",
+                    },
+                ],
+            },
+            "full_rerun_runs": 0,
+            "max_full_rerun_runs": 1,
+            "targeted_rerun_runs": 0,
+            "max_targeted_rerun_runs": 2,
+            "verification_runs": 0,
+            "max_verification_runs": 2,
+            "total_reviews": 1,
+            "max_total_iterations": 8,
+        }
+    )
+
+    assert route == "full_rerun_submit"
+
+
+def test_route_after_review_prefers_targeted_rerun_over_verify() -> None:
+    route = route_after_review(
+        {
+            "review": {
+                "verdict": Verdict.NEEDS_TARGETED_RERUN.value,
+                "reviewer_confidence": 90,
+                "high_risk_flags": [],
+                "security_concerns": [],
+                "item_assessments": [
+                    {
+                        "item_id": "RI-001",
+                        "status": "partial",
+                        "severity": "major",
+                        "failure_mode": "needs_targeted_verification",
+                        "failure_mode_confidence": 90,
+                        "recommended_action": "verify",
+                    },
+                    {
+                        "item_id": "RI-002",
+                        "status": "partial",
+                        "severity": "major",
+                        "failure_mode": "needs_deeper_search",
+                        "failure_mode_confidence": 90,
+                        "recommended_action": "targeted_rerun",
+                    },
+                ],
+            },
+            "targeted_rerun_runs": 1,
+            "max_targeted_rerun_runs": 2,
+            "verification_runs": 0,
+            "max_verification_runs": 2,
+            "no_progress_count": 2,
+            "total_reviews": 2,
+            "max_total_iterations": 8,
+        }
+    )
+
+    assert route == "build_targeted_rerun_plan"
+
+
+def test_route_after_review_stops_verification_when_no_progress_repeats() -> None:
+    route = route_after_review(
+        {
+            "review": {
+                "verdict": Verdict.NEEDS_VERIFICATION.value,
+                "reviewer_confidence": 90,
+                "high_risk_flags": [],
+                "security_concerns": [],
+                "item_assessments": [
+                    {
+                        "item_id": "RI-001",
+                        "status": "partial",
+                        "severity": "major",
+                        "failure_mode": "needs_targeted_verification",
+                        "failure_mode_confidence": 90,
+                        "recommended_action": "verify",
+                    }
+                ],
+            },
+            "verification_runs": 0,
+            "max_verification_runs": 2,
+            "no_progress_count": 2,
+            "total_reviews": 2,
+            "max_total_iterations": 8,
+        }
+    )
+
+    assert route == "human_review"
 
 
 def test_phase_3_graph_routes_v2_targeted_rerun() -> None:

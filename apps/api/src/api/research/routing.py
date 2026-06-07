@@ -15,6 +15,16 @@ ReviewRoute = Literal[
     "human_review",
 ]
 MIN_REVIEWER_CONFIDENCE_FOR_AUTO_FINALIZE = 70
+ACTION_PRIORITY = [
+    RecommendedAction.HUMAN_REVIEW.value,
+    RecommendedAction.REVISE_ITEMS.value,
+    RecommendedAction.FULL_RERUN.value,
+    RecommendedAction.TARGETED_RERUN.value,
+    RecommendedAction.LLM_PATCH.value,
+    RecommendedAction.VERIFY.value,
+    RecommendedAction.FINALIZE_WITH_LIMITATION.value,
+    RecommendedAction.NONE.value,
+]
 
 
 class RouteState(TypedDict, total=False):
@@ -34,111 +44,142 @@ class RouteState(TypedDict, total=False):
     max_total_tool_calls: int
 
 
+class RouteDecision(TypedDict):
+    candidate_route: ReviewRoute
+    selected_route: ReviewRoute
+    blocked_reason: str | None
+    dominant_actions: list[str]
+
+
 def route_after_review(state: RouteState) -> ReviewRoute:
+    return route_after_review_decision(state)["selected_route"]
+
+
+def route_after_review_decision(state: RouteState) -> RouteDecision:
+    candidate_route, dominant_actions = _candidate_route_after_review(state)
+    selected_route, blocked_reason = _apply_route_guards(candidate_route, state)
+    return {
+        "candidate_route": candidate_route,
+        "selected_route": selected_route,
+        "blocked_reason": blocked_reason,
+        "dominant_actions": dominant_actions,
+    }
+
+
+def _candidate_route_after_review(
+    state: RouteState,
+) -> tuple[ReviewRoute, list[str]]:
     review = state.get("review", {})
     verdict = _string_value(review.get("verdict", Verdict.HUMAN_REVIEW))
 
     if verdict == Verdict.HUMAN_REVIEW.value:
-        return "human_review"
+        return "human_review", []
 
     if _list_has_values(review.get("security_concerns")) or _list_has_values(
         review.get("high_risk_flags")
     ):
-        return "human_review"
+        return "human_review", []
 
     reviewer_confidence = review.get("reviewer_confidence")
     if (
         isinstance(reviewer_confidence, int | float)
         and reviewer_confidence < MIN_REVIEWER_CONFIDENCE_FOR_AUTO_FINALIZE
     ):
-        return "human_review"
-
-    if _hard_stop_reached(state):
-        return "human_review"
-
-    if verdict == Verdict.PASS.value:
-        actions = _aggregate_actions(review.get("item_assessments"))
-        if actions and actions <= {RecommendedAction.NONE.value}:
-            return "finalize"
-        if actions:
-            return "human_review"
-        return "finalize"
-
-    if verdict == Verdict.NEEDS_ITEM_REVISION.value:
-        return "revise_research_items"
-
-    if verdict == Verdict.FINALIZE_WITH_LIMITATION.value:
-        return "finalize_with_limitation"
+        return "human_review", []
 
     actions = _aggregate_actions(review.get("item_assessments"))
+    dominant_actions = _dominant_actions(actions)
+    if RecommendedAction.HUMAN_REVIEW.value in actions:
+        return "human_review", dominant_actions
+
+    if verdict == Verdict.PASS.value:
+        if actions and actions <= {RecommendedAction.NONE.value}:
+            return "finalize", dominant_actions
+        if actions:
+            return "human_review", dominant_actions
+        return "finalize", dominant_actions
+
+    if verdict == Verdict.NEEDS_ITEM_REVISION.value:
+        return "revise_research_items", dominant_actions
+
+    if verdict == Verdict.FINALIZE_WITH_LIMITATION.value:
+        return "finalize_with_limitation", dominant_actions
+
     if not actions:
-        return _route_from_verdict_fallback(verdict, state)
+        return _route_from_verdict_fallback(verdict), dominant_actions
 
     if RecommendedAction.REVISE_ITEMS.value in actions:
-        return "revise_research_items"
-
-    if RecommendedAction.HUMAN_REVIEW.value in actions:
-        return "human_review"
-
-    if RecommendedAction.LLM_PATCH.value in actions:
-        return _guarded("llm_patch", state)
-
-    if RecommendedAction.VERIFY.value in actions:
-        return _guarded("verify_items", state)
-
-    if RecommendedAction.TARGETED_RERUN.value in actions:
-        return _guarded("build_targeted_rerun_plan", state)
+        return "revise_research_items", dominant_actions
 
     if RecommendedAction.FULL_RERUN.value in actions:
-        return _guarded("full_rerun_submit", state)
+        return "full_rerun_submit", dominant_actions
+
+    if RecommendedAction.TARGETED_RERUN.value in actions:
+        return "build_targeted_rerun_plan", dominant_actions
+
+    if RecommendedAction.LLM_PATCH.value in actions:
+        return "llm_patch", dominant_actions
+
+    if RecommendedAction.VERIFY.value in actions:
+        return "verify_items", dominant_actions
 
     if RecommendedAction.FINALIZE_WITH_LIMITATION.value in actions:
-        return "finalize_with_limitation"
+        return "finalize_with_limitation", dominant_actions
 
     if actions <= {RecommendedAction.NONE.value}:
-        return "finalize"
+        return "finalize", dominant_actions
 
-    return "human_review"
+    return "human_review", dominant_actions
 
 
-def _route_from_verdict_fallback(verdict: str, state: RouteState) -> ReviewRoute:
+def _route_from_verdict_fallback(verdict: str) -> ReviewRoute:
     if verdict == Verdict.NEEDS_LLM_PATCH.value:
-        return _guarded("llm_patch", state)
+        return "llm_patch"
     if verdict == Verdict.NEEDS_VERIFICATION.value:
-        return _guarded("verify_items", state)
+        return "verify_items"
     if verdict == Verdict.NEEDS_TARGETED_RERUN.value:
-        return _guarded("build_targeted_rerun_plan", state)
+        return "build_targeted_rerun_plan"
     if verdict == Verdict.NEEDS_FULL_RERUN.value:
-        return _guarded("full_rerun_submit", state)
+        return "full_rerun_submit"
     return "human_review"
 
 
-def _guarded(route: ReviewRoute, state: RouteState) -> ReviewRoute:
+def _apply_route_guards(
+    route: ReviewRoute,
+    state: RouteState,
+) -> tuple[ReviewRoute, str | None]:
+    global_blocked_reason = _global_blocked_reason(state)
+    if global_blocked_reason is not None:
+        return "human_review", global_blocked_reason
+
+    if route in {"llm_patch", "verify_items"} and state.get("no_progress_count", 0) >= 2:
+        return "human_review", "max_no_progress_count_reached"
+
     if route == "llm_patch" and state.get("llm_patch_runs", 0) >= state.get(
         "max_llm_patch_runs", 3
     ):
-        return "human_review"
+        return "human_review", "max_llm_patch_runs_reached"
     if route == "verify_items" and state.get("verification_runs", 0) >= state.get(
         "max_verification_runs", 3
     ):
-        return "human_review"
+        return "human_review", "max_verification_runs_reached"
     if route == "build_targeted_rerun_plan" and state.get(
         "targeted_rerun_runs", 0
     ) >= state.get("max_targeted_rerun_runs", 2):
-        return "human_review"
+        return "human_review", "max_targeted_rerun_runs_reached"
     if route == "full_rerun_submit" and state.get("full_rerun_runs", 0) >= state.get(
         "max_full_rerun_runs", 1
     ):
-        return "human_review"
-    return route
+        return "human_review", "max_full_rerun_runs_reached"
+    return route, None
 
 
-def _hard_stop_reached(state: RouteState) -> bool:
-    return (
-        state.get("total_reviews", 0) >= state.get("max_total_iterations", 5)
-        or state.get("no_progress_count", 0) >= 2
-        or state.get("total_tool_calls", 0) >= state.get("max_total_tool_calls", 999)
-    )
+def _global_blocked_reason(state: RouteState) -> str | None:
+    if state.get("total_reviews", 0) >= state.get("max_total_iterations", 5):
+        return "max_total_iterations_reached"
+    if state.get("total_tool_calls", 0) >= state.get("max_total_tool_calls", 999):
+        return "max_total_tool_calls_reached"
+    return None
 
 
 def _aggregate_actions(value: object) -> set[str]:
@@ -162,6 +203,12 @@ def _aggregate_actions(value: object) -> set[str]:
             if inferred is not None:
                 actions.add(inferred)
     return actions
+
+
+def _dominant_actions(actions: set[str]) -> list[str]:
+    ordered = [action for action in ACTION_PRIORITY if action in actions]
+    ordered.extend(sorted(actions - set(ordered)))
+    return ordered
 
 
 def _action_from_failure_mode(

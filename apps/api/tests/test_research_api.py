@@ -522,6 +522,50 @@ async def test_human_review_api_does_not_require_reviewer_identity(tmp_path: Pat
 
 
 @pytest.mark.anyio
+async def test_resume_api_allows_rerun_actions_after_no_progress_count(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_v2_orchestrator(
+        tmp_path,
+        V2FakeAzure(verdict=Verdict.HUMAN_REVIEW),
+    )
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs",
+            json={
+                "user_prompt": "市場調査をしてください",
+            },
+        )
+        run_id = create_response.json()["run_id"]
+        needs_human = orchestrator.collect_deep_research(run_id)
+        orchestrator.repository.update_run(needs_human.id, no_progress_count=2)
+
+        payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+        resume_response = await client.post(
+            f"/research-runs/{run_id}/resume",
+            json={
+                "action": HumanReviewAction.REQUEST_TARGETED_RERUN.value,
+                "comment": "不足分だけ再調査してください。",
+            },
+        )
+
+    allowed_actions = payload_response.json()["allowed_actions"]
+    assert HumanReviewAction.REQUEST_TARGETED_RERUN.value in allowed_actions
+    assert HumanReviewAction.REQUEST_FULL_RERUN.value in allowed_actions
+    assert HumanReviewAction.REQUEST_ITEM_REVISION.value in allowed_actions
+    assert HumanReviewAction.REQUEST_LLM_PATCH.value not in allowed_actions
+    assert HumanReviewAction.REQUEST_VERIFICATION.value not in allowed_actions
+    assert resume_response.status_code == 200
+    assert resume_response.json()["status"] == RunStatus.WAITING_DEEP_RESEARCH.value
+
+
+@pytest.mark.anyio
 async def test_resume_api_rejects_body_reviewer_id(tmp_path: Path) -> None:
     orchestrator = make_v2_orchestrator(
         tmp_path,

@@ -291,3 +291,9 @@ async def test_targeted_rerun_budget_guard_routes_to_human_review_without_submit
     assert status["done_reason"] == "review_route_needs_targeted_rerun"
     assert status["progress"]["targeted_rerun_runs"] == 0
     assert route_events[-1]["route"] == "human_review"
+    assert route_events[-1]["candidate_route"] == "build_targeted_rerun_plan"
+    assert route_events[-1]["selected_route"] == "human_review"
+    assert route_events[-1]["blocked_reason"] == "max_targeted_rerun_runs_reached"
+    assert route_events[-1]["dominant_actions"] == ["targeted_rerun"]
+    assert route_events[-1]["budget_snapshot"]["targeted_rerun_runs"] == 0
+    assert route_events[-1]["budget_snapshot"]["max_targeted_rerun_runs"] == 0

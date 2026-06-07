@@ -1314,6 +1314,35 @@ describe("RunMonitor (SCR-3)", () => {
                     reviewer_response_id: "resp_review_2",
                   }),
                 ],
+                history: [
+                  {
+                    step: "review_recorded",
+                    review_no: 1,
+                    verdict: "needs_llm_patch",
+                    score: 72,
+                  },
+                  {
+                    step: "route_after_review",
+                    route: "llm_patch",
+                    total_reviews: 1,
+                  },
+                  {
+                    step: "llm_patch",
+                    run_no: 1,
+                    response_id: "resp_llm_patch_1",
+                  },
+                  {
+                    step: "review_recorded",
+                    review_no: 2,
+                    verdict: "pass",
+                    score: 90,
+                  },
+                  {
+                    step: "route_after_review",
+                    route: "finalize",
+                    total_reviews: 2,
+                  },
+                ],
               }),
             ),
         } as Response);
@@ -1382,6 +1411,256 @@ describe("RunMonitor (SCR-3)", () => {
       .toHaveAttribute("href", `#/runs/${runId}/report`);
     expect(screen.getByRole("link", { name: "最終レポートを開く" }))
       .toHaveAttribute("href", `#/runs/${runId}/report`);
+  });
+
+  it("does not render a third verification node when only two verification runs executed", async () => {
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/audit`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve(
+              makeAuditResponse({
+                run_id: runId,
+                reviews: [
+                  makeReviewRecord({
+                    review_no: 1,
+                    verdict: "needs_verification",
+                    recommended_route: "needs_verification",
+                    score: 62,
+                    item_assessments: [
+                      makeItemAssessment({ recommended_action: "verify" }),
+                    ],
+                  }),
+                  makeReviewRecord({
+                    review_no: 2,
+                    verdict: "needs_verification",
+                    recommended_route: "needs_verification",
+                    score: 66,
+                    item_assessments: [
+                      makeItemAssessment({ recommended_action: "verify" }),
+                    ],
+                  }),
+                  makeReviewRecord({
+                    review_no: 3,
+                    verdict: "needs_verification",
+                    recommended_route: "needs_verification",
+                    score: 68,
+                    rationale: "検証上限により人間判断が必要です",
+                    item_assessments: [
+                      makeItemAssessment({ recommended_action: "verify" }),
+                    ],
+                  }),
+                ],
+                history: [
+                  {
+                    step: "route_after_review",
+                    route: "verify_items",
+                    total_reviews: 1,
+                  },
+                  {
+                    step: "verification_completed",
+                    response_id: "resp_verify_1",
+                  },
+                  {
+                    step: "route_after_review",
+                    route: "verify_items",
+                    total_reviews: 2,
+                  },
+                  {
+                    step: "verification_completed",
+                    response_id: "resp_verify_2",
+                  },
+                  {
+                    step: "route_after_review",
+                    route: "human_review",
+                    total_reviews: 3,
+                  },
+                  {
+                    step: "human_review_required",
+                    latest_review_no: 3,
+                    reason: "max_verification_runs_reached",
+                  },
+                ],
+              }),
+            ),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve([
+              {
+                run_no: 1,
+                response_id: "resp_research_1",
+                status: "completed",
+                model: "o3-deep-research",
+                prompt: "# 指示 1",
+                report: "# Deep Research 1",
+                citations: [],
+                tool_calls_summary: [],
+                error: null,
+              },
+            ]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/items`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, items: [] }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "needs_human_review",
+            done_reason: "max_verification_runs_reached",
+            needs_human_review: true,
+            progress: {
+              deep_research_runs: 1,
+              targeted_rerun_runs: 0,
+              full_rerun_runs: 0,
+              llm_patch_runs: 0,
+              verification_runs: 2,
+              total_reviews: 3,
+              latest_verdict: "needs_verification",
+              latest_score: 68,
+              total_tool_calls: 30,
+              estimated_cost_usd: 1.8,
+            },
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("検証 1回目")).toBeInTheDocument();
+    expect(screen.getByText("検証 2回目")).toBeInTheDocument();
+    expect(screen.queryByText("検証 3回目")).not.toBeInTheDocument();
+
+    const dag = screen.getByRole("region", { name: "具体的な実行フロー" });
+    const nodeTitles = within(dag)
+      .getAllByRole("heading", { level: 3 })
+      .map((heading) => heading.textContent);
+    expect(nodeTitles).toEqual(
+      expect.arrayContaining(["LLMレビュー 3回目", "人間判断"]),
+    );
+    expect(nodeTitles.indexOf("人間判断")).toBe(
+      nodeTitles.indexOf("LLMレビュー 3回目") + 1,
+    );
+  });
+
+  it("does not render a targeted rerun node from a recommendation without an executed rerun", async () => {
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/audit`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve(
+              makeAuditResponse({
+                run_id: runId,
+                reviews: [
+                  makeReviewRecord({
+                    review_no: 1,
+                    verdict: "needs_targeted_rerun",
+                    recommended_route: "needs_targeted_rerun",
+                    score: 64,
+                    rationale: "追加調査推奨だが自動実行されません",
+                    item_assessments: [
+                      makeItemAssessment({ recommended_action: "targeted_rerun" }),
+                    ],
+                  }),
+                ],
+                history: [
+                  {
+                    step: "route_after_review",
+                    route: "human_review",
+                    total_reviews: 1,
+                  },
+                  {
+                    step: "human_review_required",
+                    latest_review_no: 1,
+                    reason: "max_targeted_rerun_runs_reached",
+                  },
+                ],
+              }),
+            ),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve([
+              {
+                run_no: 1,
+                response_id: "resp_research_1",
+                status: "completed",
+                model: "o3-deep-research",
+                prompt: "# 指示 1",
+                report: "# Deep Research 1",
+                citations: [],
+                tool_calls_summary: [],
+                error: null,
+              },
+            ]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/items`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, items: [] }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "needs_human_review",
+            done_reason: "max_targeted_rerun_runs_reached",
+            needs_human_review: true,
+            progress: {
+              deep_research_runs: 1,
+              targeted_rerun_runs: 0,
+              full_rerun_runs: 0,
+              llm_patch_runs: 0,
+              verification_runs: 0,
+              total_reviews: 1,
+              latest_verdict: "needs_targeted_rerun",
+              latest_score: 64,
+              total_tool_calls: 12,
+              estimated_cost_usd: 0.9,
+            },
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("LLMレビュー 1回目")).toBeInTheDocument();
+    expect(screen.queryByText("Targeted rerun 1")).not.toBeInTheDocument();
+
+    const dag = screen.getByRole("region", { name: "具体的な実行フロー" });
+    const nodeTitles = within(dag)
+      .getAllByRole("heading", { level: 3 })
+      .map((heading) => heading.textContent);
+    expect(nodeTitles.indexOf("人間判断")).toBe(
+      nodeTitles.indexOf("LLMレビュー 1回目") + 1,
+    );
   });
 
   it("links the active human decision DAG node to the review screen", async () => {

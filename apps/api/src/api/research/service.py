@@ -37,7 +37,11 @@ from api.research.nodes import build_objective_contract
 from api.research.progress import compute_no_progress_count, report_hash
 from api.research.query_policy import contains_sensitive_terms, query_policy_gate
 from api.research.repository import ResearchRepository
-from api.research.routing import MIN_REVIEWER_CONFIDENCE_FOR_AUTO_FINALIZE, route_after_review
+from api.research.routing import (
+    MIN_REVIEWER_CONFIDENCE_FOR_AUTO_FINALIZE,
+    RouteState,
+    route_after_review_decision,
+)
 from api.research.schemas import (
     CostEvent,
     CreateResearchRunRequest,
@@ -674,30 +678,35 @@ class ResearchOrchestrator:
             model=self.azure.reviewer_deployment,
         )
 
-        route = route_after_review(
-            {
-                "review": review.model_dump(),
-                "total_reviews": run.total_reviews + 1,
-                "targeted_rerun_runs": run.targeted_rerun_runs,
-                "full_rerun_runs": run.full_rerun_runs,
-                "llm_patch_runs": run.llm_patch_runs,
-                "verification_runs": run.verification_runs,
-                "no_progress_count": no_progress_count,
-                "max_total_iterations": run.max_total_iterations,
-                "max_targeted_rerun_runs": run.max_targeted_rerun_runs,
-                "max_full_rerun_runs": run.max_full_rerun_runs,
-                "max_llm_patch_runs": run.max_llm_patch_runs,
-                "max_verification_runs": run.max_verification_runs,
-                "total_tool_calls": next_total_tool_calls,
-                "max_total_tool_calls": run.max_total_tool_calls,
-            }
-        )
+        route_state: RouteState = {
+            "review": review.model_dump(),
+            "total_reviews": run.total_reviews + 1,
+            "targeted_rerun_runs": run.targeted_rerun_runs,
+            "full_rerun_runs": run.full_rerun_runs,
+            "llm_patch_runs": run.llm_patch_runs,
+            "verification_runs": run.verification_runs,
+            "no_progress_count": no_progress_count,
+            "max_total_iterations": run.max_total_iterations,
+            "max_targeted_rerun_runs": run.max_targeted_rerun_runs,
+            "max_full_rerun_runs": run.max_full_rerun_runs,
+            "max_llm_patch_runs": run.max_llm_patch_runs,
+            "max_verification_runs": run.max_verification_runs,
+            "total_tool_calls": next_total_tool_calls,
+            "max_total_tool_calls": run.max_total_tool_calls,
+        }
+        route_decision = route_after_review_decision(route_state)
+        route = route_decision["selected_route"]
 
         self.repository.append_history_event(
             run.id,
             {
                 "step": "route_after_review",
                 "route": route,
+                "candidate_route": route_decision["candidate_route"],
+                "selected_route": route,
+                "blocked_reason": route_decision["blocked_reason"],
+                "dominant_actions": route_decision["dominant_actions"],
+                "budget_snapshot": _route_budget_snapshot(route_state),
                 "verdict": review.verdict.value,
                 "total_reviews": run.total_reviews + 1,
                 "no_progress_count": no_progress_count,
@@ -2401,6 +2410,26 @@ def _allowed_human_review_actions(run: ResearchRunRecord) -> list[HumanReviewAct
     ]
 
 
+def _route_budget_snapshot(route_state: RouteState) -> dict[str, object]:
+    route_state_dict = cast(dict[str, object], route_state)
+    keys = [
+        "total_reviews",
+        "max_total_iterations",
+        "targeted_rerun_runs",
+        "max_targeted_rerun_runs",
+        "full_rerun_runs",
+        "max_full_rerun_runs",
+        "llm_patch_runs",
+        "max_llm_patch_runs",
+        "verification_runs",
+        "max_verification_runs",
+        "no_progress_count",
+        "total_tool_calls",
+        "max_total_tool_calls",
+    ]
+    return {key: route_state_dict.get(key) for key in keys if key in route_state_dict}
+
+
 def _blocked_human_resume_reason(
     run: ResearchRunRecord,
     action: HumanReviewAction,
@@ -2447,7 +2476,11 @@ def _blocked_human_resume_reason(
     if run.total_reviews >= run.max_total_iterations:
         return "max_total_iterations_reached"
 
-    if run.no_progress_count >= 2:
+    if run.no_progress_count >= 2 and action not in {
+        HumanReviewAction.REQUEST_TARGETED_RERUN,
+        HumanReviewAction.REQUEST_FULL_RERUN,
+        HumanReviewAction.REQUEST_ITEM_REVISION,
+    }:
         return "max_no_progress_count_reached"
 
     if (

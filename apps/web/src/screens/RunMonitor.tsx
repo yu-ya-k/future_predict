@@ -37,6 +37,7 @@ import { getTrackedRun, updateTrackedStatus } from "../runStore";
 import { notify } from "../notifications";
 import {
   isTerminal,
+  type AuditResponse,
   type ResearchRunStatusResponse,
   type ResearchAttempt,
   type ResearchItem,
@@ -167,6 +168,17 @@ const FOLLOW_UP_LABEL: Record<FollowUpKind, string> = {
   finalize_with_limitation: "制約付き最終化",
 };
 
+const ROUTE_FOLLOW_UP_KIND: Record<string, FollowUpKind | null> = {
+  finalize: null,
+  llm_patch: "llm_patch",
+  verify_items: "verification",
+  build_targeted_rerun_plan: "targeted_rerun",
+  full_rerun_submit: "full_rerun",
+  revise_research_items: "item_revision",
+  human_review: "human_review",
+  finalize_with_limitation: "finalize_with_limitation",
+};
+
 const DAG_STATUS_LABEL: Record<DagNodeStatus, string> = {
   done: "完了",
   active: "実行中",
@@ -194,27 +206,6 @@ function activeDagNodeId(
   return "brief";
 }
 
-function inferFollowUp(review: ReviewRecord): FollowUpKind | null {
-  if (review.verdict === "pass") return null;
-  const actions = new Set(review.item_assessments.map((item) => item.recommended_action));
-  if (actions.has("llm_patch") || review.verdict === "needs_llm_patch") return "llm_patch";
-  if (actions.has("verify") || review.verdict === "needs_verification") return "verification";
-  if (actions.has("targeted_rerun") || review.verdict === "needs_targeted_rerun") {
-    return "targeted_rerun";
-  }
-  if (actions.has("full_rerun") || review.verdict === "needs_full_rerun") return "full_rerun";
-  if (actions.has("revise_items") || review.verdict === "needs_item_revision") {
-    return "item_revision";
-  }
-  if (
-    actions.has("finalize_with_limitation") ||
-    review.verdict === "finalize_with_limitation"
-  ) {
-    return "finalize_with_limitation";
-  }
-  return "human_review";
-}
-
 function followUpTone(kind: FollowUpKind): DagNodeTone {
   if (kind === "llm_patch") return "patch";
   if (kind === "verification") return "verify";
@@ -232,16 +223,87 @@ function followUpTitle(kind: FollowUpKind, index: number) {
   return `Human review ${index}`;
 }
 
+function historyString(
+  event: AuditResponse["history"][number] | undefined,
+  key: string,
+): string | null {
+  const value = event?.[key];
+  return typeof value === "string" ? value : null;
+}
+
+function historyNumber(
+  event: AuditResponse["history"][number] | undefined,
+  key: string,
+): number | null {
+  const value = event?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function historyStep(event: AuditResponse["history"][number] | undefined): string | null {
+  return historyString(event, "step");
+}
+
+function countHistorySteps(
+  history: AuditResponse["history"],
+  step: string,
+): number {
+  return history.filter((event) => historyStep(event) === step).length;
+}
+
+function routeFollowUpForReview(
+  history: AuditResponse["history"],
+  reviewNo: number,
+): FollowUpKind | null {
+  const routedByReviewNo = history.find(
+    (event) =>
+      historyStep(event) === "route_after_review" &&
+      historyNumber(event, "total_reviews") === reviewNo,
+  );
+  const fallbackRoute = history.filter(
+    (event) => historyStep(event) === "route_after_review",
+  )[reviewNo - 1];
+  const route = historyString(routedByReviewNo ?? fallbackRoute, "route");
+  return route ? ROUTE_FOLLOW_UP_KIND[route] ?? null : null;
+}
+
+function executedFollowUpLimits(
+  progress: ResearchRunStatusResponse["progress"] | undefined,
+  history: AuditResponse["history"],
+): Record<FollowUpKind, number> {
+  return {
+    llm_patch: Math.max(progress?.llm_patch_runs ?? 0, countHistorySteps(history, "llm_patch")),
+    verification: Math.max(
+      progress?.verification_runs ?? 0,
+      countHistorySteps(history, "verification_completed"),
+    ),
+    targeted_rerun: progress?.targeted_rerun_runs ?? 0,
+    full_rerun: progress?.full_rerun_runs ?? 0,
+    item_revision: 0,
+    human_review: 0,
+    finalize_with_limitation: countHistorySteps(history, "finalized_with_limitation"),
+  };
+}
+
+function hasExecutedFollowUp(
+  kind: FollowUpKind,
+  counts: Record<FollowUpKind, number>,
+  limits: Record<FollowUpKind, number>,
+): boolean {
+  return counts[kind] < limits[kind];
+}
+
 function buildExecutionDag({
   status,
   attempts,
   reviews,
+  history,
   progress,
   runId,
 }: {
   status: RunStatus;
   attempts: ResearchAttempt[];
   reviews: ReviewRecord[];
+  history: AuditResponse["history"];
   progress?: ResearchRunStatusResponse["progress"];
   runId: string;
 }): { nodes: ExecutionDagNode[]; edges: ExecutionDagEdge[] } {
@@ -254,6 +316,7 @@ function buildExecutionDag({
       ? maxAttemptRunNo
       : Math.max(maxAttemptRunNo, progress?.deep_research_runs ?? 1, 1);
   const attemptsByRunNo = new Map(attempts.map((attempt) => [attempt.run_no, attempt]));
+  const executedLimits = executedFollowUpLimits(progress, history);
 
   nodes.push({
     id: "brief",
@@ -339,8 +402,10 @@ function buildExecutionDag({
     previousId = reviewId;
     col += 1;
 
-    const followUp = inferFollowUp(review);
-    if (!followUp) continue;
+    const followUp = routeFollowUpForReview(history, review.review_no);
+    if (!followUp || !hasExecutedFollowUp(followUp, followUpCounts, executedLimits)) {
+      continue;
+    }
 
     followUpCounts[followUp] += 1;
     const followUpIndex = followUpCounts[followUp];
@@ -446,12 +511,14 @@ function ExecutionDag({
   status,
   attempts,
   reviews,
+  history,
   progress,
   runId,
 }: {
   status: RunStatus;
   attempts: ResearchAttempt[];
   reviews: ReviewRecord[];
+  history: AuditResponse["history"];
   progress?: ResearchRunStatusResponse["progress"];
   runId: string;
 }) {
@@ -459,6 +526,7 @@ function ExecutionDag({
     status,
     attempts,
     reviews,
+    history,
     progress,
     runId,
   });
@@ -614,8 +682,8 @@ export function RunMonitor({ runId }: RunMonitorProps) {
 
   // ── Review data polling ───────────────────────────────────────────────────
 
-  const { data: reviews } = usePolling<ReviewRecord[]>({
-    fetcher: async (signal) => (await getAudit(runId, signal)).reviews,
+  const { data: audit } = usePolling<AuditResponse>({
+    fetcher: (signal) => getAudit(runId, signal),
     key: `review-audit:${runId}`,
     interval: (data) => {
       if (runStatus && isTerminal(runStatus.status)) return null;
@@ -656,9 +724,10 @@ export function RunMonitor({ runId }: RunMonitorProps) {
 
   const status = runStatus?.status ?? (tracked?.last_status ?? "queued");
   const progress = runStatus?.progress;
-  const sortedReviews = Array.isArray(reviews)
-    ? [...reviews].sort((a, b) => a.review_no - b.review_no)
+  const sortedReviews = Array.isArray(audit?.reviews)
+    ? [...audit.reviews].sort((a, b) => a.review_no - b.review_no)
     : [];
+  const auditHistory = Array.isArray(audit?.history) ? audit.history : [];
   const sortedAttempts = Array.isArray(dagAttempts)
     ? dagAttempts
     : [];
@@ -1002,6 +1071,7 @@ export function RunMonitor({ runId }: RunMonitorProps) {
         status={status}
         attempts={sortedAttempts}
         reviews={sortedReviews}
+        history={auditHistory}
         progress={progress}
         runId={runId}
       />
