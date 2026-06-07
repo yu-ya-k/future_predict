@@ -42,6 +42,81 @@ Response status is `202 Accepted`:
 }
 ```
 
+## Manual Import
+
+`POST /research-runs/manual-import` imports a Deep Research prompt and report
+that were produced manually in ChatGPT. The request must be
+`multipart/form-data`.
+
+Fields:
+
+- `input_prompt_file` or `input_prompt_text`, exactly one.
+- `report_file` or `report_text`, exactly one.
+- `allow_remote_review`, required boolean. When false, the run stops in human
+  review without calling the reviewer, finalizer, or verifier.
+- `allow_api_reruns`, required boolean. When false, targeted and full API reruns
+  are forced to zero for the imported run.
+- `rerun_execution_mode`, optional: `api`, `manual_chatgpt`, or `disabled`.
+  When omitted, legacy behavior is preserved:
+  `allow_api_reruns=true` maps to `api`, and `false` maps to `disabled`.
+  If `allow_api_reruns=false`, an explicit `api` mode is also normalized to
+  `disabled`.
+  `manual_chatgpt` requires `allow_api_reruns=true`; it keeps rerun limits but
+  pauses after rerun planning for a ChatGPT prompt/result upload instead of
+  submitting Deep Research through the API.
+- `options_json`, optional JSON matching `ResearchRunOptions`.
+- `idempotency_key`, optional. Repeating the same key with the same request
+  returns the existing run; the same key with different content returns `409`.
+
+Only `.md` and `.txt` uploads are accepted. Files must be UTF-8, non-blank, and
+within `RESEARCH_MANUAL_IMPORT_MAX_FILE_BYTES`. Prompt text is capped at 50,000
+characters. Report text is capped by `RESEARCH_MANUAL_IMPORT_MAX_REPORT_CHARS`.
+The API is the source of truth for these limits and rejects oversized requests
+with `422`. The web app performs client-side checks that mirror the shipped
+defaults, so operators who change the server-side manual import limits should
+keep the web deployment aligned or expect the server to enforce the final
+decision.
+
+```sh
+curl -sS -X POST http://127.0.0.1:8000/research-runs/manual-import \
+  -F input_prompt_file=@prompt.md \
+  -F report_file=@report.md \
+  -F allow_remote_review=true \
+  -F allow_api_reruns=true \
+  -F rerun_execution_mode=manual_chatgpt \
+  -F idempotency_key=operator-ticket-1234
+```
+
+Manual import creates Deep Research attempt `1` with
+`source="manual_upload"`, `model="chatgpt-deep-research-manual"`,
+`status="completed"`, and no Responses API `response_id`. Imported URLs and
+Markdown links are saved as unverified manual citations. Prompt/report bodies
+are saved as artifacts; idempotency metadata stores hashes, lengths, filenames,
+content types, and import time, not the raw bodies.
+
+When a `manual_chatgpt` import later needs targeted or full rerun, human review
+returns `pending_manual_rerun` and `allowed_actions=[]`. Run the prompt manually
+in ChatGPT, then upload exactly one of `report_text` or `report_file`:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8000/research-runs/{run_id}/manual-rerun-result \
+  -F rerun_id=RR-... \
+  -F report_file=@rerun-result.md
+```
+
+Targeted uploads are merged as item-scoped deltas; full-rerun uploads replace
+the current report. A stale `rerun_id`, missing pending prompt, non-manual
+import, or targeted upload that looks like a full merged report returns `409`.
+The endpoint can also return `409` if the report changed after prompt creation
+or if the same `rerun_id` was already accepted with different content.
+Re-uploading the same accepted `rerun_id` with the same body is idempotent.
+
+If the generated rerun prompt is blocked by query policy, the run stops in
+human review with `done_reason="manual_rerun_prompt_blocked_by_query_policy"`
+and does not expose `pending_manual_rerun`. Operators must change course from
+the human-review/audit context; there is no ChatGPT prompt to run or upload for
+that blocked plan.
+
 ## Status And Progress
 
 ```sh
@@ -412,7 +487,8 @@ summary, warnings, reason, and allowed actions:
     "total_tool_calls": 24,
     "estimated_cost_usd": 0.31
   },
-  "warnings": []
+  "warnings": [],
+  "pending_manual_rerun": null
 }
 ```
 
@@ -441,7 +517,10 @@ Actions:
 - `request_verification`: run targeted verification after query policy allows
   the safe query.
 - `request_targeted_rerun`: submit item-scoped Deep Research and wait for the
-  poller.
+  poller. For `manual_chatgpt` manual imports, this creates a pending ChatGPT
+  rerun prompt instead.
+- `request_full_rerun`: submit a full replacement Deep Research rerun, or create
+  a pending ChatGPT rerun prompt for `manual_chatgpt` manual imports.
 - `request_item_revision`: keep the run in human review for manual ResearchItem
   revision.
 - `reject`: fail the run with `done_reason=human_rejected`.
@@ -487,9 +566,18 @@ endpoints return `404`.
 - `GET /research-runs/{run_id}/checkpoints/{checkpoint_id}`
 - `GET /research-runs/{run_id}/lineage`
 
+## Storage Compatibility
+
+Startup performs SQLite compatibility migrations for manual ChatGPT reruns. An
+existing `research_runs` table gains `rerun_execution_mode` with default `api`,
+and pending/accepted manual rerun upload state is stored in
+`manual_rerun_requests` with at most one active pending request per run.
+
 ## Public Interface Summary
 
 - `POST /research-runs`
+- `POST /research-runs/manual-import`
+- `POST /research-runs/{run_id}/manual-rerun-result`
 - `GET /research-runs/{run_id}`
 - `GET /research-runs/{run_id}/contract`
 - `GET /research-runs/{run_id}/items`

@@ -25,6 +25,7 @@ build/
 
 # uv
 .uv-cache/
+.gh-cache/
 
 # Local temporary files
 tmp/

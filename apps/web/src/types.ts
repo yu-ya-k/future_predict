@@ -39,8 +39,12 @@ export type HumanReviewAction =
   | "request_verification"
   | "request_targeted_rerun"
   | "request_full_rerun"
+  | "request_manual_targeted_rerun"
+  | "request_manual_full_rerun"
   | "request_item_revision"
   | "reject";
+
+export type RerunExecutionMode = "api" | "manual_chatgpt" | "disabled";
 
 export type ResearchItemStatus =
   | "not_started"
@@ -117,7 +121,11 @@ export type RerunScope =
   | "contradiction_resolution"
   | "full_rerun";
 
-export type RerunOutputMode = "delta_sections_only" | "evidence_summary_only";
+export type RerunOutputMode =
+  | "delta_sections_only"
+  | "evidence_summary_only"
+  | "targeted_delta_sections"
+  | "complete_replacement_report";
 
 // ── Request / response models ───────────────────────────────────────────────
 
@@ -269,6 +277,7 @@ export interface ResearchAttempt {
   status: string;
   model: string;
   prompt: string;
+  source?: "api" | "manual_upload" | "manual_chatgpt_rerun" | string;
   report: string;
   citations: Citation[];
   tool_calls_summary: ToolCallSummary[];
@@ -363,6 +372,7 @@ export interface HumanReviewResumeResponse {
 }
 
 export interface HumanReviewAuditSummary {
+  deep_research_runs: number;
   targeted_rerun_runs: number;
   full_rerun_runs: number;
   llm_patch_runs: number;
@@ -385,6 +395,44 @@ export interface HumanReviewQueueItem {
   updated_at: string;
 }
 
+export interface ManualRerunPrompt {
+  rerun_id: string;
+  scope: string;
+  expected_output_kind: RerunOutputMode;
+  expected_run_no: number;
+  prompt: string;
+  prompt_artifact_path: string;
+  target_item_ids: string[];
+  query_policy: QueryPolicyDecision;
+  base_report_hash?: string | null;
+  created_at: string;
+}
+
+export interface SuggestedRerunPrompt {
+  scope: string;
+  expected_output_kind: RerunOutputMode;
+  expected_run_no: number;
+  prompt: string;
+  target_item_ids: string[];
+  query_policy: QueryPolicyDecision;
+  base_report_hash?: string | null;
+}
+
+export interface HumanReviewActionState {
+  action: HumanReviewAction;
+  allowed: boolean;
+  blocked_reason?: string | null;
+}
+
+export interface HumanReviewRouteSummary {
+  candidate_route?: string | null;
+  selected_route?: string | null;
+  blocked_reason?: string | null;
+  dominant_actions: string[];
+  latest_review_no?: number | null;
+  latest_verdict?: Verdict | null;
+}
+
 export interface HumanReviewPayload {
   run_id: string;
   reason: string;
@@ -392,8 +440,12 @@ export interface HumanReviewPayload {
   latest_review: ReviewRecord | null;
   unresolved_items?: ResearchItem[];
   allowed_actions: HumanReviewAction[];
+  action_states?: HumanReviewActionState[];
+  route_summary?: HumanReviewRouteSummary | null;
   audit_summary: HumanReviewAuditSummary;
   warnings: string[];
+  pending_manual_rerun?: ManualRerunPrompt | null;
+  suggested_rerun?: SuggestedRerunPrompt | null;
 }
 
 // ── Research checkpoints / fork lineage ─────────────────────────────────────

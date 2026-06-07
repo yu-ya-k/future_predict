@@ -48,7 +48,8 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   if (apiKey) {
     headers["X-API-Key"] = apiKey;
   }
-  if (body !== undefined) {
+  const isFormData = body instanceof FormData;
+  if (body !== undefined && !isFormData) {
     headers["Content-Type"] = "application/json";
   }
 
@@ -57,7 +58,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     response = await fetch(`${env.apiBaseUrl}${path}`, {
       method,
       headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: body === undefined ? undefined : isFormData ? body : JSON.stringify(body),
       signal,
     });
   } catch (error) {

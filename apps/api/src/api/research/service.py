@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -45,28 +46,35 @@ from api.research.routing import (
     route_after_review_decision,
 )
 from api.research.schemas import (
+    Citation,
     CostEvent,
     CreateResearchRunRequest,
     FailureMode,
     ForkPreviewResponse,
     ForkSubmitResponse,
     HumanReviewAction,
+    HumanReviewActionState,
     HumanReviewAuditSummary,
     HumanReviewPayload,
     HumanReviewQueueItem,
     HumanReviewResumeRequest,
+    HumanReviewRouteSummary,
     ItemStatus,
     QueryPolicyDecision,
     RecommendedAction,
+    RerunExecutionMode,
     RerunPlan,
     ResearchAttempt,
     ResearchCheckpoint,
     ResearchItem,
     ResearchRunLineage,
+    ResearchRunOptions,
     ResearchRunRecord,
     ReviewRecord,
     RunStatus,
     Severity,
+    SuggestedRerunPrompt,
+    Verdict,
     VerificationQuery,
     utc_now,
 )
@@ -74,6 +82,11 @@ from api.research.schemas import (
 TERMINAL_FAILURE_STATUSES = {"failed", "cancelled", "incomplete"}
 TERMINAL_RUN_STATUSES = {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.FAILED}
 NON_TERMINAL_RUN_STATUSES = set(RunStatus) - TERMINAL_RUN_STATUSES
+MANUAL_RERUN_PROMPT_BLOCKED_REASON = "manual_rerun_prompt_blocked_by_query_policy"
+MANUAL_RERUN_ACTION_SCOPES = {
+    HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN: "targeted_gap_closure",
+    HumanReviewAction.REQUEST_MANUAL_FULL_RERUN: "full_rerun",
+}
 
 
 class ResearchOrchestrator:
@@ -97,6 +110,179 @@ class ResearchOrchestrator:
             settings=self.settings,
         )
         return self.submit_deep_research(run.id)
+
+    def create_manual_import_run(
+        self,
+        *,
+        input_prompt: str,
+        report: str,
+        options: ResearchRunOptions,
+        allow_remote_review: bool,
+        allow_api_reruns: bool,
+        rerun_execution_mode: RerunExecutionMode | None = None,
+        idempotency_key: str | None,
+        metadata: dict[str, Any],
+    ) -> tuple[ResearchRunRecord, bool]:
+        mode = rerun_execution_mode or (
+            RerunExecutionMode.API if allow_api_reruns else RerunExecutionMode.DISABLED
+        )
+        if not allow_api_reruns and mode == RerunExecutionMode.API:
+            mode = RerunExecutionMode.DISABLED
+        if mode == RerunExecutionMode.DISABLED:
+            options = options.model_copy(
+                update={
+                    "max_targeted_rerun_runs": 0,
+                    "max_full_rerun_runs": 0,
+                }
+            )
+
+        imported_at = utc_now()
+        options_payload = options.model_dump(mode="json")
+        request_metadata = {
+            **metadata,
+            "prompt_sha256": hashlib.sha256(input_prompt.encode("utf-8")).hexdigest(),
+            "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+            "prompt_chars": len(input_prompt),
+            "report_chars": len(report),
+            "allow_remote_review": allow_remote_review,
+            "allow_api_reruns": allow_api_reruns,
+            "rerun_execution_mode": mode.value,
+            "options": options_payload,
+            "imported_at": imported_at.isoformat(),
+        }
+        request_hash = _manual_import_request_hash(
+            input_prompt=input_prompt,
+            report=report,
+            options=options_payload,
+            allow_remote_review=allow_remote_review,
+            allow_api_reruns=allow_api_reruns,
+            rerun_execution_mode=mode,
+        )
+        if idempotency_key:
+            existing = self.repository.get_manual_import_idempotency(idempotency_key)
+            if existing is not None:
+                existing_run, existing_hash = existing
+                if existing_hash != request_hash:
+                    raise ValueError(
+                        "Manual import idempotency key already exists with a "
+                        "different request."
+                    )
+                return existing_run, False
+
+        contract, research_items, _optimized_prompt = build_objective_contract(
+            user_prompt=input_prompt,
+        )
+        run_id = uuid4()
+        thread_id = str(uuid4())
+        try:
+            prompt_path, _ = self.artifacts.save_text(
+                run_id,
+                "prompts/manual_import_prompt.txt",
+                input_prompt,
+            )
+            report_path, _ = self.artifacts.save_text(
+                run_id,
+                "reports/report_attempt_001.md",
+                report,
+            )
+            raw_path, _ = self.artifacts.save_json(
+                run_id,
+                "raw-responses/manual_import_001.json",
+                {
+                    **request_metadata,
+                    "source": "manual_upload",
+                    "prompt_path": prompt_path,
+                    "report_path": report_path,
+                    "request_hash": request_hash,
+                },
+            )
+            citations = _manual_upload_citations(report, retrieved_at=imported_at.isoformat())
+            attempt = ResearchAttempt(
+                run_no=1,
+                response_id=None,
+                status="completed",
+                model="chatgpt-deep-research-manual",
+                source="manual_upload",
+                prompt=input_prompt,
+                report=report,
+                citations=citations,
+                raw_response_artifact_path=raw_path,
+            )
+            report_digest = report_hash(report)
+            manual_checkpoint_snapshot = _manual_import_checkpoint_snapshot(
+                kind="deep_research_collected",
+                status=RunStatus.REVIEWING,
+                input_prompt=input_prompt,
+                report=report,
+                source_attempt_no=1,
+                snapshot_extra={
+                    "source": "manual_upload",
+                    "prompt_path": prompt_path,
+                    "report_path": report_path,
+                    "citations_count": len(citations),
+                },
+            )
+            done_reason: str | None = None
+            if not allow_remote_review:
+                done_reason = "manual_import_remote_review_not_allowed"
+            dispatch_review = done_reason is None
+            initial_status = (
+                RunStatus.REVIEWING if dispatch_review else RunStatus.NEEDS_HUMAN_REVIEW
+            )
+            human_review_checkpoint_snapshot = None
+            if done_reason is not None:
+                human_review_checkpoint_snapshot = _manual_import_checkpoint_snapshot(
+                    kind="human_review_required",
+                    status=RunStatus.NEEDS_HUMAN_REVIEW,
+                    input_prompt=input_prompt,
+                    report=report,
+                    source_attempt_no=1,
+                    snapshot_extra={
+                        "reason": done_reason,
+                        "audit_summary": {
+                            "deep_research_runs": 1,
+                            "targeted_rerun_runs": 0,
+                            "full_rerun_runs": 0,
+                            "llm_patch_runs": 0,
+                            "verification_runs": 0,
+                            "total_reviews": 0,
+                            "no_progress_count": 0,
+                            "total_tool_calls": 0,
+                            "estimated_cost_usd": 0,
+                        },
+                    },
+                )
+
+            run, created = self.repository.create_manual_import_run(
+                run_id=run_id,
+                thread_id=thread_id,
+                input_prompt=input_prompt,
+                report=report,
+                options=options,
+                settings=self.settings,
+                request_hash=request_hash,
+                request_metadata=request_metadata,
+                idempotency_key=idempotency_key,
+                contract=contract,
+                research_items=research_items,
+                attempt=attempt,
+                prompt_path=prompt_path,
+                report_path=report_path,
+                initial_status=initial_status,
+                needs_human_review=not dispatch_review,
+                done_reason=done_reason,
+                manual_checkpoint_snapshot=manual_checkpoint_snapshot,
+                manual_checkpoint_report_hash=report_digest,
+                human_review_checkpoint_snapshot=human_review_checkpoint_snapshot,
+                human_review_checkpoint_report_hash=report_digest if done_reason else None,
+            )
+        except Exception:
+            self.artifacts.delete_run(run_id)
+            raise
+        if not created:
+            self.artifacts.delete_run(run_id)
+            return run, False
+        return run, dispatch_review
 
     def submit_deep_research(
         self,
@@ -268,6 +454,249 @@ class ResearchOrchestrator:
                 optimized_prompt=optimized_prompt,
                 deep_research_runs=run_no,
             )
+
+    def _request_manual_chatgpt_rerun(
+        self,
+        run_id: UUID,
+        *,
+        human_comment: str | None = None,
+        scope: str = "targeted_gap_closure",
+    ) -> ResearchRunRecord:
+        run = self.repository.get_run(run_id)
+        active = self.repository.get_active_manual_rerun_request(run.id)
+        if active is not None:
+            return self._enter_human_review(
+                run.id,
+                done_reason="manual_chatgpt_rerun_pending",
+            )
+
+        run_no = run.deep_research_runs + 1
+        plan = self._build_rerun_plan(
+            run,
+            human_comment=human_comment,
+            scope=scope,
+        )
+        self.repository.add_rerun_plan(run.id, plan)
+        prompt = self._build_rerun_brief(run, human_comment=human_comment, plan=plan)
+        prompt_path, _ = self.artifacts.save_text(
+            run.id,
+            f"prompts/rerun_prompt_{run_no:03d}.txt",
+            prompt,
+        )
+        self.repository.append_history_event(
+            run.id,
+            {
+                "step": "manual_rerun_brief_created",
+                "run_no": run_no,
+                "rerun_id": plan.rerun_id,
+                "scope": plan.scope,
+                "target_item_ids": plan.target_item_ids,
+                "artifact_path": prompt_path,
+            },
+        )
+        policy_decision = _deep_research_query_policy_decision(prompt)
+        if policy_decision.status != "allowed":
+            self.repository.append_history_event(
+                run.id,
+                {
+                    "step": "manual_rerun_prompt_blocked_by_query_policy",
+                    "rerun_id": plan.rerun_id,
+                    "reason": policy_decision.blocked_reason,
+                    "policy_status": policy_decision.status,
+                },
+            )
+            return self._enter_human_review(
+                run.id,
+                done_reason="manual_rerun_prompt_blocked_by_query_policy",
+                allowed_statuses={RunStatus.REVIEWING, RunStatus.NEEDS_HUMAN_REVIEW},
+            )
+
+        self.repository.add_manual_rerun_request(
+            run.id,
+            plan=plan,
+            expected_run_no=run_no,
+            prompt=prompt,
+            prompt_artifact_path=prompt_path,
+            query_policy=policy_decision,
+            base_report_hash=report_hash(run.report or ""),
+        )
+        return self._enter_human_review(
+            run.id,
+            done_reason="manual_chatgpt_rerun_pending",
+            allowed_statuses={RunStatus.REVIEWING, RunStatus.NEEDS_HUMAN_REVIEW},
+        )
+
+    def accept_manual_rerun_result(
+        self,
+        run_id: UUID,
+        *,
+        rerun_id: str,
+        report_text: str,
+    ) -> ResearchRunRecord:
+        run = self.repository.get_run(run_id)
+
+        result = report_text.strip()
+        if not result:
+            raise ValueError("manual rerun result must not be blank.")
+        result_sha256 = hashlib.sha256(result.encode("utf-8")).hexdigest()
+
+        row = self.repository.get_manual_rerun_request_row(run.id, rerun_id)
+        if row is not None and row["status"] == "accepted":
+            if row["result_sha256"] == result_sha256:
+                return self.repository.get_run(run.id)
+            raise ValueError(
+                "Manual rerun result was already accepted with different content."
+            )
+
+        active = self.repository.get_active_manual_rerun_request(run.id)
+        if active is None:
+            raise ValueError("Run has no pending manual ChatGPT rerun.")
+        if active.rerun_id != rerun_id:
+            raise ValueError("Manual rerun id does not match the active pending rerun.")
+        if active.base_report_hash and active.base_report_hash != report_hash(run.report or ""):
+            raise ValueError("Run report changed since the manual rerun prompt was created.")
+
+        if active.scope == "full_rerun":
+            merged_report = result
+        else:
+            try:
+                merged_report = _merge_targeted_research_delta(
+                    existing_report=run.report or "",
+                    delta=result,
+                    run_no=active.expected_run_no,
+                )
+            except RegressionError as error:
+                self.repository.append_history_event(
+                    run.id,
+                    {
+                        "step": "manual_rerun_targeted_merge_rejected",
+                        "rerun_id": active.rerun_id,
+                        "reason": str(error),
+                    },
+                )
+                raise ValueError(str(error)) from error
+
+        imported_at = utc_now()
+        updated = self.repository.accept_manual_rerun_request_and_update_run(
+            run.id,
+            rerun_id=active.rerun_id,
+            result_sha256=result_sha256,
+            allowed_statuses={RunStatus.NEEDS_HUMAN_REVIEW, RunStatus.REVIEWING},
+            status=RunStatus.REVIEWING,
+            needs_human_review=False,
+            done_reason=None,
+            report=merged_report,
+            deep_research_runs=active.expected_run_no,
+            targeted_rerun_runs=(
+                run.targeted_rerun_runs + 1
+                if active.scope != "full_rerun"
+                else run.targeted_rerun_runs
+            ),
+            full_rerun_runs=(
+                run.full_rerun_runs + 1
+                if active.scope == "full_rerun"
+                else run.full_rerun_runs
+            ),
+            pending_deep_research_response_id=None,
+            deep_research_status="completed",
+            review_claim_token=None,
+            review_claim_operation=None,
+            review_claim_expires_at=None,
+        )
+        if updated is None:
+            row = self.repository.get_manual_rerun_request_row(run.id, rerun_id)
+            if row is not None and row["status"] == "accepted":
+                if row["result_sha256"] == result_sha256:
+                    return self.repository.get_run(run.id)
+                raise ValueError(
+                    "Manual rerun result was already accepted with different content."
+                )
+            raise ValueError("Manual rerun result could not be accepted because run state changed.")
+
+        artifact_fragment = _manual_rerun_artifact_fragment(
+            active.rerun_id,
+            result_sha256,
+        )
+        raw_path, _ = self.artifacts.save_json(
+            run.id,
+            (
+                f"raw-responses/manual_chatgpt_rerun_"
+                f"{active.expected_run_no:03d}_{artifact_fragment}.json"
+            ),
+            {
+                "source": "manual_chatgpt_rerun",
+                "rerun_id": active.rerun_id,
+                "scope": active.scope,
+                "expected_run_no": active.expected_run_no,
+                "result_sha256": result_sha256,
+                "result_chars": len(result),
+                "imported_at": imported_at.isoformat(),
+                "prompt_artifact_path": active.prompt_artifact_path,
+            },
+        )
+        result_path, _ = self.artifacts.save_text(
+            run.id,
+            (
+                f"reports/manual_chatgpt_rerun_result_"
+                f"{active.expected_run_no:03d}_{artifact_fragment}.md"
+            ),
+            result,
+        )
+        report_path, _ = self.artifacts.save_text(
+            run.id,
+            (
+                f"reports/report_attempt_{active.expected_run_no:03d}_{artifact_fragment}.md"
+            ),
+            merged_report,
+        )
+        citations = _manual_upload_citations(
+            result,
+            retrieved_at=imported_at.isoformat(),
+            source_type="manual_chatgpt_rerun_url_unverified",
+        )
+        self.repository.add_attempt(
+            run.id,
+            ResearchAttempt(
+                run_no=active.expected_run_no,
+                response_id=None,
+                status="completed",
+                model="chatgpt-deep-research-manual",
+                source="manual_chatgpt_rerun",
+                prompt=active.prompt,
+                report=result,
+                citations=citations,
+                raw_response_artifact_path=raw_path,
+            ),
+        )
+
+        self.repository.append_history_event(
+            run.id,
+            {
+                "step": "manual_rerun_result_collected",
+                "rerun_id": active.rerun_id,
+                "scope": active.scope,
+                "result_path": result_path,
+                "report_path": report_path,
+                "citations_count": len(citations),
+            },
+        )
+        self._save_checkpoint(
+            updated,
+            kind="deep_research_collected",
+            node_anchor=f"deep_research:{active.expected_run_no}",
+            source_attempt_no=active.expected_run_no,
+            source_response_id=None,
+            report_override=merged_report,
+            snapshot_extra={
+                "source": "manual_chatgpt_rerun",
+                "rerun_id": active.rerun_id,
+                "scope": active.scope,
+                "result_path": result_path,
+                "report_path": report_path,
+                "citations_count": len(citations),
+            },
+        )
+        return self.review_run(updated.id)
 
     def _record_deep_research_submit_failure(
         self,
@@ -918,6 +1347,8 @@ class ResearchOrchestrator:
                 _review_claim_token=_review_claim_token,
             )
         if route == "build_targeted_rerun_plan":
+            if self._should_use_manual_chatgpt_rerun(updated):
+                return self._request_manual_chatgpt_rerun(updated.id)
             return self.submit_deep_research(updated.id)
         if route == "verify_items":
             return self.verify_items(
@@ -925,6 +1356,11 @@ class ResearchOrchestrator:
                 _review_claim_token=_review_claim_token,
             )
         if route == "full_rerun_submit":
+            if self._should_use_manual_chatgpt_rerun(updated):
+                return self._request_manual_chatgpt_rerun(
+                    updated.id,
+                    scope="full_rerun",
+                )
             return self.submit_deep_research(updated.id, scope="full_rerun")
         if route == "finalize_with_limitation":
             return self._finalize_with_limitation(updated.id)
@@ -1165,6 +1601,12 @@ class ResearchOrchestrator:
             run,
             latest_review=self._latest_review(run.id),
         )
+        pending_manual_rerun = self.repository.get_active_manual_rerun_request(run.id)
+        query_policy_blocked_actions = (
+            {}
+            if pending_manual_rerun
+            else self._manual_rerun_query_policy_blocked_actions(run)
+        )
         return HumanReviewPayload(
             run_id=run.id,
             reason=run.done_reason or (latest_review.rationale if latest_review else ""),
@@ -1181,9 +1623,27 @@ class ResearchOrchestrator:
                     ItemStatus.UNVERIFIABLE,
                 }
             ],
-            allowed_actions=_allowed_human_review_actions(run),
+            allowed_actions=[]
+            if pending_manual_rerun
+            else _allowed_human_review_actions(
+                run,
+                query_policy_blocked_actions=query_policy_blocked_actions,
+            ),
+            action_states=_human_review_action_states(
+                run,
+                pending_manual_rerun=pending_manual_rerun is not None,
+                query_policy_blocked_actions=query_policy_blocked_actions,
+            ),
+            route_summary=_human_review_route_summary(
+                self.repository.get_history(run.id),
+                latest_review=latest_review,
+            ),
             audit_summary=self._human_review_audit_summary(run),
             warnings=run.warnings,
+            pending_manual_rerun=pending_manual_rerun,
+            suggested_rerun=None
+            if pending_manual_rerun
+            else self._build_suggested_rerun_prompt(run, latest_review=latest_review),
         )
 
     def get_cost_events(self, run_id: UUID) -> list[CostEvent]:
@@ -1768,6 +2228,11 @@ class ResearchOrchestrator:
         pending_run = self.repository.get_run(run_id)
         if not _is_waiting_for_human_review(pending_run):
             raise ValueError("Run is not waiting for human review.")
+        if self.repository.get_active_manual_rerun_request(pending_run.id) is not None:
+            raise ValueError(
+                "Run has a pending manual ChatGPT rerun result; "
+                "upload the result before other actions."
+            )
 
         blocked_reason = _blocked_human_resume_reason(pending_run, request.action)
         if blocked_reason is not None:
@@ -1782,6 +2247,31 @@ class ResearchOrchestrator:
             )
             raise ValueError(
                 f"Human review action {request.action.value!r} is blocked by {blocked_reason}."
+            )
+
+        query_policy_decision = self._manual_rerun_query_policy_decision(
+            pending_run,
+            action=request.action,
+            human_comment=request.comment,
+        )
+        if (
+            query_policy_decision is not None
+            and query_policy_decision.status != "allowed"
+        ):
+            self.repository.append_history_event(
+                pending_run.id,
+                {
+                    "step": "human_review_resume_blocked",
+                    "action": request.action.value,
+                    "reason": MANUAL_RERUN_PROMPT_BLOCKED_REASON,
+                    "comment": request.comment,
+                    "policy_status": query_policy_decision.status,
+                    "policy_reason": query_policy_decision.blocked_reason,
+                },
+            )
+            raise ValueError(
+                f"Human review action {request.action.value!r} is blocked by "
+                f"{MANUAL_RERUN_PROMPT_BLOCKED_REASON}."
             )
 
         claimed = self.repository.claim_human_review_decision(
@@ -1858,10 +2348,34 @@ class ResearchOrchestrator:
             return self.llm_finalize(run.id, human_comment=request.comment)
 
         if request.action == HumanReviewAction.REQUEST_TARGETED_RERUN:
+            if self._should_use_manual_chatgpt_rerun(run):
+                return self._request_manual_chatgpt_rerun(
+                    run.id,
+                    human_comment=request.comment,
+                )
             return self.submit_deep_research(run.id, human_comment=request.comment)
 
         if request.action == HumanReviewAction.REQUEST_FULL_RERUN:
+            if self._should_use_manual_chatgpt_rerun(run):
+                return self._request_manual_chatgpt_rerun(
+                    run.id,
+                    human_comment=request.comment,
+                    scope="full_rerun",
+                )
             return self.submit_deep_research(
+                run.id,
+                human_comment=request.comment,
+                scope="full_rerun",
+            )
+
+        if request.action == HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN:
+            return self._request_manual_chatgpt_rerun(
+                run.id,
+                human_comment=request.comment,
+            )
+
+        if request.action == HumanReviewAction.REQUEST_MANUAL_FULL_RERUN:
+            return self._request_manual_chatgpt_rerun(
                 run.id,
                 human_comment=request.comment,
                 scope="full_rerun",
@@ -2129,13 +2643,16 @@ class ResearchOrchestrator:
         research_items: list[ResearchItem],
     ) -> tuple[Any, str | None, dict[str, Any]]:
         last_error: Exception | None = None
-        citations = [citation.model_dump() for citation in self.repository.get_citations(run.id)]
+        all_citations = [
+            citation.model_dump() for citation in self.repository.get_citations(run.id)
+        ]
+        citations = all_citations[: self.settings.research_review_max_citations]
         omitted_report_chars = max(
             len(run.report or "") - self.settings.research_review_max_report_chars,
             0,
         )
         omitted_citations = max(
-            len(citations) - self.settings.research_review_max_citations,
+            len(all_citations) - self.settings.research_review_max_citations,
             0,
         )
         if omitted_report_chars or omitted_citations:
@@ -2402,6 +2919,112 @@ class ResearchOrchestrator:
             return None
         return reviews[-1]
 
+    def _is_manual_upload_run(self, run_id: UUID) -> bool:
+        return any(
+            attempt.run_no == 1 and attempt.source == "manual_upload"
+            for attempt in self.repository.get_attempts(run_id)
+        )
+
+    def _should_use_manual_chatgpt_rerun(self, run: ResearchRunRecord) -> bool:
+        return run.rerun_execution_mode == RerunExecutionMode.MANUAL_CHATGPT
+
+    def _manual_rerun_query_policy_decision(
+        self,
+        run: ResearchRunRecord,
+        *,
+        action: HumanReviewAction,
+        human_comment: str | None,
+    ) -> QueryPolicyDecision | None:
+        scope = MANUAL_RERUN_ACTION_SCOPES.get(action)
+        if scope is None:
+            return None
+        if _blocked_human_resume_reason(run, action) is not None:
+            return None
+        plan = self._build_rerun_plan(run, human_comment=human_comment, scope=scope)
+        prompt = self._build_rerun_brief(
+            run,
+            human_comment=human_comment,
+            plan=plan,
+        )
+        return _deep_research_query_policy_decision(prompt)
+
+    def _manual_rerun_query_policy_blocked_actions(
+        self,
+        run: ResearchRunRecord,
+    ) -> dict[HumanReviewAction, QueryPolicyDecision]:
+        blocked: dict[HumanReviewAction, QueryPolicyDecision] = {}
+        for action in MANUAL_RERUN_ACTION_SCOPES:
+            decision = self._manual_rerun_query_policy_decision(
+                run,
+                action=action,
+                human_comment=None,
+            )
+            if decision is not None and decision.status != "allowed":
+                blocked[action] = decision
+        return blocked
+
+    def _build_suggested_rerun_prompt(
+        self,
+        run: ResearchRunRecord,
+        *,
+        latest_review: ReviewRecord | None,
+    ) -> SuggestedRerunPrompt | None:
+        manual_full_allowed = (
+            _blocked_human_resume_reason(
+                run,
+                HumanReviewAction.REQUEST_MANUAL_FULL_RERUN,
+            )
+            is None
+        )
+        manual_targeted_allowed = (
+            _blocked_human_resume_reason(
+                run,
+                HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN,
+            )
+            is None
+        )
+        done_reason = run.done_reason or ""
+        scope: str | None = None
+        if (
+            manual_full_allowed
+            and (
+                (
+                    latest_review is not None
+                    and latest_review.verdict == Verdict.NEEDS_FULL_RERUN
+                )
+                or "full_rerun" in done_reason
+            )
+        ):
+            scope = "full_rerun"
+        elif (
+            manual_targeted_allowed
+            and (
+                (
+                    latest_review is not None
+                    and latest_review.verdict == Verdict.NEEDS_TARGETED_RERUN
+                )
+                or "targeted_rerun" in done_reason
+            )
+        ):
+            scope = "targeted_rerun"
+        if scope is None:
+            return None
+
+        plan = self._build_rerun_plan(run, human_comment=None, scope=scope)
+        prompt = self._build_rerun_brief(run, human_comment=None, plan=plan)
+        query_policy = _deep_research_query_policy_decision(prompt)
+        if query_policy.status != "allowed":
+            return None
+        return SuggestedRerunPrompt(
+            scope=scope,
+            expected_output_kind=_expected_rerun_output_kind(scope),
+            expected_run_no=run.deep_research_runs + 1,
+            prompt=prompt,
+            target_item_ids=plan.target_item_ids,
+            query_policy=query_policy,
+            base_report_hash=report_hash(run.report) if run.report else None,
+        )
+
     def _build_rerun_brief(
         self,
         run: ResearchRunRecord,
@@ -2434,6 +3057,15 @@ rationale: {latest_review.rationale}"""
             else latest_review.next_instructions
         )
         human_block = human_comment or "None."
+        output_contract = (
+            """Expected output: complete_replacement_report.
+Return the final report body only. Do not return rerun analysis, a plan, a checklist,
+or commentary about what you would do."""
+            if plan.scope == "full_rerun"
+            else """Expected output: targeted_delta_sections.
+Return only the item-scoped additions or replacement sections needed to patch the
+previous report. Do not return a full merged report."""
+        )
         rerun_policy = (
             """You are rebuilding the report because the current report or contract execution
 was judged unusable. Address the full Objective Contract and all ResearchItems.
@@ -2450,6 +3082,9 @@ Do not rewrite preserved sections or preserved ResearchItems."""
         )
         return f"""# Original User Prompt
 {run.user_prompt}
+
+# Output Contract
+{output_contract}
 
 # Original Research Brief
 {run.optimized_prompt or run.user_prompt}
@@ -2519,6 +3154,17 @@ previous report, review, or human comment is in another language.
         if not target_item_ids:
             target_item_ids = [item.item_id for item in items[:1]]
         target_items = [item for item in items if item.item_id in set(target_item_ids)]
+        forbidden_changes = (
+            [
+                "Do not omit required Objective Contract sections.",
+                "Do not return rerun analysis or a plan instead of the final report.",
+            ]
+            if scope == "full_rerun"
+            else [
+                "Do not rewrite accepted sections.",
+                "Do not return a full merged report.",
+            ]
+        )
         return RerunPlan(
             rerun_id=f"RR-{uuid4()}",
             scope=scope,
@@ -2534,10 +3180,8 @@ previous report, review, or human comment is in another language.
                 for tool in self.repository.get_tool_calls(run.id)
                 if tool.query
             ],
-            forbidden_changes=[
-                "Do not rewrite accepted sections.",
-                "Do not return a full merged report.",
-            ],
+            forbidden_changes=forbidden_changes,
+            output_mode=_expected_rerun_output_kind(scope),
             max_tool_calls=min(
                 80 if scope == "full_rerun" else 25,
                 max(1, run.max_total_tool_calls - run.total_tool_calls),
@@ -2641,6 +3285,108 @@ def _extract_response_error(response: Any) -> str:
     if raw.get("incomplete_details"):
         return str(raw["incomplete_details"])
     return "Deep Research ended without a completed response."
+
+
+def _manual_import_request_hash(
+    *,
+    input_prompt: str,
+    report: str,
+    options: dict[str, Any],
+    allow_remote_review: bool,
+    allow_api_reruns: bool,
+    rerun_execution_mode: RerunExecutionMode,
+) -> str:
+    payload = {
+        "input_prompt_sha256": hashlib.sha256(input_prompt.encode("utf-8")).hexdigest(),
+        "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+        "options": options,
+        "allow_remote_review": allow_remote_review,
+        "allow_api_reruns": allow_api_reruns,
+        "rerun_execution_mode": rerun_execution_mode.value,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _manual_rerun_artifact_fragment(rerun_id: str, result_sha256: str) -> str:
+    safe_rerun_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", rerun_id).strip("._-")
+    if not safe_rerun_id:
+        safe_rerun_id = "rerun"
+    return f"{safe_rerun_id[:40]}_{result_sha256[:12]}"
+
+
+def _manual_import_checkpoint_snapshot(
+    *,
+    kind: str,
+    status: RunStatus,
+    input_prompt: str,
+    report: str,
+    source_attempt_no: int,
+    snapshot_extra: dict[str, Any],
+) -> dict[str, Any]:
+    snapshot = {
+        "kind": kind,
+        "status": status.value,
+        "source_prompt": input_prompt,
+        "source_report": report,
+        "source_report_excerpt": _excerpt(report),
+        "source_prompt_excerpt": _excerpt(input_prompt),
+        "source_attempt_no": source_attempt_no,
+        "source_review_no": None,
+        "source_response_id": None,
+    }
+    snapshot.update(snapshot_extra)
+    return snapshot
+
+
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]{1,300})\]\((https?://[^)\s]+)\)")
+_URL_RE = re.compile(r"https?://[^\s<>\]\)\"']+")
+
+
+def _manual_upload_citations(
+    report: str,
+    *,
+    retrieved_at: str,
+    source_type: str = "manual_upload_url_unverified",
+) -> list[Citation]:
+    citations: list[Citation] = []
+    seen_urls: set[str] = set()
+    for match in _MARKDOWN_LINK_RE.finditer(report):
+        title = match.group(1).strip() or None
+        url = _clean_manual_url(match.group(2))
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        citations.append(
+            Citation(
+                title=title,
+                url=url,
+                start_index=match.start(2),
+                end_index=match.end(2),
+                source_type=source_type,
+                retrieved_at=retrieved_at,
+            )
+        )
+    for match in _URL_RE.finditer(report):
+        url = _clean_manual_url(match.group(0))
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        citations.append(
+            Citation(
+                title=None,
+                url=url,
+                start_index=match.start(),
+                end_index=match.end(),
+                source_type=source_type,
+                retrieved_at=retrieved_at,
+            )
+        )
+    return citations
+
+
+def _clean_manual_url(url: str) -> str:
+    return url.rstrip(".,;:")
 
 
 def _acceptance_criteria_from_history(history: list[dict[str, Any]]) -> list[str]:
@@ -3054,12 +3800,85 @@ def _human_review_route_reason(review: ReviewRecord) -> str:
     return f"review_route_{review.verdict.value}"
 
 
-def _allowed_human_review_actions(run: ResearchRunRecord) -> list[HumanReviewAction]:
+def _allowed_human_review_actions(
+    run: ResearchRunRecord,
+    *,
+    query_policy_blocked_actions: (
+        dict[HumanReviewAction, QueryPolicyDecision] | None
+    ) = None,
+) -> list[HumanReviewAction]:
+    query_policy_blocked_actions = query_policy_blocked_actions or {}
     return [
         action
         for action in HumanReviewAction
         if _blocked_human_resume_reason(run, action) is None
+        and action not in query_policy_blocked_actions
     ]
+
+
+def _human_review_action_states(
+    run: ResearchRunRecord,
+    *,
+    pending_manual_rerun: bool = False,
+    query_policy_blocked_actions: (
+        dict[HumanReviewAction, QueryPolicyDecision] | None
+    ) = None,
+) -> list[HumanReviewActionState]:
+    query_policy_blocked_actions = query_policy_blocked_actions or {}
+    states: list[HumanReviewActionState] = []
+    for action in HumanReviewAction:
+        blocked_reason = (
+            "manual_chatgpt_rerun_pending"
+            if pending_manual_rerun
+            else _blocked_human_resume_reason(run, action)
+        )
+        if blocked_reason is None and action in query_policy_blocked_actions:
+            blocked_reason = MANUAL_RERUN_PROMPT_BLOCKED_REASON
+        states.append(
+            HumanReviewActionState(
+                action=action,
+                allowed=blocked_reason is None,
+                blocked_reason=blocked_reason,
+            )
+        )
+    return states
+
+
+def _expected_rerun_output_kind(scope: str) -> str:
+    return (
+        "complete_replacement_report"
+        if scope == "full_rerun"
+        else "targeted_delta_sections"
+    )
+
+
+def _human_review_route_summary(
+    history: list[dict[str, Any]],
+    *,
+    latest_review: ReviewRecord | None,
+) -> HumanReviewRouteSummary | None:
+    route_events = [
+        event
+        for event in history
+        if event.get("step") == "route_after_review"
+    ]
+    if not route_events and latest_review is None:
+        return None
+    latest_event: dict[str, Any] = route_events[-1] if route_events else {}
+    dominant_actions_raw = latest_event.get("dominant_actions")
+    dominant_actions: list[str] = []
+    if isinstance(dominant_actions_raw, list):
+        dominant_actions = [
+            str(action) for action in cast(list[object], dominant_actions_raw)
+        ]
+    return HumanReviewRouteSummary(
+        candidate_route=cast(str | None, latest_event.get("candidate_route")),
+        selected_route=cast(str | None, latest_event.get("selected_route")),
+        blocked_reason=cast(str | None, latest_event.get("blocked_reason")),
+        dominant_actions=dominant_actions,
+        latest_review_no=latest_review.review_no if latest_review else None,
+        latest_verdict=latest_review.verdict if latest_review else None,
+    )
 
 
 def _route_budget_snapshot(route_state: RouteState) -> dict[str, object]:
@@ -3110,13 +3929,18 @@ def _blocked_human_resume_reason(
     if action == HumanReviewAction.REQUEST_VERIFICATION and run.total_reviews == 0:
         return "missing_review_for_verification"
 
-    if action == HumanReviewAction.REQUEST_TARGETED_RERUN and not run.report:
+    if action in {
+        HumanReviewAction.REQUEST_TARGETED_RERUN,
+        HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN,
+    } and not run.report:
         return "missing_report_for_targeted_rerun_use_full_rerun"
 
     if action not in {
         HumanReviewAction.REQUEST_LLM_PATCH,
         HumanReviewAction.REQUEST_TARGETED_RERUN,
         HumanReviewAction.REQUEST_FULL_RERUN,
+        HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN,
+        HumanReviewAction.REQUEST_MANUAL_FULL_RERUN,
         HumanReviewAction.REQUEST_VERIFICATION,
         HumanReviewAction.REQUEST_ITEM_REVISION,
     }:
@@ -3131,6 +3955,8 @@ def _blocked_human_resume_reason(
     if run.no_progress_count >= 2 and action not in {
         HumanReviewAction.REQUEST_TARGETED_RERUN,
         HumanReviewAction.REQUEST_FULL_RERUN,
+        HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN,
+        HumanReviewAction.REQUEST_MANUAL_FULL_RERUN,
         HumanReviewAction.REQUEST_ITEM_REVISION,
     }:
         return "max_no_progress_count_reached"

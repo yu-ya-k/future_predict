@@ -46,8 +46,16 @@ class HumanReviewAction(StrEnum):
     REQUEST_VERIFICATION = "request_verification"
     REQUEST_TARGETED_RERUN = "request_targeted_rerun"
     REQUEST_FULL_RERUN = "request_full_rerun"
+    REQUEST_MANUAL_TARGETED_RERUN = "request_manual_targeted_rerun"
+    REQUEST_MANUAL_FULL_RERUN = "request_manual_full_rerun"
     REQUEST_ITEM_REVISION = "request_item_revision"
     REJECT = "reject"
+
+
+class RerunExecutionMode(StrEnum):
+    API = "api"
+    MANUAL_CHATGPT = "manual_chatgpt"
+    DISABLED = "disabled"
 
 
 class ResearchRunOptions(BaseModel):
@@ -346,6 +354,7 @@ class ResearchAttempt(BaseModel):
     status: str
     model: str
     prompt: str
+    source: str = "api"
     report: str = ""
     citations: list[Citation] = Field(default_factory=_empty_citations)
     tool_calls_summary: list[ToolCallSummary] = Field(default_factory=_empty_tool_calls)
@@ -542,6 +551,48 @@ class RerunPlansResponse(BaseModel):
     rerun_plans: list[RerunPlan]
 
 
+class ManualRerunPrompt(BaseModel):
+    rerun_id: str
+    scope: str
+    expected_output_kind: str
+    expected_run_no: int
+    prompt: str
+    prompt_artifact_path: str
+    target_item_ids: list[str] = Field(default_factory=list)
+    query_policy: QueryPolicyDecision
+    base_report_hash: str | None = None
+    created_at: datetime
+
+
+class SuggestedRerunPrompt(BaseModel):
+    scope: str
+    expected_output_kind: str
+    expected_run_no: int
+    prompt: str
+    target_item_ids: list[str] = Field(default_factory=list)
+    query_policy: QueryPolicyDecision
+    base_report_hash: str | None = None
+
+
+class HumanReviewActionState(BaseModel):
+    action: HumanReviewAction
+    allowed: bool
+    blocked_reason: str | None = None
+
+
+def _empty_human_review_action_states() -> list[HumanReviewActionState]:
+    return []
+
+
+class HumanReviewRouteSummary(BaseModel):
+    candidate_route: str | None = None
+    selected_route: str | None = None
+    blocked_reason: str | None = None
+    dominant_actions: list[str] = Field(default_factory=list)
+    latest_review_no: int | None = None
+    latest_verdict: Verdict | None = None
+
+
 class CancelResponse(BaseModel):
     run_id: UUID
     status: RunStatus
@@ -585,8 +636,14 @@ class HumanReviewPayload(BaseModel):
     latest_review: ReviewRecord | None
     unresolved_items: list[ResearchItem] = Field(default_factory=_empty_human_review_items)
     allowed_actions: list[HumanReviewAction]
+    action_states: list[HumanReviewActionState] = Field(
+        default_factory=_empty_human_review_action_states
+    )
+    route_summary: HumanReviewRouteSummary | None = None
     audit_summary: HumanReviewAuditSummary
     warnings: list[str]
+    pending_manual_rerun: ManualRerunPrompt | None = None
+    suggested_rerun: SuggestedRerunPrompt | None = None
 
 
 class HumanReviewDecision(BaseModel):
@@ -626,6 +683,7 @@ class ResearchRunRecord(BaseModel):
     max_total_tool_calls: int
     total_tool_calls: int
     estimated_cost_usd: float
+    rerun_execution_mode: RerunExecutionMode = RerunExecutionMode.API
     terminal_status: str | None = None
     review_claim_token: str | None = None
     review_claim_operation: str | None = None

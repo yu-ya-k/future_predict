@@ -576,6 +576,14 @@
   line-height: var(--leading-normal);
 }
 
+.decision-button__blocked {
+  font-size: var(--text-caption);
+  color: var(--error);
+  margin: 0;
+  padding: 0 2px;
+  line-height: var(--leading-normal);
+}
+
 /* ── 3-11 WaitBanner ───────────────────────────────────────────────────────── */
 
 .wait-banner {

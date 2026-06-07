@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     research_review_max_report_chars: int = Field(default=50000, ge=1)
     research_review_max_citations: int = Field(default=40, ge=0)
     research_review_web_search_enabled: bool = False
+    research_manual_import_max_report_chars: int = Field(default=50000, ge=1)
+    research_manual_import_max_file_bytes: int = Field(default=1048576, ge=1)
 
     default_max_targeted_rerun_runs: int = Field(default=2, ge=0)
     default_max_full_rerun_runs: int = Field(default=1, ge=0)

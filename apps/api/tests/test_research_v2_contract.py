@@ -36,6 +36,8 @@ V2_HUMAN_ACTIONS = {
     "request_verification",
     "request_targeted_rerun",
     "request_full_rerun",
+    "request_manual_targeted_rerun",
+    "request_manual_full_rerun",
     "request_item_revision",
     "reject",
 }

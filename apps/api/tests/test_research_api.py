@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
@@ -11,6 +12,8 @@ from api.config import get_settings
 from api.main import create_app
 from api.research.azure_responses import ReviewRequestTimeout
 from api.research.dependencies import get_research_orchestrator
+from api.research.poller import ResearchPoller
+from api.research.repository import ResearchRepository
 from api.research.schemas import (
     CreateResearchRunRequest,
     FailureMode,
@@ -18,6 +21,7 @@ from api.research.schemas import (
     ItemAssessment,
     ItemStatus,
     RecommendedAction,
+    ResearchRunOptions,
     ReviewResult,
     RunStatus,
     Severity,
@@ -260,6 +264,1057 @@ async def test_research_api_rejects_blank_prompt_fields(tmp_path: Path) -> None:
     assert valid_preview_response.status_code == 200
     assert blank_fork_prompt_response.status_code == 422
     assert blank_idempotency_response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_manual_import_text_dispatches_review_without_deep_research_submit(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure()
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "公開情報だけで市場調査をしてください。",
+                "report_text": "調査レポート本文\n\n[Example](https://example.com/source)",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "false",
+                "idempotency_key": "manual-import-pass",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        status_response = await client.get(f"/research-runs/{run_id}")
+        audit_response = await client.get(f"/research-runs/{run_id}/audit")
+
+    assert fake.submitted_prompts == []
+    assert fake.review_calls == 1
+    status_json = status_response.json()
+    assert status_json["status"] == "completed"
+    assert status_json["progress"]["deep_research_runs"] == 1
+    assert status_json["progress"]["total_tool_calls"] == 0
+    audit_json = audit_response.json()
+    assert audit_json["attempts"][0]["source"] == "manual_upload"
+    assert audit_json["attempts"][0]["model"] == "chatgpt-deep-research-manual"
+    assert audit_json["attempts"][0]["response_id"] is None
+    assert audit_json["citations"][0]["source_type"] == "manual_upload_url_unverified"
+    assert audit_json["cost_events"] == [
+        event for event in audit_json["cost_events"] if event["step"] != "deep_research"
+    ]
+
+
+@pytest.mark.anyio
+async def test_manual_import_without_remote_review_enters_human_review(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure()
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "公開情報だけで調べてください。",
+                "report_text": "調査レポート本文",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        status_response = await client.get(f"/research-runs/{run_id}")
+
+    assert fake.submitted_prompts == []
+    assert fake.review_calls == 0
+    status_json = status_response.json()
+    assert status_json["status"] == "needs_human_review"
+    assert status_json["done_reason"] == "manual_import_remote_review_not_allowed"
+
+
+@pytest.mark.anyio
+async def test_manual_import_sensitive_terms_still_dispatches_review(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure()
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "api_key を含む内容は外部に出さないでください。",
+                "report_text": "調査レポート本文",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "true",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        status_response = await client.get(f"/research-runs/{run_id}")
+
+    assert fake.submitted_prompts == []
+    assert fake.review_calls == 1
+    status_json = status_response.json()
+    assert status_json["status"] == "completed"
+    assert status_json["done_reason"] == "passed_review"
+
+
+@pytest.mark.anyio
+async def test_manual_import_disables_api_reruns_when_not_allowed(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure(verdict=Verdict.NEEDS_TARGETED_RERUN)
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "公開情報だけで調べてください。",
+                "report_text": "追加調査が必要なレポート本文",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "false",
+                "rerun_execution_mode": "api",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        status_response = await client.get(f"/research-runs/{run_id}")
+
+    assert fake.review_calls == 1
+    assert fake.submitted_prompts == []
+    assert orchestrator.repository.get_run(UUID(run_id)).rerun_execution_mode.value == "disabled"
+    status_json = status_response.json()
+    assert status_json["status"] == "needs_human_review"
+    assert status_json["progress"]["targeted_rerun_runs"] == 0
+
+
+@pytest.mark.anyio
+async def test_manual_import_allows_next_deep_research_attempt_when_reruns_allowed(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure(verdict=Verdict.NEEDS_TARGETED_RERUN)
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "公開情報だけで調べてください。",
+                "report_text": "追加調査が必要なレポート本文",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "true",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        status_response = await client.get(f"/research-runs/{run_id}")
+        attempts_response = await client.get(f"/research-runs/{run_id}/attempts")
+
+    assert fake.review_calls == 1
+    assert len(fake.submitted_prompts) == 1
+    status_json = status_response.json()
+    assert status_json["status"] == "waiting_deep_research"
+    assert status_json["progress"]["deep_research_runs"] == 2
+    assert status_json["progress"]["targeted_rerun_runs"] == 1
+    attempts = attempts_response.json()
+    assert attempts[0]["source"] == "manual_upload"
+    assert attempts[1]["source"] == "api"
+    assert attempts[1]["run_no"] == 2
+
+
+@pytest.mark.anyio
+async def test_manual_import_manual_chatgpt_mode_creates_pending_prompt_without_api_submit(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure(verdict=Verdict.NEEDS_TARGETED_RERUN)
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "公開情報だけで調べてください。",
+                "report_text": "追加調査が必要なレポート本文",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "false",
+                "rerun_execution_mode": "manual_chatgpt",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        status_response = await client.get(f"/research-runs/{run_id}")
+        payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+        audit_response = await client.get(f"/research-runs/{run_id}/audit")
+        blocked_action = await client.post(
+            f"/research-runs/{run_id}/resume",
+            json={"action": "approve", "comment": None},
+        )
+
+    assert fake.review_calls == 1
+    assert fake.submitted_prompts == []
+    status_json = status_response.json()
+    assert status_json["status"] == "needs_human_review"
+    assert status_json["done_reason"] == "manual_chatgpt_rerun_pending"
+    assert status_json["progress"]["deep_research_runs"] == 1
+    assert status_json["progress"]["targeted_rerun_runs"] == 0
+    payload = payload_response.json()
+    assert payload["allowed_actions"] == []
+    pending = payload["pending_manual_rerun"]
+    assert pending["rerun_id"].startswith("RR-")
+    assert pending["expected_output_kind"] == "targeted_delta_sections"
+    assert pending["expected_run_no"] == 2
+    assert pending["prompt"]
+    assert "Expected output: targeted_delta_sections" in pending["prompt"]
+    assert "Do not return a full merged report." in pending["prompt"]
+    assert pending["query_policy"]["status"] == "allowed"
+    assert blocked_action.status_code == 409
+    audit_json = audit_response.json()
+    assert [attempt["source"] for attempt in audit_json["attempts"]] == ["manual_upload"]
+
+
+@pytest.mark.anyio
+async def test_manual_chatgpt_targeted_upload_merges_and_replay_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure(verdicts=[Verdict.NEEDS_TARGETED_RERUN, Verdict.PASS])
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "公開情報だけで調べてください。",
+                "report_text": "Base report section.",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "true",
+                "rerun_execution_mode": "manual_chatgpt",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        pending_payload = (await client.get(f"/research-runs/{run_id}/human-review")).json()
+        rerun_id = pending_payload["pending_manual_rerun"]["rerun_id"]
+        stale_response = await client.post(
+            f"/research-runs/{run_id}/manual-rerun-result",
+            data={
+                "rerun_id": "RR-stale",
+                "report_text": "Delta with [Source](https://example.com/new).",
+            },
+        )
+        upload_response = await client.post(
+            f"/research-runs/{run_id}/manual-rerun-result",
+            data={
+                "rerun_id": rerun_id,
+                "report_text": "Delta with [Source](https://example.com/new).",
+            },
+        )
+        replay_response = await client.post(
+            f"/research-runs/{run_id}/manual-rerun-result",
+            data={
+                "rerun_id": rerun_id,
+                "report_text": "Delta with [Source](https://example.com/new).",
+            },
+        )
+        conflict_response = await client.post(
+            f"/research-runs/{run_id}/manual-rerun-result",
+            data={"rerun_id": rerun_id, "report_text": "Different delta."},
+        )
+        report_response = await client.get(f"/research-runs/{run_id}/report")
+        audit_response = await client.get(f"/research-runs/{run_id}/audit")
+
+    assert stale_response.status_code == 409
+    assert upload_response.status_code == 200
+    assert replay_response.status_code == 200
+    assert conflict_response.status_code == 409
+    assert fake.submitted_prompts == []
+    assert fake.review_calls == 2
+    upload_json = upload_response.json()
+    assert upload_json["status"] == "completed"
+    assert upload_json["progress"]["deep_research_runs"] == 2
+    assert upload_json["progress"]["targeted_rerun_runs"] == 1
+    final_report = report_response.json()["final_report"]
+    assert "Base report section." in final_report
+    assert "Delta with" in final_report
+    audit_json = audit_response.json()
+    assert [attempt["source"] for attempt in audit_json["attempts"]] == [
+        "manual_upload",
+        "manual_chatgpt_rerun",
+    ]
+    assert audit_json["attempts"][1]["response_id"] is None
+    assert audit_json["attempts"][1]["citations"][0]["source_type"] == (
+        "manual_chatgpt_rerun_url_unverified"
+    )
+    assert not [event for event in audit_json["cost_events"] if event["step"] == "deep_research"]
+    assert audit_json["tool_calls"] == []
+
+
+@pytest.mark.anyio
+async def test_manual_chatgpt_replay_is_idempotent_with_new_pending_rerun(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure(
+        verdicts=[Verdict.NEEDS_TARGETED_RERUN, Verdict.NEEDS_TARGETED_RERUN],
+    )
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "公開情報だけで調べてください。",
+                "report_text": "Base report section.",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "true",
+                "rerun_execution_mode": "manual_chatgpt",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        first_payload = (await client.get(f"/research-runs/{run_id}/human-review")).json()
+        first_rerun_id = first_payload["pending_manual_rerun"]["rerun_id"]
+        upload_response = await client.post(
+            f"/research-runs/{run_id}/manual-rerun-result",
+            data={
+                "rerun_id": first_rerun_id,
+                "report_text": "Delta with [Source](https://example.com/new).",
+            },
+        )
+        second_payload = (await client.get(f"/research-runs/{run_id}/human-review")).json()
+        replay_response = await client.post(
+            f"/research-runs/{run_id}/manual-rerun-result",
+            data={
+                "rerun_id": first_rerun_id,
+                "report_text": "Delta with [Source](https://example.com/new).",
+            },
+        )
+
+    assert upload_response.status_code == 200
+    assert upload_response.json()["done_reason"] == "manual_chatgpt_rerun_pending"
+    second_rerun_id = second_payload["pending_manual_rerun"]["rerun_id"]
+    assert second_rerun_id != first_rerun_id
+    assert replay_response.status_code == 200
+    assert replay_response.json()["done_reason"] == "manual_chatgpt_rerun_pending"
+    assert fake.submitted_prompts == []
+    assert fake.review_calls == 2
+
+
+@pytest.mark.anyio
+async def test_manual_chatgpt_upload_after_status_change_keeps_pending(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure(verdict=Verdict.NEEDS_TARGETED_RERUN)
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "公開情報だけで調べてください。",
+                "report_text": "Base report section.",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "true",
+                "rerun_execution_mode": "manual_chatgpt",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        pending_payload = (await client.get(f"/research-runs/{run_id}/human-review")).json()
+        rerun_id = pending_payload["pending_manual_rerun"]["rerun_id"]
+        cancel_response = await client.post(f"/research-runs/{run_id}/cancel")
+        upload_response = await client.post(
+            f"/research-runs/{run_id}/manual-rerun-result",
+            data={
+                "rerun_id": rerun_id,
+                "report_text": "Delta with [Source](https://example.com/new).",
+            },
+        )
+        audit_response = await client.get(f"/research-runs/{run_id}/audit")
+
+    assert cancel_response.status_code == 200
+    assert cancel_response.json()["status"] == "cancelled"
+    assert upload_response.status_code == 409
+    assert "run state changed" in upload_response.json()["detail"]
+    assert orchestrator.repository.get_active_manual_rerun_request(UUID(run_id)) is not None
+    assert [attempt["source"] for attempt in audit_response.json()["attempts"]] == [
+        "manual_upload",
+    ]
+
+
+@pytest.mark.anyio
+async def test_manual_chatgpt_full_upload_replaces_report(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure(verdicts=[Verdict.NEEDS_FULL_RERUN, Verdict.PASS])
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "公開情報だけで調べてください。",
+                "report_text": "Original defective report.",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "true",
+                "rerun_execution_mode": "manual_chatgpt",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        pending_payload = (await client.get(f"/research-runs/{run_id}/human-review")).json()
+        rerun_id = pending_payload["pending_manual_rerun"]["rerun_id"]
+        assert pending_payload["pending_manual_rerun"]["scope"] == "full_rerun"
+        upload_response = await client.post(
+            f"/research-runs/{run_id}/manual-rerun-result",
+            data={
+                "rerun_id": rerun_id,
+                "report_text": "Complete replacement report.",
+            },
+        )
+        report_response = await client.get(f"/research-runs/{run_id}/report")
+
+    assert upload_response.status_code == 200
+    upload_json = upload_response.json()
+    assert upload_json["progress"]["deep_research_runs"] == 2
+    assert upload_json["progress"]["full_rerun_runs"] == 1
+    assert report_response.json()["final_report"] == "Complete replacement report."
+
+
+@pytest.mark.anyio
+async def test_manual_chatgpt_targeted_upload_rejects_full_report_and_keeps_pending(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure(verdict=Verdict.NEEDS_TARGETED_RERUN)
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "公開情報だけで調べてください。",
+                "report_text": "Original report paragraph that should be preserved.",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "true",
+                "rerun_execution_mode": "manual_chatgpt",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        pending_payload = (await client.get(f"/research-runs/{run_id}/human-review")).json()
+        rerun_id = pending_payload["pending_manual_rerun"]["rerun_id"]
+        rejected = await client.post(
+            f"/research-runs/{run_id}/manual-rerun-result",
+            data={
+                "rerun_id": rerun_id,
+                "report_text": (
+                    "Original report paragraph that should be preserved.\n\n"
+                    "This is an attempted full merged report."
+                ),
+            },
+        )
+        status_response = await client.get(f"/research-runs/{run_id}")
+        payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+
+    assert rejected.status_code == 409
+    status_json = status_response.json()
+    assert status_json["status"] == "needs_human_review"
+    assert status_json["progress"]["deep_research_runs"] == 1
+    assert status_json["progress"]["targeted_rerun_runs"] == 0
+    assert payload_response.json()["pending_manual_rerun"]["rerun_id"] == rerun_id
+
+
+@pytest.mark.anyio
+async def test_manual_chatgpt_query_policy_blocked_prompt_has_no_pending_rerun(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure(verdict=Verdict.NEEDS_TARGETED_RERUN)
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "api_key を含む内容を公開情報だけで調べてください。",
+                "report_text": "追加調査が必要なレポート本文",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "true",
+                "rerun_execution_mode": "manual_chatgpt",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        status_response = await client.get(f"/research-runs/{run_id}")
+        payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+
+    assert fake.review_calls == 1
+    assert fake.submitted_prompts == []
+    status_json = status_response.json()
+    assert status_json["status"] == "needs_human_review"
+    assert status_json["done_reason"] == "manual_rerun_prompt_blocked_by_query_policy"
+    payload = payload_response.json()
+    assert payload["pending_manual_rerun"] is None
+    assert payload["suggested_rerun"] is None
+    assert payload["allowed_actions"]
+    assert HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN.value not in payload[
+        "allowed_actions"
+    ]
+    assert HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value not in payload[
+        "allowed_actions"
+    ]
+    states = {state["action"]: state for state in payload["action_states"]}
+    assert states[HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN.value] == {
+        "action": HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN.value,
+        "allowed": False,
+        "blocked_reason": "manual_rerun_prompt_blocked_by_query_policy",
+    }
+    assert states[HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value] == {
+        "action": HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value,
+        "allowed": False,
+        "blocked_reason": "manual_rerun_prompt_blocked_by_query_policy",
+    }
+
+
+@pytest.mark.anyio
+async def test_resume_api_rejects_query_policy_blocked_manual_rerun(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure(verdict=Verdict.HUMAN_REVIEW)
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "api_key を含む内容を公開情報だけで調べてください。",
+                "report_text": "追加調査が必要なレポート本文",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "true",
+                "rerun_execution_mode": "manual_chatgpt",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+
+        payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+        resume_response = await client.post(
+            f"/research-runs/{run_id}/resume",
+            json={
+                "action": HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value,
+                "comment": "ChatGPTで全面作り直し",
+            },
+        )
+        pending_payload_response = await client.get(
+            f"/research-runs/{run_id}/human-review"
+        )
+
+    assert payload_response.status_code == 200
+    payload = payload_response.json()
+    assert HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value not in payload[
+        "allowed_actions"
+    ]
+    assert resume_response.status_code == 409
+    assert (
+        "manual_rerun_prompt_blocked_by_query_policy"
+        in resume_response.json()["detail"]
+    )
+    assert pending_payload_response.json()["pending_manual_rerun"] is None
+
+
+@pytest.mark.anyio
+async def test_manual_import_validates_file_text_xor_and_options(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        both_prompt_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "report_text": "report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+            files={"input_prompt_file": ("prompt.txt", b"prompt", "text/plain")},
+        )
+        blank_text_and_file_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": " ",
+                "report_text": "report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+            files={"input_prompt_file": ("prompt.txt", b"prompt", "text/plain")},
+        )
+        missing_report_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+        )
+        blank_prompt_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": " \n\t ",
+                "report_text": "report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+        )
+        bad_ext_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "report_text": "report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+            files={"input_prompt_file": ("prompt.pdf", b"prompt", "application/pdf")},
+        )
+        non_utf_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+            files={"report_file": ("report.md", b"\xff\xfe", "text/markdown")},
+        )
+        oversize_file_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+            files={
+                "report_file": (
+                    "report.md",
+                    b"a" * (orchestrator.settings.research_manual_import_max_file_bytes + 1),
+                    "text/markdown",
+                )
+            },
+        )
+        prompt_limit_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "a" * 50001,
+                "report_text": "report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+        )
+        orchestrator.settings.research_manual_import_max_report_chars = 10
+        report_limit_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "report_text": "a" * 11,
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+        )
+        bad_options_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "report_text": "report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+                "options_json": "{not-json",
+            },
+        )
+
+    assert both_prompt_response.status_code == 422
+    assert blank_text_and_file_response.status_code == 422
+    assert missing_report_response.status_code == 422
+    assert blank_prompt_response.status_code == 422
+    assert bad_ext_response.status_code == 422
+    assert non_utf_response.status_code == 422
+    assert oversize_file_response.status_code == 422
+    assert prompt_limit_response.status_code == 422
+    assert report_limit_response.status_code == 422
+    assert bad_options_response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_manual_import_idempotency_replay_and_conflict(tmp_path: Path) -> None:
+    fake = V2FakeAzure()
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        first = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "report_text": "report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+                "idempotency_key": "same-key",
+            },
+        )
+        replay = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "report_text": "report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+                "idempotency_key": "same-key",
+            },
+        )
+        conflict = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "report_text": "different report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+                "idempotency_key": "same-key",
+            },
+        )
+
+    assert first.status_code == 202
+    assert replay.status_code == 202
+    assert first.json()["run_id"] == replay.json()["run_id"]
+    assert conflict.status_code == 409
+    assert fake.review_calls == 0
+
+
+def test_manual_import_idempotency_race_cleans_unused_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
+    metadata = {"input_prompt": {"source": "text"}, "report": {"source": "text"}}
+
+    first, dispatch_review = orchestrator.create_manual_import_run(
+        input_prompt="prompt",
+        report="report",
+        options=ResearchRunOptions(),
+        allow_remote_review=False,
+        allow_api_reruns=False,
+        idempotency_key="race-key",
+        metadata=metadata,
+    )
+    assert dispatch_review is False
+    assert (orchestrator.settings.research_artifact_dir / str(first.id)).is_dir()
+
+    def miss_manual_import_idempotency(_idempotency_key: str) -> None:
+        return None
+
+    monkeypatch.setattr(
+        orchestrator.repository,
+        "get_manual_import_idempotency",
+        miss_manual_import_idempotency,
+    )
+
+    replay, dispatch_review = orchestrator.create_manual_import_run(
+        input_prompt="prompt",
+        report="report",
+        options=ResearchRunOptions(),
+        allow_remote_review=False,
+        allow_api_reruns=False,
+        idempotency_key="race-key",
+        metadata=metadata,
+    )
+
+    assert replay.id == first.id
+    assert dispatch_review is False
+    artifact_dirs = sorted(
+        path.name
+        for path in orchestrator.settings.research_artifact_dir.iterdir()
+        if path.is_dir()
+    )
+    assert artifact_dirs == [str(first.id)]
+
+    with pytest.raises(ValueError, match="different request"):
+        orchestrator.create_manual_import_run(
+            input_prompt="prompt",
+            report="different report",
+            options=ResearchRunOptions(),
+            allow_remote_review=False,
+            allow_api_reruns=False,
+            idempotency_key="race-key",
+            metadata=metadata,
+        )
+
+    artifact_dirs = sorted(
+        path.name
+        for path in orchestrator.settings.research_artifact_dir.iterdir()
+        if path.is_dir()
+    )
+    assert artifact_dirs == [str(first.id)]
+
+
+def test_manual_import_artifact_failure_does_not_persist_idempotency(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
+    original_save_json = orchestrator.artifacts.save_json
+
+    def fail_save_json(*_args: Any, **_kwargs: Any) -> tuple[str, str]:
+        raise RuntimeError("artifact write failed")
+
+    orchestrator.artifacts.save_json = fail_save_json  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="artifact write failed"):
+        orchestrator.create_manual_import_run(
+            input_prompt="public prompt",
+            report="public report",
+            options=ResearchRunOptions(),
+            allow_remote_review=False,
+            allow_api_reruns=False,
+            idempotency_key="atomic-key",
+            metadata={"input_prompt": {"source": "text"}, "report": {"source": "text"}},
+        )
+
+    with orchestrator.repository.connect() as connection:
+        run_count = connection.execute("SELECT COUNT(*) AS count FROM research_runs").fetchone()
+        request_count = connection.execute(
+            "SELECT COUNT(*) AS count FROM manual_import_requests"
+        ).fetchone()
+    assert run_count["count"] == 0
+    assert request_count["count"] == 0
+
+    orchestrator.artifacts.save_json = original_save_json  # type: ignore[method-assign]
+    run, dispatch_review = orchestrator.create_manual_import_run(
+        input_prompt="public prompt",
+        report="public report",
+        options=ResearchRunOptions(),
+        allow_remote_review=False,
+        allow_api_reruns=False,
+        idempotency_key="atomic-key",
+        metadata={"input_prompt": {"source": "text"}, "report": {"source": "text"}},
+    )
+
+    assert dispatch_review is False
+    assert run.status == RunStatus.NEEDS_HUMAN_REVIEW
+
+
+@pytest.mark.anyio
+async def test_manual_import_metadata_omits_prompt_and_report_bodies(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+    prompt_body = "unique prompt body should not be in metadata"
+    report_body = "unique report body should not be in metadata"
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": prompt_body,
+                "report_text": report_body,
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+                "idempotency_key": "metadata-key",
+            },
+        )
+
+    assert create_response.status_code == 202
+    run_id = create_response.json()["run_id"]
+    attempt = orchestrator.repository.get_attempts(UUID(run_id))[0]
+    raw_metadata = json.loads(Path(attempt.raw_response_artifact_path or "").read_text())
+    with orchestrator.repository.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT request_metadata_json
+            FROM manual_import_requests
+            WHERE idempotency_key = ?
+            """,
+            ("metadata-key",),
+        ).fetchone()
+    idempotency_metadata = json.loads(row["request_metadata_json"])
+
+    assert prompt_body not in json.dumps(raw_metadata, ensure_ascii=False)
+    assert report_body not in json.dumps(raw_metadata, ensure_ascii=False)
+    assert prompt_body not in json.dumps(idempotency_metadata, ensure_ascii=False)
+    assert report_body not in json.dumps(idempotency_metadata, ensure_ascii=False)
+    assert raw_metadata["prompt_sha256"]
+    assert raw_metadata["report_sha256"]
+    assert idempotency_metadata["prompt_chars"] == len(prompt_body)
+    assert idempotency_metadata["report_chars"] == len(report_body)
+
+
+@pytest.mark.anyio
+async def test_manual_import_poller_resumes_pending_review(tmp_path: Path) -> None:
+    fake = V2FakeAzure()
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    run, dispatch_review = orchestrator.create_manual_import_run(
+        input_prompt="公開情報だけで調べてください。",
+        report="調査レポート本文",
+        options=ResearchRunOptions(),
+        allow_remote_review=True,
+        allow_api_reruns=False,
+        idempotency_key=None,
+        metadata={"input_prompt": {"source": "text"}, "report": {"source": "text"}},
+    )
+    poller = ResearchPoller(orchestrator=orchestrator, interval_seconds=60)
+
+    assert dispatch_review is True
+    assert run.status == RunStatus.REVIEWING
+    assert fake.review_calls == 0
+
+    await poller.tick()
+
+    updated = orchestrator.repository.get_run(run.id)
+    assert fake.review_calls == 1
+    assert updated.status == RunStatus.COMPLETED
+
+
+@pytest.mark.anyio
+async def test_manual_import_review_respects_citation_cap(tmp_path: Path) -> None:
+    class CitationRecordingAzure(V2FakeAzure):
+        def __init__(self) -> None:
+            super().__init__()
+            self.review_citation_counts: list[int] = []
+
+        def review_report(self, **kwargs: Any) -> tuple[ReviewResult, str, dict[str, object]]:
+            self.review_citation_counts.append(len(kwargs.get("citations") or []))
+            return super().review_report(**kwargs)
+
+    fake = CitationRecordingAzure()
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    orchestrator.settings.research_review_max_citations = 2
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+    report = "\n".join(f"[Source {index}](https://example.com/{index})" for index in range(5))
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "公開情報だけで調べてください。",
+                "report_text": report,
+                "allow_remote_review": "true",
+                "allow_api_reruns": "false",
+            },
+        )
+
+    assert create_response.status_code == 202
+    assert fake.review_citation_counts == [2]
+
+
+def test_research_attempt_source_column_is_added_to_legacy_sqlite(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy.sqlite3"
+    repository = ResearchRepository(db_path)
+    with repository.connect() as connection:
+        connection.executescript(
+            """
+            ALTER TABLE research_attempts RENAME TO research_attempts_current;
+            CREATE TABLE research_attempts (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
+                attempt_no INTEGER NOT NULL,
+                response_id TEXT,
+                model TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                output_text TEXT,
+                status TEXT NOT NULL,
+                error TEXT,
+                tool_calls TEXT NOT NULL DEFAULT '[]',
+                citations TEXT NOT NULL DEFAULT '[]',
+                raw_response_artifact_path TEXT,
+                created_at TEXT NOT NULL
+            );
+            DROP TABLE research_attempts_current;
+            """
+        )
+
+    reopened = ResearchRepository(db_path)
+    with reopened.connect() as connection:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(research_attempts)")
+        }
+
+    assert "source" in columns
 
 
 def test_review_missing_research_items_enters_human_review(tmp_path: Path) -> None:
@@ -1316,6 +2371,239 @@ async def test_human_review_api_does_not_require_reviewer_identity(tmp_path: Pat
     assert payload_response.status_code == 200
     assert decisions_response.status_code == 200
     assert resume_response.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_human_review_payload_includes_suggested_rerun_prompt(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_v2_orchestrator(
+        tmp_path,
+        V2FakeAzure(verdict=Verdict.HUMAN_REVIEW),
+    )
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs",
+            json={
+                "user_prompt": "市場調査をしてください",
+            },
+        )
+        run_id = create_response.json()["run_id"]
+        run = orchestrator.collect_deep_research(run_id)
+        orchestrator.repository.update_run(
+            run.id,
+            done_reason="review_route_needs_full_rerun",
+        )
+
+        payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+
+    assert payload_response.status_code == 200
+    payload = payload_response.json()
+    suggested = payload["suggested_rerun"]
+    assert suggested["scope"] == "full_rerun"
+    assert suggested["expected_output_kind"] == "complete_replacement_report"
+    assert suggested["expected_run_no"] == 2
+    assert suggested["query_policy"]["status"] == "allowed"
+    assert "Original User Prompt" in suggested["prompt"]
+    assert "Expected output: complete_replacement_report" in suggested["prompt"]
+    assert "final report body only" in suggested["prompt"]
+    assert "Do not return a full merged report." not in suggested["prompt"]
+    assert "Rerun Policy" in suggested["prompt"]
+    assert suggested["target_item_ids"]
+
+
+@pytest.mark.anyio
+async def test_resume_api_can_request_manual_chatgpt_full_rerun(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure(verdicts=[Verdict.HUMAN_REVIEW, Verdict.PASS])
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs",
+            json={
+                "user_prompt": "市場調査をしてください",
+            },
+        )
+        run_id = create_response.json()["run_id"]
+        run = orchestrator.collect_deep_research(run_id)
+        orchestrator.repository.update_run(
+            run.id,
+            done_reason="review_route_needs_full_rerun",
+        )
+        fake.submitted_prompts.clear()
+
+        payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+        resume_response = await client.post(
+            f"/research-runs/{run_id}/resume",
+            json={
+                "action": HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value,
+                "comment": "ChatGPTで手動実行します。",
+            },
+        )
+        pending_payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+        pending = pending_payload_response.json()["pending_manual_rerun"]
+        upload_response = await client.post(
+            f"/research-runs/{run_id}/manual-rerun-result",
+            data={
+                "rerun_id": pending["rerun_id"],
+                "report_text": "Complete replacement report from ChatGPT.",
+            },
+        )
+        audit_response = await client.get(f"/research-runs/{run_id}/audit")
+
+    assert payload_response.status_code == 200
+    allowed_actions = payload_response.json()["allowed_actions"]
+    assert HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value in allowed_actions
+    assert resume_response.status_code == 200
+    assert resume_response.json()["status"] == "needs_human_review"
+    assert resume_response.json()["done_reason"] == "manual_chatgpt_rerun_pending"
+    assert fake.submitted_prompts == []
+    assert pending["scope"] == "full_rerun"
+    assert pending["expected_output_kind"] == "complete_replacement_report"
+    assert pending["expected_run_no"] == 2
+    assert "ChatGPTで手動実行します。" in pending["prompt"]
+    assert upload_response.status_code == 200
+    assert upload_response.json()["status"] == "completed"
+    assert fake.review_calls == 2
+    assert [attempt["source"] for attempt in audit_response.json()["attempts"]] == [
+        "api",
+        "manual_chatgpt_rerun",
+    ]
+
+
+@pytest.mark.anyio
+async def test_manual_full_rerun_bypasses_api_full_rerun_limit(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_v2_orchestrator(
+        tmp_path,
+        V2FakeAzure(verdict=Verdict.HUMAN_REVIEW),
+    )
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs",
+            json={
+                "user_prompt": "市場調査をしてください",
+                "options": {"max_full_rerun_runs": 1},
+            },
+        )
+        run_id = create_response.json()["run_id"]
+        run = orchestrator.collect_deep_research(run_id)
+        orchestrator.repository.update_run(
+            run.id,
+            full_rerun_runs=1,
+            done_reason="max_full_rerun_runs_reached",
+        )
+
+        payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+        api_full_response = await client.post(
+            f"/research-runs/{run_id}/resume",
+            json={
+                "action": HumanReviewAction.REQUEST_FULL_RERUN.value,
+                "comment": None,
+            },
+        )
+        manual_full_response = await client.post(
+            f"/research-runs/{run_id}/resume",
+            json={
+                "action": HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value,
+                "comment": "ChatGPTで全面作り直し",
+            },
+        )
+
+    payload = payload_response.json()
+    assert HumanReviewAction.REQUEST_FULL_RERUN.value not in payload["allowed_actions"]
+    assert HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value in payload["allowed_actions"]
+    states = {state["action"]: state for state in payload["action_states"]}
+    assert states[HumanReviewAction.REQUEST_FULL_RERUN.value]["blocked_reason"] == (
+        "max_full_rerun_runs_reached"
+    )
+    assert states[HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value]["allowed"] is True
+    assert payload["suggested_rerun"]["scope"] == "full_rerun"
+    assert payload["suggested_rerun"]["expected_output_kind"] == (
+        "complete_replacement_report"
+    )
+    assert api_full_response.status_code == 409
+    assert manual_full_response.status_code == 200
+    assert manual_full_response.json()["done_reason"] == "manual_chatgpt_rerun_pending"
+
+
+@pytest.mark.anyio
+async def test_manual_targeted_rerun_bypasses_api_targeted_rerun_limit(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_v2_orchestrator(
+        tmp_path,
+        V2FakeAzure(verdict=Verdict.HUMAN_REVIEW),
+    )
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs",
+            json={
+                "user_prompt": "市場調査をしてください",
+                "options": {"max_targeted_rerun_runs": 1},
+            },
+        )
+        run_id = create_response.json()["run_id"]
+        run = orchestrator.collect_deep_research(run_id)
+        orchestrator.repository.update_run(
+            run.id,
+            targeted_rerun_runs=1,
+            done_reason="max_targeted_rerun_runs_reached",
+        )
+
+        payload_response = await client.get(f"/research-runs/{run_id}/human-review")
+        api_targeted_response = await client.post(
+            f"/research-runs/{run_id}/resume",
+            json={
+                "action": HumanReviewAction.REQUEST_TARGETED_RERUN.value,
+                "comment": None,
+            },
+        )
+        manual_targeted_response = await client.post(
+            f"/research-runs/{run_id}/resume",
+            json={
+                "action": HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN.value,
+                "comment": "ChatGPTで不足itemだけ補強",
+            },
+        )
+
+    payload = payload_response.json()
+    assert HumanReviewAction.REQUEST_TARGETED_RERUN.value not in payload["allowed_actions"]
+    assert HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN.value in payload["allowed_actions"]
+    states = {state["action"]: state for state in payload["action_states"]}
+    assert states[HumanReviewAction.REQUEST_TARGETED_RERUN.value]["blocked_reason"] == (
+        "max_targeted_rerun_runs_reached"
+    )
+    assert states[HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN.value]["allowed"] is True
+    assert api_targeted_response.status_code == 409
+    assert manual_targeted_response.status_code == 200
+    assert manual_targeted_response.json()["done_reason"] == "manual_chatgpt_rerun_pending"
 
 
 @pytest.mark.anyio

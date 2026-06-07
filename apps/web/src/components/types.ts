@@ -77,6 +77,7 @@ export interface DecisionButtonProps {
   costHint?: string;
   disabled?: boolean;
   guardMessage?: string;
+  disabledReason?: string;
   /** Render as a full-width block (SCR-4) vs inline button. */
   block?: boolean;
   type?: "button" | "submit";

@@ -226,6 +226,12 @@ function checkpointKindLabel(kind: string): string {
   return CHECKPOINT_KIND_LABEL[kind] ?? kind;
 }
 
+function attemptSourceLabel(source?: string | null): string {
+  if (source === "manual_upload") return "手動取り込み";
+  if (source === "manual_chatgpt_rerun") return "ChatGPT手動rerun";
+  return "API";
+}
+
 function shortId(value: string | null | undefined, length = 10): string | null {
   if (!value) return null;
   return value.length > length ? `${value.slice(0, length)}...` : value;
@@ -1760,7 +1766,7 @@ export function RunMonitor({ runId }: RunMonitorProps) {
                 Deep Researchへの指示内容
               </h2>
               <p className="prompt-panel-description">
-                実際にDeep Researchへ送信したブリーフとtargeted rerun指示です。
+                Deep Researchへ送信したブリーフと手動実行用rerun指示です。
               </p>
             </div>
             <button
@@ -1785,7 +1791,14 @@ export function RunMonitor({ runId }: RunMonitorProps) {
               {attempts.map((attempt) => (
                 <article key={`${attempt.run_no}-${attempt.response_id ?? "pending"}`} className="prompt-attempt">
                   <div className="prompt-attempt-header">
-                    <span className="prompt-attempt-title">Deep Research {attempt.run_no}回目</span>
+                    <span className="prompt-attempt-title">
+                      Deep Research {attempt.run_no}回目
+                      {attempt.source === "manual_upload" ? " 手動取り込み" : ""}
+                      {attempt.source === "manual_chatgpt_rerun" ? " ChatGPT手動rerun" : ""}
+                    </span>
+                    <span className="prompt-attempt-status">
+                      {attemptSourceLabel(attempt.source)}
+                    </span>
                     <span className="prompt-attempt-status">{attempt.status}</span>
                   </div>
                   <pre className="prompt-attempt-body">{attempt.prompt}</pre>
