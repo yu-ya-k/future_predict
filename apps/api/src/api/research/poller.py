@@ -67,7 +67,7 @@ class ResearchPoller:
         for run in waiting:
             claimed = self.orchestrator.repository.claim_deep_research_run(
                 run.id,
-                lease_seconds=settings.research_deep_research_timeout_seconds,
+                lease_seconds=settings.research_deep_research_collecting_stale_seconds,
             )
             if claimed is None:
                 continue
@@ -85,7 +85,7 @@ class ResearchPoller:
                 run.id,
                 stale_seconds=settings.research_deep_research_collecting_stale_seconds,
                 timeout_seconds=settings.research_deep_research_timeout_seconds,
-                lease_seconds=settings.research_deep_research_timeout_seconds,
+                lease_seconds=settings.research_deep_research_collecting_stale_seconds,
             )
             if claimed is None:
                 continue

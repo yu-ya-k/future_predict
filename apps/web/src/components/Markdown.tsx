@@ -28,13 +28,13 @@ function renderInline(text: string, onCitationClick?: (n: number) => void): Reac
     if (token.startsWith("[") && token.endsWith("]")) {
       // Citation [n]
       const n = parseInt(token.slice(1, -1), 10);
-      if (!isNaN(n)) {
+      if (!isNaN(n) && onCitationClick) {
         parts.push(
           <button
             key={`cite-${match.index}`}
             className="markdown__citation"
             type="button"
-            onClick={() => onCitationClick?.(n)}
+            onClick={() => onCitationClick(n)}
             aria-label={`引用 ${n} へジャンプ`}
           >
             {token}

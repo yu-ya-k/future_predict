@@ -8,6 +8,7 @@
  */
 
 import { env } from "../env";
+import { getResearchApiKey } from "../researchApiKey";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -43,6 +44,10 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   const { method = "GET", body, signal } = options;
 
   const headers: Record<string, string> = {};
+  const apiKey = getResearchApiKey();
+  if (apiKey) {
+    headers["X-API-Key"] = apiKey;
+  }
   if (body !== undefined) {
     headers["Content-Type"] = "application/json";
   }

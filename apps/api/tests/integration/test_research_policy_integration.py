@@ -21,6 +21,20 @@ from api.research.service import ResearchOrchestrator
 from research_fakes import IntegrationFakeAzure
 
 
+def _answered_assessment(item_id: str) -> ItemAssessment:
+    return ItemAssessment(
+        item_id=item_id,
+        status=ItemStatus.ANSWERED,
+        severity=Severity.MAJOR,
+        failure_mode=FailureMode.NONE,
+        failure_mode_confidence=90,
+        recommended_action=RecommendedAction.NONE,
+        evidence_summary=f"{item_id} is covered.",
+        missing_evidence=[],
+        rationale=f"{item_id} is sufficiently answered.",
+    )
+
+
 @pytest.mark.integration
 @pytest.mark.anyio
 async def test_initial_deep_research_submit_blocks_sensitive_queries(
@@ -97,7 +111,13 @@ async def test_verification_route_blocks_sensitive_queries_and_records_policy_de
     )
     fake = IntegrationFakeAzure(
         verdicts=[Verdict.NEEDS_VERIFICATION],
-        item_assessments=[sensitive_assessment],
+        item_assessments=[
+            sensitive_assessment,
+            *[
+                _answered_assessment(item_id)
+                for item_id in ("RI-002", "RI-003", "RI-004", "RI-005")
+            ],
+        ],
     )
     orchestrator = integration_orchestrator_factory(fake)
 

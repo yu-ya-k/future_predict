@@ -65,33 +65,47 @@ export function HumanReview({ runId }: HumanReviewProps) {
   const [submitError, setSubmitError] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
+  const requestGenerationRef = useRef(0);
 
   async function fetchPayload() {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    const generation = ++requestGenerationRef.current;
+    abortRef.current = controller;
+
     setLoading(true);
     setLoadError(null);
 
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
+    const isCurrentRequest = () =>
+      generation === requestGenerationRef.current &&
+      abortRef.current === controller &&
+      !controller.signal.aborted;
 
     try {
       const data = await getHumanReviewPayload(runId, controller.signal);
+      if (!isCurrentRequest()) return;
       setPayload(data);
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") return;
+      if (!isCurrentRequest()) return;
       if (err instanceof ApiError) {
         setLoadError(err.detail ?? err.message);
       } else if (err instanceof Error) {
         setLoadError(err.message);
       }
     } finally {
-      setLoading(false);
+      if (isCurrentRequest()) {
+        setLoading(false);
+      }
     }
   }
 
   useEffect(() => {
     void fetchPayload();
-    return () => abortRef.current?.abort();
+    return () => {
+      requestGenerationRef.current += 1;
+      abortRef.current?.abort();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId]);
 

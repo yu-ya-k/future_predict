@@ -2600,6 +2600,10 @@ body {
   gap: var(--space-1);
 }
 
+.settings-secret-field {
+  max-width: 520px;
+}
+
 .settings-label {
   font-size: var(--text-caption);
   font-weight: var(--weight-medium);

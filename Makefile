@@ -9,8 +9,8 @@ WEB_DIR := apps/web
 
 install:
 	test -f .env || cp .env.example .env
-	$(UV) --project $(API_DIR) sync --all-groups
-	$(PNPM) install
+	$(UV) --project $(API_DIR) sync --all-groups --locked
+	$(PNPM) install --frozen-lockfile
 
 dev:
 	$(MAKE) -j2 api web

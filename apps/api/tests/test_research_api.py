@@ -7,14 +7,20 @@ from uuid import UUID
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from api.config import get_settings
 from api.main import create_app
 from api.research.azure_responses import ReviewRequestTimeout
 from api.research.dependencies import get_research_orchestrator
 from api.research.schemas import (
     CreateResearchRunRequest,
+    FailureMode,
     HumanReviewAction,
+    ItemAssessment,
+    ItemStatus,
+    RecommendedAction,
     ReviewResult,
     RunStatus,
+    Severity,
     Verdict,
 )
 from research_v2_fakes import V2FakeAzure, make_v2_orchestrator
@@ -84,6 +90,50 @@ def _first_checkpoint(
 
 
 @pytest.mark.anyio
+async def test_research_runs_require_configured_api_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RESEARCH_API_KEY", "test-secret")
+    get_settings.cache_clear()
+
+    try:
+        orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
+        app = create_app()
+        app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as client:
+            missing_response = await client.post(
+                "/research-runs",
+                json={"user_prompt": "市場調査をしてください"},
+            )
+            wrong_response = await client.post(
+                "/research-runs",
+                headers={"X-API-Key": "wrong-secret"},
+                json={"user_prompt": "市場調査をしてください"},
+            )
+            bearer_response = await client.post(
+                "/research-runs",
+                headers={"Authorization": "Bearer test-secret"},
+                json={"user_prompt": "市場調査をしてください"},
+            )
+            assert bearer_response.status_code == 202
+            api_key_response = await client.get(
+                f"/research-runs/{bearer_response.json()['run_id']}",
+                headers={"X-API-Key": "test-secret"},
+            )
+
+        assert missing_response.status_code == 401
+        assert wrong_response.status_code == 401
+        assert api_key_response.status_code == 200
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.anyio
 async def test_research_run_api_flow(tmp_path: Path) -> None:
     orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
     app = create_app()
@@ -130,6 +180,13 @@ async def test_research_run_api_flow(tmp_path: Path) -> None:
         assert reviews_json[0]["review_no"] == 1
         assert reviews_json[0]["verdict"] == "pass"
         assert reviews_json[0]["recommended_route"] == "pass"
+        assert [item["item_id"] for item in reviews_json[0]["item_assessments"]] == [
+            "RI-001",
+            "RI-002",
+            "RI-003",
+            "RI-004",
+            "RI-005",
+        ]
 
         audit_response = await client.get(f"/research-runs/{run_id}/audit")
         assert audit_response.status_code == 200
@@ -141,6 +198,155 @@ async def test_research_run_api_flow(tmp_path: Path) -> None:
             "deep_research",
             "review",
         ]
+
+
+@pytest.mark.anyio
+async def test_research_api_rejects_blank_prompt_fields(tmp_path: Path) -> None:
+    orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+    _xfail_if_checkpoint_fork_routes_missing(app)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        blank_create_response = await client.post(
+            "/research-runs",
+            json={"user_prompt": " \n\t "},
+        )
+
+        run_id = await _create_completed_run(client, orchestrator)
+        checkpoint = _first_checkpoint(
+            await _list_checkpoints(client, run_id),
+            forkable=True,
+        )
+        preview_path = (
+            f"/research-runs/{run_id}/checkpoints/"
+            f"{checkpoint['checkpoint_id']}/fork-preview"
+        )
+        fork_path = (
+            f"/research-runs/{run_id}/checkpoints/{checkpoint['checkpoint_id']}/forks"
+        )
+
+        blank_preview_response = await client.post(
+            preview_path,
+            json={"additional_prompt": " \n\t "},
+        )
+        valid_preview_response = await client.post(
+            preview_path,
+            json={"additional_prompt": "追加調査してください。"},
+        )
+        preview_hash = valid_preview_response.json()["preview_hash"]
+        blank_fork_prompt_response = await client.post(
+            fork_path,
+            json={
+                "additional_prompt": " \n\t ",
+                "idempotency_key": "blank-fork-prompt",
+                "confirmed_preview_hash": preview_hash,
+            },
+        )
+        blank_idempotency_response = await client.post(
+            fork_path,
+            json={
+                "additional_prompt": "追加調査してください。",
+                "idempotency_key": " \n\t ",
+                "confirmed_preview_hash": preview_hash,
+            },
+        )
+
+    assert blank_create_response.status_code == 422
+    assert blank_preview_response.status_code == 422
+    assert valid_preview_response.status_code == 200
+    assert blank_fork_prompt_response.status_code == 422
+    assert blank_idempotency_response.status_code == 422
+
+
+def test_review_missing_research_items_enters_human_review(tmp_path: Path) -> None:
+    orchestrator = make_v2_orchestrator(
+        tmp_path,
+        V2FakeAzure(
+            item_assessments=[
+                ItemAssessment(
+                    item_id="RI-001",
+                    status=ItemStatus.ANSWERED,
+                    severity=Severity.MAJOR,
+                    failure_mode=FailureMode.NONE,
+                    failure_mode_confidence=90,
+                    recommended_action=RecommendedAction.NONE,
+                    evidence_summary="covered",
+                    missing_evidence=[],
+                    rationale="only one item was reviewed",
+                )
+            ],
+        ),
+    )
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="市場調査をしてください")
+    )
+    stopped = orchestrator.collect_deep_research(run.id)
+    history = orchestrator.repository.get_history(run.id)
+    missing_event = next(
+        event for event in history if event["step"] == "review_missing_research_items"
+    )
+
+    assert stopped.status == RunStatus.NEEDS_HUMAN_REVIEW
+    assert stopped.done_reason == "review_missing_research_items"
+    assert stopped.needs_human_review is True
+    assert missing_event["missing_item_ids"] == ["RI-002", "RI-003", "RI-004", "RI-005"]
+    assert missing_event["unknown_item_ids"] == []
+    assert missing_event["assessed_item_ids"] == ["RI-001"]
+
+
+@pytest.mark.anyio
+async def test_submit_persistence_failure_cancels_remote_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = V2FakeAzure()
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    original_save_json = orchestrator.artifacts.save_json
+
+    def fail_submit_raw_response(
+        run_id: UUID,
+        relative_path: str,
+        payload: object,
+    ) -> tuple[str, str]:
+        if relative_path == "raw-responses/deep_research_submit_001.json":
+            raise OSError("disk full")
+        return original_save_json(run_id, relative_path, payload)
+
+    monkeypatch.setattr(orchestrator.artifacts, "save_json", fail_submit_raw_response)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs",
+            json={"user_prompt": "市場調査をしてください"},
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        status_response = await client.get(f"/research-runs/{run_id}")
+        audit_response = await client.get(f"/research-runs/{run_id}/audit")
+
+    assert fake.cancelled == ["resp_deep_1"]
+    status_json = status_response.json()
+    assert status_json["status"] == "needs_human_review"
+    assert status_json["done_reason"] == "deep_research_submitted_but_persistence_failed"
+
+    audit_json = audit_response.json()
+    assert [attempt["status"] for attempt in audit_json["attempts"]] == [
+        "submitted_but_persistence_failed"
+    ]
+    assert audit_json["attempts"][0]["response_id"] == "resp_deep_1"
+    history_steps = [event["step"] for event in audit_json["history"]]
+    assert "deep_research_submit_persistence_remote_cancel_succeeded" in history_steps
+    assert "deep_research_submit_persistence_failed" in history_steps
 
 
 @pytest.mark.anyio

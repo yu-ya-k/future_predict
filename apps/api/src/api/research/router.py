@@ -5,7 +5,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from api.research.dependencies import get_research_orchestrator
+from api.research.dependencies import get_research_orchestrator, require_research_api_key
 from api.research.schemas import (
     AuditResponse,
     CancelResponse,
@@ -40,7 +40,11 @@ from api.research.schemas import (
 )
 from api.research.service import ResearchOrchestrator
 
-router = APIRouter(prefix="/research-runs", tags=["research-runs"])
+router = APIRouter(
+    prefix="/research-runs",
+    tags=["research-runs"],
+    dependencies=[Depends(require_research_api_key)],
+)
 OrchestratorDependency = Annotated[ResearchOrchestrator, Depends(get_research_orchestrator)]
 
 

@@ -1,12 +1,35 @@
 from __future__ import annotations
 
+import hashlib
+import os
+from pathlib import Path
+from typing import cast
+from uuid import UUID, uuid4
+
+import pytest
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
+from api.config import Settings
+from api.research.artifacts import ArtifactStore
+from api.research.azure_responses import AzureResponsesClient
 from api.research.graph import build_phase_3_graph, build_phase_4_graph
 from api.research.nodes import build_objective_contract
+from api.research.repository import ResearchRepository
 from api.research.routing import route_after_review
-from api.research.schemas import HumanReviewAction, Verdict
+from api.research.schemas import (
+    REVIEW_RESULT_SCHEMA,
+    HumanReviewAction,
+    ResearchRunOptions,
+    RunStatus,
+    Verdict,
+)
+from api.research.service import ResearchOrchestrator
+
+
+class _FailingDeleteArtifactStore(ArtifactStore):
+    def delete_run(self, run_id: UUID) -> None:
+        raise OSError("artifact cleanup failed")
 
 
 def test_objective_contract_builder_creates_frozen_items() -> None:
@@ -25,6 +48,115 @@ def test_objective_contract_builder_creates_frozen_items() -> None:
         "RI-005",
     ]
     assert "Research Items" in prompt
+
+
+def test_review_result_schema_required_fields_match_properties() -> None:
+    required = set(REVIEW_RESULT_SCHEMA["required"])
+    properties = set(REVIEW_RESULT_SCHEMA["properties"])
+
+    assert required == properties
+
+
+@pytest.mark.parametrize("writer", ["save_json", "save_text"])
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "../escape.txt",
+        "reports/../../escape.txt",
+        "/tmp/escape.txt",
+        "C:\\tmp\\escape.txt",
+        "reports\\..\\escape.txt",
+    ],
+)
+def test_artifact_store_rejects_unsafe_relative_paths(
+    tmp_path: Path,
+    writer: str,
+    relative_path: str,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    run_id = uuid4()
+
+    with pytest.raises(ValueError):
+        if writer == "save_json":
+            store.save_json(run_id, relative_path, {"ok": True})
+        else:
+            store.save_text(run_id, relative_path, "ok")
+
+    assert not (tmp_path / "escape.txt").exists()
+
+
+def test_artifact_store_rejects_symlink_escape(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    run_id = uuid4()
+    run_root = tmp_path / "artifacts" / str(run_id)
+    outside = tmp_path / "outside"
+    run_root.mkdir(parents=True)
+    outside.mkdir()
+    try:
+        (run_root / "link").symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation is unavailable: {error}")
+
+    with pytest.raises(ValueError):
+        store.save_text(run_id, "link/escape.txt", "escaped")
+
+    assert not (outside / "escape.txt").exists()
+
+
+def test_artifact_store_save_text_uses_same_directory_atomic_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    run_id = uuid4()
+    replacements: list[tuple[Path, Path]] = []
+    real_replace = os.replace
+
+    def record_replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        replacements.append((Path(src), Path(dst)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr("api.research.artifacts.os.replace", record_replace)
+
+    path, digest = store.save_text(run_id, "reports/final.md", "hello")
+
+    artifact_path = Path(path)
+    assert artifact_path.read_text() == "hello"
+    assert digest == hashlib.sha256(b"hello").hexdigest()
+    assert len(replacements) == 1
+    temp_path, replaced_path = replacements[0]
+    assert replaced_path == artifact_path
+    assert temp_path.parent == artifact_path.parent
+    assert not temp_path.exists()
+
+
+def test_delete_run_keeps_database_record_when_artifact_cleanup_fails(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        research_db_path=tmp_path / "research.sqlite3",
+        research_artifact_dir=tmp_path / "artifacts",
+        research_poller_enabled=False,
+    )
+    repository = ResearchRepository(settings.research_db_path)
+    artifacts = _FailingDeleteArtifactStore(settings.research_artifact_dir)
+    orchestrator = ResearchOrchestrator(
+        settings=settings,
+        repository=repository,
+        artifacts=artifacts,
+        azure=cast(AzureResponsesClient, object()),
+    )
+    run = repository.create_run(
+        user_prompt="Research public information.",
+        options=ResearchRunOptions(),
+        settings=settings,
+    )
+    repository.update_run(run.id, status=RunStatus.COMPLETED)
+
+    with pytest.raises(RuntimeError, match="Artifact cleanup failed"):
+        orchestrator.delete_run(run.id)
+
+    assert repository.get_run(run.id).id == run.id
 
 
 def test_route_after_review_prefers_targeted_rerun_for_missing_sources() -> None:

@@ -19,6 +19,50 @@ from api.research.schemas import (
 from api.research.service import ResearchOrchestrator
 
 
+def _default_recommended_action(verdict: Verdict) -> RecommendedAction:
+    if verdict == Verdict.PASS:
+        return RecommendedAction.NONE
+    if verdict == Verdict.NEEDS_VERIFICATION:
+        return RecommendedAction.VERIFY
+    if verdict == Verdict.NEEDS_FULL_RERUN:
+        return RecommendedAction.FULL_RERUN
+    if verdict == Verdict.NEEDS_LLM_PATCH:
+        return RecommendedAction.LLM_PATCH
+    return RecommendedAction.TARGETED_RERUN
+
+
+def _default_item_assessments(
+    *,
+    research_items: list[dict[str, Any]] | None,
+    verdict: Verdict,
+) -> list[ItemAssessment]:
+    item_ids = [
+        str(item["item_id"])
+        for item in research_items or []
+        if isinstance(item.get("item_id"), str) and item["item_id"]
+    ]
+    if not item_ids:
+        item_ids = ["RI-001"]
+    return [
+        ItemAssessment(
+            item_id=item_id,
+            status=ItemStatus.ANSWERED if verdict == Verdict.PASS else ItemStatus.PARTIAL,
+            severity=Severity.MAJOR,
+            failure_mode=(
+                FailureMode.NONE
+                if verdict == Verdict.PASS
+                else FailureMode.NEEDS_DIFFERENT_SOURCES
+            ),
+            failure_mode_confidence=90,
+            recommended_action=_default_recommended_action(verdict),
+            evidence_summary="covered" if verdict == Verdict.PASS else None,
+            missing_evidence=[] if verdict == Verdict.PASS else ["official source"],
+            rationale="v2 fake review",
+        )
+        for item_id in item_ids
+    ]
+
+
 class V2FakeAzure:
     deep_research_deployment = "o3-deep-research"
     reviewer_deployment = "gpt-5.5"
@@ -105,39 +149,10 @@ class V2FakeAzure:
         item_assessments = (
             self.item_assessments
             if self.item_assessments is not None
-            else [
-                ItemAssessment(
-                    item_id="RI-001",
-                    status=ItemStatus.ANSWERED if verdict == Verdict.PASS else ItemStatus.PARTIAL,
-                    severity=Severity.MAJOR,
-                    failure_mode=(
-                        FailureMode.NONE
-                        if verdict == Verdict.PASS
-                        else FailureMode.NEEDS_DIFFERENT_SOURCES
-                    ),
-                    failure_mode_confidence=90,
-                    recommended_action=(
-                        RecommendedAction.NONE
-                        if verdict == Verdict.PASS
-                        else (
-                            RecommendedAction.VERIFY
-                            if verdict == Verdict.NEEDS_VERIFICATION
-                            else (
-                                RecommendedAction.FULL_RERUN
-                                if verdict == Verdict.NEEDS_FULL_RERUN
-                                else (
-                                    RecommendedAction.LLM_PATCH
-                                    if verdict == Verdict.NEEDS_LLM_PATCH
-                                    else RecommendedAction.TARGETED_RERUN
-                                )
-                            )
-                        )
-                    ),
-                    evidence_summary="covered" if verdict == Verdict.PASS else None,
-                    missing_evidence=[] if verdict == Verdict.PASS else ["official source"],
-                    rationale="v2 fake review",
-                )
-            ]
+            else _default_item_assessments(
+                research_items=kwargs.get("research_items"),
+                verdict=verdict,
+            )
         )
         response_id = f"resp_review_{self.review_calls}"
         return (

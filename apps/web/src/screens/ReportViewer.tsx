@@ -164,10 +164,14 @@ export function ReportViewer({
       ? selectedAttempt.citations
       : (Array.isArray(citations) ? citations : []);
   const sourceTypes = uniqueSourceTypes(currentCitations);
-  const filteredCitations =
+  const citationItems = currentCitations.map((citation, i) => ({
+    citation,
+    index: i + 1,
+  }));
+  const filteredCitationItems =
     activeSourceType === SOURCE_TYPE_ALL
-      ? currentCitations
-      : currentCitations.filter((c) => c.source_type === activeSourceType);
+      ? citationItems
+      : citationItems.filter(({ citation }) => citation.source_type === activeSourceType);
 
   const exportText = displayText;
 
@@ -179,8 +183,9 @@ export function ReportViewer({
 
   function handleCitationClick(index: number) {
     if (!sourcePanelRef.current) return;
-    const items = sourcePanelRef.current.querySelectorAll("[data-citation-index]");
-    const target = items[index - 1];
+    const target = sourcePanelRef.current.querySelector(
+      `[data-citation-index="${index}"]`,
+    );
     if (target) {
       target.scrollIntoView({ behavior: "smooth", block: "start" });
     }
@@ -311,7 +316,7 @@ export function ReportViewer({
           />
           <SourcesAside
             title={displayMode === "final" ? "最終レポートの引用ソース" : "選択版の引用ソース"}
-            citations={filteredCitations}
+            citations={filteredCitationItems}
             allCitations={currentCitations}
             sourceTypes={sourceTypes}
             activeSourceType={activeSourceType}
@@ -327,7 +332,7 @@ export function ReportViewer({
 
 interface SourcesAsideProps {
   title: string;
-  citations: Citation[];
+  citations: Array<{ citation: Citation; index: number }>;
   allCitations: Citation[];
   sourceTypes: string[];
   activeSourceType: string;
@@ -386,9 +391,9 @@ function SourcesAside({
             description="このフィルターに一致するソースはありません。"
           />
         ) : (
-          citations.map((citation, i) => (
-            <div key={i} data-citation-index={i + 1}>
-              <SourceListItem citation={citation} index={i + 1} />
+          citations.map(({ citation, index }) => (
+            <div key={index} data-citation-index={index}>
+              <SourceListItem citation={citation} index={index} />
             </div>
           ))
         )}
