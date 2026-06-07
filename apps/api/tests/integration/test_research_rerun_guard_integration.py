@@ -52,6 +52,20 @@ def _history_steps(audit: dict[str, Any]) -> list[str]:
     ]
 
 
+def _answered_assessment(item_id: str) -> ItemAssessment:
+    return ItemAssessment(
+        item_id=item_id,
+        status=ItemStatus.ANSWERED,
+        severity=Severity.MAJOR,
+        failure_mode=FailureMode.NONE,
+        failure_mode_confidence=90,
+        recommended_action=RecommendedAction.NONE,
+        evidence_summary=f"{item_id} is covered.",
+        missing_evidence=[],
+        rationale=f"{item_id} is sufficiently answered.",
+    )
+
+
 @pytest.mark.integration
 @pytest.mark.anyio
 async def test_targeted_rerun_rejects_full_merged_report_and_preserves_report(
@@ -207,6 +221,18 @@ async def test_finalize_with_limitation_routes_to_human_review_when_required_ite
     fake = IntegrationFakeAzure(
         verdicts=[Verdict.FINALIZE_WITH_LIMITATION],
         item_assessments=[
+            ItemAssessment(
+                item_id="RI-001",
+                status=ItemStatus.PARTIAL,
+                severity=Severity.BLOCKER,
+                failure_mode=FailureMode.NEEDS_DEEPER_SEARCH,
+                failure_mode_confidence=90,
+                recommended_action=RecommendedAction.FINALIZE_WITH_LIMITATION,
+                evidence_summary=None,
+                missing_evidence=["required blocker evidence"],
+                rationale="The blocker criterion is still unresolved.",
+            ),
+            *[_answered_assessment(item_id) for item_id in ("RI-002", "RI-003", "RI-004")],
             ItemAssessment(
                 item_id="RI-005",
                 status=ItemStatus.UNVERIFIABLE,

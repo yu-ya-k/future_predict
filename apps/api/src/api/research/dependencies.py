@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from secrets import compare_digest
+from typing import Annotated
+
+from fastapi import Header, HTTPException, status
 
 from api.config import get_settings
 from api.research.artifacts import ArtifactStore
 from api.research.azure_responses import AzureResponsesClient
 from api.research.repository import ResearchRepository
 from api.research.service import ResearchOrchestrator
+
+ApiKeyHeader = Annotated[str | None, Header(alias="X-API-Key")]
+AuthorizationHeader = Annotated[str | None, Header()]
 
 
 @lru_cache
@@ -34,6 +41,47 @@ def get_research_orchestrator() -> ResearchOrchestrator:
         artifacts=get_artifact_store(),
         azure=get_azure_responses_client(),
     )
+
+
+def require_research_api_key(
+    x_api_key: ApiKeyHeader = None,
+    authorization: AuthorizationHeader = None,
+) -> None:
+    expected_key = get_settings().research_api_key.strip()
+    if not expected_key:
+        return
+    expected_key_bytes = expected_key.encode("utf-8")
+
+    candidates: list[str] = []
+    if x_api_key:
+        candidates.append(x_api_key)
+
+    bearer_token = _bearer_token(authorization)
+    if bearer_token:
+        candidates.append(bearer_token)
+
+    if any(
+        compare_digest(candidate.encode("utf-8"), expected_key_bytes)
+        for candidate in candidates
+    ):
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or missing research API key.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _bearer_token(authorization: str | None) -> str | None:
+    if authorization is None:
+        return None
+
+    scheme, separator, token = authorization.partition(" ")
+    if separator == "" or scheme.lower() != "bearer":
+        return None
+    token = token.strip()
+    return token or None
 
 
 def clear_research_dependency_caches() -> None:

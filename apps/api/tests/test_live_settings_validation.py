@@ -1,9 +1,33 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
+from pydantic import ValidationError
 
 from api.config import Settings
 from live_helpers import require_live_reviewer_settings
+
+
+@pytest.mark.parametrize(
+    "settings_kwargs",
+    [
+        {"research_poller_interval_seconds": 0},
+        {"research_deep_research_timeout_seconds": 0},
+        {"research_deep_research_collecting_stale_seconds": 0},
+        {"research_review_timeout_seconds": 0},
+        {"research_review_max_report_chars": 0},
+        {"research_review_max_citations": -1},
+        {"default_max_targeted_rerun_runs": -1},
+        {"default_max_total_iterations": 0},
+        {"default_max_total_tool_calls": 0},
+    ],
+)
+def test_settings_reject_invalid_runtime_bounds(
+    settings_kwargs: dict[str, Any],
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(research_poller_enabled=False, **settings_kwargs)
 
 
 def test_live_reviewer_settings_skip_on_partial_gpt_client_settings() -> None:

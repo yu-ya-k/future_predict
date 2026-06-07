@@ -5,7 +5,13 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+def _strip_string(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.strip()
+    return value
 
 
 class RunStatus(StrEnum):
@@ -60,6 +66,8 @@ class CreateResearchRunRequest(BaseModel):
 
     user_prompt: str = Field(min_length=1, max_length=50000)
     options: ResearchRunOptions = Field(default_factory=ResearchRunOptions)
+
+    _strip_user_prompt = field_validator("user_prompt", mode="before")(_strip_string)
 
 
 class CreateResearchRunResponse(BaseModel):
@@ -475,6 +483,10 @@ class ForkPreviewRequest(BaseModel):
 
     additional_prompt: str = Field(min_length=1, max_length=20000)
 
+    _strip_additional_prompt = field_validator("additional_prompt", mode="before")(
+        _strip_string
+    )
+
 
 class ForkPreviewResponse(BaseModel):
     run_id: UUID
@@ -494,6 +506,13 @@ class ForkSubmitRequest(BaseModel):
     additional_prompt: str = Field(min_length=1, max_length=20000)
     idempotency_key: str = Field(min_length=1, max_length=200)
     confirmed_preview_hash: str = Field(min_length=1, max_length=128)
+
+    _strip_additional_prompt = field_validator("additional_prompt", mode="before")(
+        _strip_string
+    )
+    _strip_idempotency_key = field_validator("idempotency_key", mode="before")(
+        _strip_string
+    )
 
 
 class ForkSubmitResponse(BaseModel):
@@ -633,6 +652,7 @@ REVIEW_RESULT_SCHEMA: dict[str, Any] = {
         "score",
         "rationale",
         "item_assessments",
+        "gaps",
         "factuality_concerns",
         "source_quality_concerns",
         "freshness_concerns",

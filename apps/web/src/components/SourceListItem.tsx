@@ -1,8 +1,10 @@
 import type { SourceListItemProps } from "./types";
+import { toSafeHttpUrl } from "../utils/safeUrl";
 
 export function SourceListItem({ citation, index }: SourceListItemProps) {
   const title = citation.title ?? citation.url ?? "(no title)";
   const url = citation.url;
+  const safeUrl = toSafeHttpUrl(url);
   const sourceType = citation.source_type;
   const retrievedAt = citation.retrieved_at;
 
@@ -33,10 +35,10 @@ export function SourceListItem({ citation, index }: SourceListItemProps) {
             <span className="source-list-item__type-badge">{sourceType}</span>
           )}
         </div>
-        {url && (
+        {url && safeUrl && (
           <a
             className="source-list-item__url"
-            href={url}
+            href={safeUrl}
             target="_blank"
             rel="noopener noreferrer"
             aria-label={`${title} を開く`}
@@ -44,6 +46,7 @@ export function SourceListItem({ citation, index }: SourceListItemProps) {
             {url}
           </a>
         )}
+        {url && !safeUrl && <span className="source-list-item__url">{url}</span>}
         {dateStr && (
           <span className="source-list-item__date">{dateStr} 取得</span>
         )}

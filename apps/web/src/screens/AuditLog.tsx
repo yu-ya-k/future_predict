@@ -23,6 +23,7 @@ import { getAudit } from "../api/research";
 import { usePolling } from "../hooks/usePolling";
 import { navigate, routes } from "../router";
 import type { AuditResponse } from "../types";
+import { toSafeHttpUrl } from "../utils/safeUrl";
 
 type TabId =
   | "attempts"
@@ -310,22 +311,30 @@ function CitationsTab({ data }: { data: AuditResponse }) {
           </tr>
         </thead>
         <tbody>
-          {data.citations.map((c, i) => (
-            <tr key={i}>
-              <td className="mono">{i + 1}</td>
-              <td>{c.title ?? "—"}</td>
-              <td>
-                {c.url ? (
-                  <a href={c.url} target="_blank" rel="noopener noreferrer" className="audit-link">
-                    {c.url}
-                  </a>
-                ) : (
-                  "—"
-                )}
-              </td>
-              <td>{c.source_type ?? "—"}</td>
-            </tr>
-          ))}
+          {data.citations.map((c, i) => {
+            const safeUrl = toSafeHttpUrl(c.url);
+            return (
+              <tr key={i}>
+                <td className="mono">{i + 1}</td>
+                <td>{c.title ?? "—"}</td>
+                <td>
+                  {c.url && safeUrl ? (
+                    <a
+                      href={safeUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="audit-link"
+                    >
+                      {c.url}
+                    </a>
+                  ) : (
+                    c.url ?? "—"
+                  )}
+                </td>
+                <td>{c.source_type ?? "—"}</td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>

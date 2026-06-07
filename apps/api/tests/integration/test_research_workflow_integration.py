@@ -334,6 +334,39 @@ async def test_poller_recovers_stale_collecting_deep_research_run(
 
 @pytest.mark.integration
 @pytest.mark.anyio
+async def test_poller_recovers_stale_collecting_run_with_long_claim_lease(
+    integration_orchestrator_factory: Callable[[IntegrationFakeAzure], ResearchOrchestrator],
+) -> None:
+    fake = IntegrationFakeAzure()
+    orchestrator = integration_orchestrator_factory(fake)
+    orchestrator.settings.research_deep_research_collecting_stale_seconds = 0
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(
+            user_prompt="公開情報に基づく市場調査をしてください。",
+        )
+    )
+    claimed = orchestrator.repository.claim_deep_research_run(
+        run.id,
+        lease_seconds=orchestrator.settings.research_deep_research_timeout_seconds,
+    )
+
+    assert claimed is not None
+    assert claimed.status == RunStatus.COLLECTING
+    assert claimed.review_claim_expires_at is not None
+    assert claimed.review_claim_expires_at > claimed.updated_at
+
+    poller = ResearchPoller(orchestrator=orchestrator, interval_seconds=0.01)
+    await poller.tick()
+
+    completed = orchestrator.repository.get_run(run.id)
+
+    assert completed.status == RunStatus.COMPLETED
+    assert fake.retrieve_calls == [claimed.pending_deep_research_response_id]
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
 async def test_poller_claims_stale_collecting_run_before_recovery(
     integration_orchestrator_factory: Callable[[IntegrationFakeAzure], ResearchOrchestrator],
 ) -> None:

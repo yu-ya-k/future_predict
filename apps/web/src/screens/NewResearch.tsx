@@ -20,7 +20,10 @@ import { requestNotificationPermission } from "../notifications";
 import {
   FACTORY_RESEARCH_DEFAULTS,
   loadResearchDefaults,
+  normalizeResearchDefaultValue,
+  normalizeResearchDefaults,
   RESEARCH_DEFAULTS_STORAGE_KEY,
+  type ResearchDefaults,
 } from "../researchDefaults";
 import { navigate, routes } from "../router";
 import { trackRun } from "../runStore";
@@ -77,6 +80,30 @@ export function NewResearch() {
   const promptTrimmed = prompt.trim();
   const canSubmit = promptTrimmed.length > 0 && promptTrimmed.length <= MAX_PROMPT_CHARS && !submitting;
 
+  function handleOptionChange(key: keyof ResearchDefaults, value: string) {
+    const normalized = normalizeResearchDefaultValue(key, value);
+    switch (key) {
+      case "max_targeted_rerun_runs":
+        setMaxTargetedRerun(normalized);
+        break;
+      case "max_full_rerun_runs":
+        setMaxFullRerun(normalized);
+        break;
+      case "max_llm_patch_runs":
+        setMaxLlmPatch(normalized);
+        break;
+      case "max_verification_runs":
+        setMaxVerification(normalized);
+        break;
+      case "max_total_iterations":
+        setMaxIterations(normalized);
+        break;
+      case "max_total_tool_calls":
+        setMaxToolCalls(normalized);
+        break;
+    }
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!canSubmit) return;
@@ -85,17 +112,18 @@ export function NewResearch() {
 
     try {
       await requestNotificationPermission();
+      const options = normalizeResearchDefaults({
+        max_targeted_rerun_runs: maxTargetedRerun,
+        max_full_rerun_runs: maxFullRerun,
+        max_llm_patch_runs: maxLlmPatch,
+        max_verification_runs: maxVerification,
+        max_total_iterations: maxIterations,
+        max_total_tool_calls: maxToolCalls,
+      });
 
       const response = await createRun({
         user_prompt: promptTrimmed,
-        options: {
-          max_targeted_rerun_runs: maxTargetedRerun,
-          max_full_rerun_runs: maxFullRerun,
-          max_llm_patch_runs: maxLlmPatch,
-          max_verification_runs: maxVerification,
-          max_total_iterations: maxIterations,
-          max_total_tool_calls: maxToolCalls,
-        },
+        options,
       });
 
       // Derive title from first line of prompt
@@ -104,7 +132,7 @@ export function NewResearch() {
       trackRun({
         run_id: response.run_id,
         title,
-        max_total_iterations: maxIterations,
+        max_total_iterations: options.max_total_iterations,
         created_at: response.created_at,
         last_status: response.status,
       });
@@ -194,7 +222,9 @@ export function NewResearch() {
                     value={maxTargetedRerun}
                     min={OPTION_BOUNDS.max_targeted_rerun_runs.min}
                     max={OPTION_BOUNDS.max_targeted_rerun_runs.max}
-                    onChange={(e) => setMaxTargetedRerun(Number(e.target.value))}
+                    onChange={(e) =>
+                      handleOptionChange("max_targeted_rerun_runs", e.target.value)
+                    }
                     disabled={submitting}
                   />
                   <span className="option-range">
@@ -213,7 +243,9 @@ export function NewResearch() {
                     value={maxFullRerun}
                     min={OPTION_BOUNDS.max_full_rerun_runs.min}
                     max={OPTION_BOUNDS.max_full_rerun_runs.max}
-                    onChange={(e) => setMaxFullRerun(Number(e.target.value))}
+                    onChange={(e) =>
+                      handleOptionChange("max_full_rerun_runs", e.target.value)
+                    }
                     disabled={submitting}
                   />
                   <span className="option-range">
@@ -232,7 +264,9 @@ export function NewResearch() {
                     value={maxLlmPatch}
                     min={OPTION_BOUNDS.max_llm_patch_runs.min}
                     max={OPTION_BOUNDS.max_llm_patch_runs.max}
-                    onChange={(e) => setMaxLlmPatch(Number(e.target.value))}
+                    onChange={(e) =>
+                      handleOptionChange("max_llm_patch_runs", e.target.value)
+                    }
                     disabled={submitting}
                   />
                   <span className="option-range">
@@ -251,7 +285,9 @@ export function NewResearch() {
                     value={maxVerification}
                     min={OPTION_BOUNDS.max_verification_runs.min}
                     max={OPTION_BOUNDS.max_verification_runs.max}
-                    onChange={(e) => setMaxVerification(Number(e.target.value))}
+                    onChange={(e) =>
+                      handleOptionChange("max_verification_runs", e.target.value)
+                    }
                     disabled={submitting}
                   />
                   <span className="option-range">
@@ -270,7 +306,9 @@ export function NewResearch() {
                     value={maxIterations}
                     min={OPTION_BOUNDS.max_total_iterations.min}
                     max={OPTION_BOUNDS.max_total_iterations.max}
-                    onChange={(e) => setMaxIterations(Number(e.target.value))}
+                    onChange={(e) =>
+                      handleOptionChange("max_total_iterations", e.target.value)
+                    }
                     disabled={submitting}
                   />
                   <span className="option-range">
@@ -290,7 +328,9 @@ export function NewResearch() {
                     min={OPTION_BOUNDS.max_total_tool_calls.min}
                     max={OPTION_BOUNDS.max_total_tool_calls.max}
                     step={10}
-                    onChange={(e) => setMaxToolCalls(Number(e.target.value))}
+                    onChange={(e) =>
+                      handleOptionChange("max_total_tool_calls", e.target.value)
+                    }
                     disabled={submitting}
                   />
                   <span className="option-range">

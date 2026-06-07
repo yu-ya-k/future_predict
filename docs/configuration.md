@@ -11,6 +11,17 @@ Do not commit secrets. Values prefixed with `VITE_` are exposed to browser code.
 | --- | --- | --- |
 | `APP_ENV` | `development` | API runtime environment label returned by `/health`. |
 | `VITE_API_BASE_URL` | `http://localhost:8000` | Browser-visible API base URL for the web app. |
+| `CORS_ORIGINS` | Local Vite origins on ports `5173`-`5175` | JSON array of browser origins allowed by the API CORS middleware. |
+| `RESEARCH_API_KEY` | empty | Optional API key for `/research-runs` endpoints. Empty disables API key authentication for local development. |
+
+When `RESEARCH_API_KEY` is set, every `/research-runs` request must include
+either `X-API-Key: <key>` or `Authorization: Bearer <key>`. `/health` remains
+unauthenticated.
+
+The web app does not read this key from a `VITE_*` environment variable because
+those values are exposed in browser bundles. For browser access, open Settings
+and save the Research API key there; the app stores it in that browser's local
+storage and sends it as `X-API-Key` on API requests.
 
 ## Research Storage
 
@@ -37,6 +48,10 @@ The repository and artifact store create parent directories as needed.
 When the poller is disabled, submitted runs can remain `waiting_deep_research`
 until code explicitly calls `collect_deep_research`.
 
+Poller intervals, timeout values, and stale-claim windows must be greater than
+zero. Report character limits must be at least `1`; citation limits can be `0`
+or higher.
+
 ## Default Guard Limits
 
 These defaults are copied into each run unless the create request supplies an
@@ -50,6 +65,9 @@ override in `options`.
 | `DEFAULT_MAX_VERIFICATION_RUNS` | `3` | Maximum targeted verification attempts. |
 | `DEFAULT_MAX_TOTAL_ITERATIONS` | `5` | Maximum total review loop iterations. |
 | `DEFAULT_MAX_TOTAL_TOOL_CALLS` | `120` | Tool-call ceiling before human review or resume block. |
+
+Rerun, patch, and verification defaults can be `0` to disable that route.
+Total iterations and total tool calls must be at least `1`.
 
 ## Cost Estimation
 

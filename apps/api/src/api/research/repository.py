@@ -571,6 +571,7 @@ class ResearchRepository:
         stale_seconds: int,
         timeout_seconds: int,
     ) -> list[ResearchRunRecord]:
+        effective_lease_seconds = max(stale_seconds, 1)
         cutoff = utc_now() - timedelta(seconds=stale_seconds)
         timeout_cutoff = utc_now() - timedelta(seconds=timeout_seconds)
         with self.connect() as connection:
@@ -588,6 +589,8 @@ class ResearchRepository:
                       r.review_claim_token IS NULL
                       OR r.review_claim_expires_at IS NULL
                       OR r.review_claim_expires_at <= ?
+                      OR CAST(strftime('%s', r.review_claim_expires_at) AS INTEGER) >
+                         CAST(strftime('%s', r.updated_at) AS INTEGER) + ?
                   )
                   AND a.created_at > ?
                   AND a.created_at = (
@@ -603,6 +606,7 @@ class ResearchRepository:
                     RunStatus.COLLECTING.value,
                     cutoff.isoformat(),
                     utc_now().isoformat(),
+                    effective_lease_seconds,
                     timeout_cutoff.isoformat(),
                 ),
             ).fetchall()
@@ -655,6 +659,7 @@ class ResearchRepository:
         lease_seconds: int,
     ) -> ResearchRunRecord | None:
         now = utc_now()
+        effective_lease_seconds = max(stale_seconds, 1)
         cutoff = now - timedelta(seconds=stale_seconds)
         timeout_cutoff = now - timedelta(seconds=timeout_seconds)
         expires_at = now + timedelta(seconds=max(lease_seconds, 1))
@@ -675,6 +680,8 @@ class ResearchRepository:
                       review_claim_token IS NULL
                       OR review_claim_expires_at IS NULL
                       OR review_claim_expires_at <= ?
+                      OR CAST(strftime('%s', review_claim_expires_at) AS INTEGER) >
+                         CAST(strftime('%s', updated_at) AS INTEGER) + ?
                   )
                   AND EXISTS (
                       SELECT 1
@@ -699,6 +706,7 @@ class ResearchRepository:
                     RunStatus.COLLECTING.value,
                     cutoff.isoformat(),
                     now.isoformat(),
+                    effective_lease_seconds,
                     timeout_cutoff.isoformat(),
                 ),
             )

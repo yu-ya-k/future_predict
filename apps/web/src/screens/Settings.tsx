@@ -12,28 +12,42 @@ import { BackLink } from "../components";
 import {
   FACTORY_RESEARCH_DEFAULTS,
   loadResearchDefaults,
+  normalizeResearchDefaultValue,
+  normalizeResearchDefaults,
   saveResearchDefaults,
   type ResearchDefaults,
 } from "../researchDefaults";
+import {
+  clearResearchApiKey,
+  getResearchApiKey,
+  saveResearchApiKey,
+} from "../researchApiKey";
 import { routes } from "../router";
 import { OPTION_BOUNDS } from "../types";
 
 export function Settings() {
   const [defaults, setDefaults] = useState<ResearchDefaults>(() => loadResearchDefaults());
   const [saved, setSaved] = useState(false);
+  const [apiKeyDraft, setApiKeyDraft] = useState(() => getResearchApiKey() ?? "");
+  const [apiKeySaved, setApiKeySaved] = useState(false);
 
   // Persist whenever defaults change (auto-save on blur/change)
   useEffect(() => {
     saveResearchDefaults(defaults);
   }, [defaults]);
 
-  function handleChange(key: keyof ResearchDefaults, value: number) {
-    setDefaults((prev) => ({ ...prev, [key]: value }));
+  function handleChange(key: keyof ResearchDefaults, value: string) {
+    setDefaults((prev) => ({
+      ...prev,
+      [key]: normalizeResearchDefaultValue(key, value),
+    }));
     setSaved(false);
   }
 
   function handleSave() {
-    saveResearchDefaults(defaults);
+    const normalized = normalizeResearchDefaults(defaults);
+    setDefaults(normalized);
+    saveResearchDefaults(normalized);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   }
@@ -41,6 +55,19 @@ export function Settings() {
   function handleReset() {
     setDefaults({ ...FACTORY_RESEARCH_DEFAULTS });
     setSaved(false);
+  }
+
+  function handleApiKeySave() {
+    saveResearchApiKey(apiKeyDraft);
+    setApiKeyDraft(apiKeyDraft.trim());
+    setApiKeySaved(true);
+    setTimeout(() => setApiKeySaved(false), 2000);
+  }
+
+  function handleApiKeyClear() {
+    clearResearchApiKey();
+    setApiKeyDraft("");
+    setApiKeySaved(false);
   }
 
   return (
@@ -72,7 +99,7 @@ export function Settings() {
               min={OPTION_BOUNDS.max_targeted_rerun_runs.min}
               max={OPTION_BOUNDS.max_targeted_rerun_runs.max}
               onChange={(e) =>
-                handleChange("max_targeted_rerun_runs", Number(e.target.value))
+                handleChange("max_targeted_rerun_runs", e.target.value)
               }
             />
             <span className="settings-range">
@@ -91,7 +118,7 @@ export function Settings() {
               value={defaults.max_full_rerun_runs}
               min={OPTION_BOUNDS.max_full_rerun_runs.min}
               max={OPTION_BOUNDS.max_full_rerun_runs.max}
-              onChange={(e) => handleChange("max_full_rerun_runs", Number(e.target.value))}
+              onChange={(e) => handleChange("max_full_rerun_runs", e.target.value)}
             />
             <span className="settings-range">
               {OPTION_BOUNDS.max_full_rerun_runs.min}–{OPTION_BOUNDS.max_full_rerun_runs.max}
@@ -109,7 +136,7 @@ export function Settings() {
               value={defaults.max_llm_patch_runs}
               min={OPTION_BOUNDS.max_llm_patch_runs.min}
               max={OPTION_BOUNDS.max_llm_patch_runs.max}
-              onChange={(e) => handleChange("max_llm_patch_runs", Number(e.target.value))}
+              onChange={(e) => handleChange("max_llm_patch_runs", e.target.value)}
             />
             <span className="settings-range">
               {OPTION_BOUNDS.max_llm_patch_runs.min}–{OPTION_BOUNDS.max_llm_patch_runs.max}
@@ -128,7 +155,7 @@ export function Settings() {
               min={OPTION_BOUNDS.max_verification_runs.min}
               max={OPTION_BOUNDS.max_verification_runs.max}
               onChange={(e) =>
-                handleChange("max_verification_runs", Number(e.target.value))
+                handleChange("max_verification_runs", e.target.value)
               }
             />
             <span className="settings-range">
@@ -148,7 +175,7 @@ export function Settings() {
               min={OPTION_BOUNDS.max_total_iterations.min}
               max={OPTION_BOUNDS.max_total_iterations.max}
               onChange={(e) =>
-                handleChange("max_total_iterations", Number(e.target.value))
+                handleChange("max_total_iterations", e.target.value)
               }
             />
             <span className="settings-range">
@@ -169,7 +196,7 @@ export function Settings() {
               max={OPTION_BOUNDS.max_total_tool_calls.max}
               step={10}
               onChange={(e) =>
-                handleChange("max_total_tool_calls", Number(e.target.value))
+                handleChange("max_total_tool_calls", e.target.value)
               }
             />
             <span className="settings-range">
@@ -184,6 +211,40 @@ export function Settings() {
           </button>
           <button type="button" className="btn-secondary" onClick={handleReset}>
             デフォルトに戻す
+          </button>
+        </div>
+      </section>
+
+      <section className="settings-section" aria-labelledby="api-connection-heading">
+        <h2 id="api-connection-heading" className="section-title">API接続</h2>
+        <div className="settings-field settings-secret-field">
+          <label className="settings-label" htmlFor="s-research-api-key">
+            Research API key
+          </label>
+          <input
+            id="s-research-api-key"
+            type="password"
+            className="settings-input"
+            value={apiKeyDraft}
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="RESEARCH_API_KEY"
+            onChange={(e) => {
+              setApiKeyDraft(e.target.value);
+              setApiKeySaved(false);
+            }}
+          />
+          <span className="settings-range">
+            RESEARCH_API_KEY が設定されたAPIへ接続する場合に、このブラウザから送信します。
+          </span>
+        </div>
+
+        <div className="settings-actions">
+          <button type="button" className="btn-primary" onClick={handleApiKeySave}>
+            {apiKeySaved ? "保存しました" : "API keyを保存"}
+          </button>
+          <button type="button" className="btn-secondary" onClick={handleApiKeyClear}>
+            API keyを削除
           </button>
         </div>
       </section>

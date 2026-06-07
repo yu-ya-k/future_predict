@@ -38,6 +38,18 @@ export interface TrackedProgressSnapshot {
 }
 
 const STORAGE_KEY = "dro.trackedRuns";
+const RUN_STATUSES: ReadonlySet<RunStatus> = new Set([
+  "queued",
+  "submitted",
+  "waiting_deep_research",
+  "collecting",
+  "reviewing",
+  "needs_action",
+  "needs_human_review",
+  "completed",
+  "cancelled",
+  "failed",
+]);
 
 type Listener = () => void;
 const listeners = new Set<Listener>();
@@ -47,7 +59,11 @@ function read(): TrackedRun[] {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw) as TrackedRun[];
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((entry) => {
+      const run = toTrackedRun(entry);
+      return run ? [run] : [];
+    });
   } catch {
     return [];
   }
@@ -67,8 +83,11 @@ export function getTrackedRuns(): TrackedRun[] {
 }
 
 export function trackRun(run: TrackedRun): void {
+  const validRun = toTrackedRun(run);
+  if (!validRun) return;
+
   const runs = read().filter((r) => r.run_id !== run.run_id);
-  runs.push(run);
+  runs.push(validRun);
   write(runs);
 }
 
@@ -115,4 +134,53 @@ export function untrackRun(runId: string): void {
 export function subscribeRuns(listener: Listener): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
+}
+
+function toTrackedRun(value: unknown): TrackedRun | null {
+  if (!isRecord(value)) return null;
+  if (!isNonEmptyString(value.run_id)) return null;
+  if (!isNonEmptyString(value.title)) return null;
+  if (!isValidCreatedAt(value.created_at)) return null;
+
+  const run: TrackedRun = {
+    run_id: value.run_id,
+    title: value.title,
+    created_at: value.created_at,
+  };
+
+  if (isFiniteNumber(value.max_total_iterations)) {
+    run.max_total_iterations = Math.max(1, Math.trunc(value.max_total_iterations));
+  }
+  if (value.last_status !== undefined) {
+    if (!isRunStatus(value.last_status)) return null;
+    run.last_status = value.last_status;
+  }
+  if (isFiniteNumber(value.last_estimated_cost_usd)) {
+    run.last_estimated_cost_usd = value.last_estimated_cost_usd;
+  }
+  if (value.last_latest_score === null || isFiniteNumber(value.last_latest_score)) {
+    run.last_latest_score = value.last_latest_score;
+  }
+
+  return run;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isValidCreatedAt(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function isRunStatus(value: unknown): value is RunStatus {
+  return typeof value === "string" && RUN_STATUSES.has(value as RunStatus);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }

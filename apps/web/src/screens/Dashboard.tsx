@@ -179,6 +179,39 @@ function QueueEmptyCompact() {
   );
 }
 
+interface QueueFetchErrorProps {
+  error: unknown;
+  connectionUnstable: boolean;
+  retrying: boolean;
+  onRetry: () => void;
+}
+
+function QueueFetchError({
+  error,
+  connectionUnstable,
+  retrying,
+  onRetry,
+}: QueueFetchErrorProps) {
+  return (
+    <div className="queue-empty-compact" role="alert">
+      <span className="queue-empty-compact__title">
+        {connectionUnstable ? "接続が不安定です" : "要対応の取得に失敗しました"}
+      </span>
+      <span className="queue-empty-compact__description">
+        {formatQueueFetchError(error)}
+      </span>
+      <button
+        type="button"
+        className="btn-secondary"
+        onClick={onRetry}
+        disabled={retrying}
+      >
+        再試行
+      </button>
+    </div>
+  );
+}
+
 function confirmRunDelete(runId: string): boolean {
   return window.confirm(
     [
@@ -199,6 +232,16 @@ function formatDeleteError(runId: string, error: unknown): string {
         ? error.message
         : "Unknown error";
   return `run ${runId} の削除に失敗しました。${detail}`;
+}
+
+function formatQueueFetchError(error: unknown): string {
+  if (error instanceof ApiError) {
+    return error.detail ?? error.message;
+  }
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return "要対応キューを取得できませんでした。";
 }
 
 // ── Dashboard live polling for non-terminal tracked runs ──────────────────────
@@ -289,6 +332,9 @@ export function Dashboard() {
   const {
     data: queueItems,
     loading: queueLoading,
+    error: queueError,
+    connectionUnstable: queueConnectionUnstable,
+    refetch: refetchQueue,
   } = usePolling<HumanReviewQueueItem[]>({
     fetcher: (signal) => listHumanReviews(signal),
     interval: () => HUMAN_REVIEW_QUEUE_INTERVAL,
@@ -317,7 +363,7 @@ export function Dashboard() {
   );
   const visibleQueueRunIds = new Set(visibleQueueItems.map((item) => item.run_id));
   const isQueueEmpty =
-    !queueLoading && visibleQueueItems.length === 0;
+    !queueLoading && !queueError && visibleQueueItems.length === 0;
 
   const visibleActiveRuns = activeRuns.filter(
     (run) => !visibleQueueRunIds.has(run.run_id),
@@ -351,6 +397,15 @@ export function Dashboard() {
           </h2>
         </div>
 
+        {queueError !== undefined && (
+          <QueueFetchError
+            error={queueError}
+            connectionUnstable={queueConnectionUnstable}
+            retrying={queueLoading}
+            onRetry={refetchQueue}
+          />
+        )}
+
         {queueLoading && !queueItems ? (
           <div className="queue-skeleton">
             <Skeleton width="100%" height="80px" />
@@ -367,9 +422,9 @@ export function Dashboard() {
               />
             ))}
           </div>
-        ) : (
+        ) : queueError === undefined ? (
           <QueueEmptyCompact />
-        )}
+        ) : null}
       </section>
 
       {/* ── 進行中 ─────────────────────────────────── */}

@@ -197,6 +197,7 @@ class ResearchOrchestrator:
                 optimized_prompt=optimized_prompt,
             )
 
+        response_id: str | None = None
         try:
             response = self.azure.submit_deep_research(
                 prompt=prompt,
@@ -205,12 +206,12 @@ class ResearchOrchestrator:
                     requested_max_tool_calls,
                 ),
             )
+            response_id = get_response_id(response)
             raw_path, _ = self.artifacts.save_json(
                 run.id,
                 f"raw-responses/deep_research_submit_{run_no:03d}.json",
                 response_to_jsonable(response),
             )
-            response_id = get_response_id(response)
             response_status = get_response_status(response) or "queued"
             self.repository.add_attempt(
                 run.id,
@@ -249,22 +250,66 @@ class ResearchOrchestrator:
                 return self.repository.get_run(run.id)
             return updated
         except Exception as error:
-            self.repository.add_attempt(
+            self._record_deep_research_submit_failure(
+                run_id=run.id,
+                run_no=run_no,
+                prompt=prompt,
+                error=error,
+                response_id=response_id,
+            )
+            done_reason = (
+                "deep_research_submitted_but_persistence_failed"
+                if response_id
+                else "deep_research_submit_failed"
+            )
+            return self._enter_human_review(
                 run.id,
+                done_reason=done_reason,
+                optimized_prompt=optimized_prompt,
+                deep_research_runs=run_no,
+            )
+
+    def _record_deep_research_submit_failure(
+        self,
+        *,
+        run_id: UUID,
+        run_no: int,
+        prompt: str,
+        error: Exception,
+        response_id: str | None,
+    ) -> None:
+        if response_id:
+            self._cancel_submitted_response_after_persistence_failure(run_id, response_id)
+            self.repository.append_history_event(
+                run_id,
+                {
+                    "step": "deep_research_submit_persistence_failed",
+                    "response_id": response_id,
+                    "error": repr(error),
+                },
+            )
+        status = "submitted_but_persistence_failed" if response_id else "failed_to_submit"
+        try:
+            self.repository.add_attempt(
+                run_id,
                 ResearchAttempt(
                     run_no=run_no,
-                    response_id=None,
-                    status="failed_to_submit",
+                    response_id=response_id,
+                    status=status,
                     model=self.azure.deep_research_deployment,
                     prompt=prompt,
                     error=repr(error),
                 ),
             )
-            return self._enter_human_review(
-                run.id,
-                done_reason="deep_research_submit_failed",
-                optimized_prompt=optimized_prompt,
-                deep_research_runs=run_no,
+        except Exception as attempt_error:
+            self.repository.append_history_event(
+                run_id,
+                {
+                    "step": "deep_research_submit_failure_attempt_record_failed",
+                    "response_id": response_id,
+                    "error": repr(attempt_error),
+                    "original_error": repr(error),
+                },
             )
 
     def collect_deep_research(self, run_id: UUID) -> ResearchRunRecord:
@@ -275,7 +320,7 @@ class ResearchOrchestrator:
         if run.status == RunStatus.WAITING_DEEP_RESEARCH:
             claimed = self.repository.claim_deep_research_run(
                 run.id,
-                lease_seconds=self.settings.research_deep_research_timeout_seconds,
+                lease_seconds=self.settings.research_deep_research_collecting_stale_seconds,
             )
             if claimed is None:
                 return self.repository.get_run(run.id)
@@ -685,7 +730,8 @@ class ResearchOrchestrator:
             report_hash=report_hash(run.report),
         )
         unknown_item_ids = _unknown_item_assessment_ids(research_items, review)
-        if unknown_item_ids:
+        missing_item_ids = _missing_item_assessment_ids(research_items, review)
+        if unknown_item_ids or missing_item_ids:
             self.repository.add_review(
                 run_id=run.id,
                 review=review,
@@ -694,14 +740,26 @@ class ResearchOrchestrator:
             self.repository.append_history_event(
                 run.id,
                 {
-                    "step": "review_unknown_research_items",
+                    "step": (
+                        "review_unknown_research_items"
+                        if unknown_item_ids
+                        else "review_missing_research_items"
+                    ),
                     "unknown_item_ids": unknown_item_ids,
+                    "missing_item_ids": missing_item_ids,
                     "known_item_ids": [item.item_id for item in research_items],
+                    "assessed_item_ids": [
+                        assessment.item_id for assessment in review.item_assessments
+                    ],
                 },
             )
             return self._enter_human_review(
                 run.id,
-                done_reason="review_referenced_unknown_research_items",
+                done_reason=(
+                    "review_referenced_unknown_research_items"
+                    if unknown_item_ids
+                    else "review_missing_research_items"
+                ),
                 allowed_statuses={RunStatus.REVIEWING},
                 total_reviews=run.total_reviews + 1,
                 total_tool_calls=next_total_tool_calls,
@@ -1313,6 +1371,7 @@ class ResearchOrchestrator:
                 run.id,
                 done_reason="max_total_tool_calls_reached_before_deep_research_submit",
             )
+        response_id: str | None = None
         try:
             response = self.azure.submit_deep_research(
                 prompt=prompt,
@@ -1321,12 +1380,12 @@ class ResearchOrchestrator:
                     self.settings.default_max_total_tool_calls,
                 ),
             )
+            response_id = get_response_id(response)
             raw_path, _ = self.artifacts.save_json(
                 run.id,
                 f"raw-responses/fork_deep_research_submit_{run_no:03d}.json",
                 response_to_jsonable(response),
             )
-            response_id = get_response_id(response)
             response_status = get_response_status(response) or "queued"
             self.repository.add_attempt(
                 run.id,
@@ -1355,20 +1414,21 @@ class ResearchOrchestrator:
                 return self.repository.get_run(run.id)
             return updated
         except Exception as error:
-            self.repository.add_attempt(
-                run.id,
-                ResearchAttempt(
-                    run_no=run_no,
-                    response_id=None,
-                    status="failed_to_submit",
-                    model=self.azure.deep_research_deployment,
-                    prompt=prompt,
-                    error=repr(error),
-                ),
+            self._record_deep_research_submit_failure(
+                run_id=run.id,
+                run_no=run_no,
+                prompt=prompt,
+                error=error,
+                response_id=response_id,
+            )
+            done_reason = (
+                "fork_deep_research_submitted_but_persistence_failed"
+                if response_id
+                else "fork_deep_research_submit_failed"
             )
             return self._enter_human_review(
                 run.id,
-                done_reason="fork_deep_research_submit_failed",
+                done_reason=done_reason,
                 deep_research_runs=run_no,
             )
 
@@ -1954,10 +2014,13 @@ class ResearchOrchestrator:
                 history_step_prefix="delete_remote_cancel",
             ):
                 raise RuntimeError("Remote Deep Research cancel failed; run was not deleted.")
+        try:
+            self.artifacts.delete_run(run.id)
+        except Exception as error:
+            raise RuntimeError("Artifact cleanup failed; run was not deleted.") from error
         deleted = self.repository.delete_run(run.id)
         if not deleted:
             raise KeyError(str(run.id))
-        self.artifacts.delete_run(run.id)
 
     def _cancel_remote_response(
         self,
@@ -2029,6 +2092,31 @@ class ResearchOrchestrator:
             run_id,
             {
                 "step": "deep_research_submit_status_changed_remote_cancel_succeeded",
+                "response_id": response_id,
+            },
+        )
+
+    def _cancel_submitted_response_after_persistence_failure(
+        self,
+        run_id: UUID,
+        response_id: str,
+    ) -> None:
+        try:
+            self.azure.cancel_response(response_id)
+        except Exception as error:
+            self.repository.append_history_event(
+                run_id,
+                {
+                    "step": "deep_research_submit_persistence_remote_cancel_failed",
+                    "response_id": response_id,
+                    "error": repr(error),
+                },
+            )
+            return
+        self.repository.append_history_event(
+            run_id,
+            {
+                "step": "deep_research_submit_persistence_remote_cancel_succeeded",
                 "response_id": response_id,
             },
         )
@@ -2688,6 +2776,16 @@ def _unknown_item_assessment_ids(
         for assessment in review.item_assessments
         if assessment.item_id not in known_ids
     ]
+
+
+def _missing_item_assessment_ids(
+    existing_items: list[ResearchItem],
+    review: ReviewRecord,
+) -> list[str]:
+    if not existing_items:
+        return []
+    assessed_ids = {assessment.item_id for assessment in review.item_assessments}
+    return [item.item_id for item in existing_items if item.item_id not in assessed_ids]
 
 
 def _items_from_review_assessments(
