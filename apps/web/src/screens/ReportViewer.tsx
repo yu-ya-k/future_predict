@@ -65,6 +65,11 @@ function safeMarkdownFilename(runId: string, attemptNo: number | null): string {
   return `${safeRunId || "research-run"}-${suffix}.md`;
 }
 
+function attemptSourceLabel(source?: string | null): string {
+  if (source === "manual_upload") return "手動取り込み";
+  return "API";
+}
+
 function downloadMarkdown(filename: string, markdown: string) {
   const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -278,6 +283,10 @@ export function ReportViewer({
                   <dd>{selectedAttempt.status}</dd>
                 </div>
                 <div>
+                  <dt>Source</dt>
+                  <dd>{attemptSourceLabel(selectedAttempt.source)}</dd>
+                </div>
+                <div>
                   <dt>Model</dt>
                   <dd>{selectedAttempt.model}</dd>
                 </div>
@@ -306,7 +315,10 @@ export function ReportViewer({
           <VersionList
             versions={researchVersions.map((version) => ({
               id: version.run_no,
-              title: `${version.run_no}回目`,
+              title:
+                version.source === "manual_upload"
+                  ? `${version.run_no}回目 手動取り込み`
+                  : `${version.run_no}回目`,
               meta: `${version.status} / ${version.model}`,
             }))}
             selectedId={displayMode === "attempt" ? selectedAttempt?.run_no ?? null : null}

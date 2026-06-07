@@ -269,6 +269,7 @@ export interface ResearchAttempt {
   status: string;
   model: string;
   prompt: string;
+  source?: "api" | "manual_upload" | string;
   report: string;
   citations: Citation[];
   tool_calls_summary: ToolCallSummary[];

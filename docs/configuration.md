@@ -44,13 +44,25 @@ The repository and artifact store create parent directories as needed.
 | `RESEARCH_REVIEW_MAX_REPORT_CHARS` | `50000` | Caps report text sent to the reviewer. Long reports are truncated with a marker. |
 | `RESEARCH_REVIEW_MAX_CITATIONS` | `40` | Caps citation metadata sent to the reviewer. |
 | `RESEARCH_REVIEW_WEB_SEARCH_ENABLED` | `false` | Enables Web Search tools for structured review calls. LLM patch/finalization fallback and targeted verification have separate public-context/query-policy checks before using Web Search. |
+| `RESEARCH_MANUAL_IMPORT_MAX_REPORT_CHARS` | `50000` | Caps pasted or uploaded report text accepted by `/research-runs/manual-import`. |
+| `RESEARCH_MANUAL_IMPORT_MAX_FILE_BYTES` | `1048576` | Caps each manual import upload before UTF-8 decoding. |
 
 When the poller is disabled, submitted runs can remain `waiting_deep_research`
-until code explicitly calls `collect_deep_research`.
+until code explicitly calls `collect_deep_research`. Manual imports can also
+remain `reviewing` if the API process exits after saving the import but before
+the background review task starts; the poller is what recovers that pending
+manual review.
+
+The API enforces `RESEARCH_MANUAL_IMPORT_MAX_REPORT_CHARS` and
+`RESEARCH_MANUAL_IMPORT_MAX_FILE_BYTES` on every manual import request. The web
+app includes client-side guards that mirror the default values, but server
+configuration remains authoritative. If operators change these limits, keep the
+web app's displayed/client-side constraints aligned with the API deployment, and
+treat API `422` responses as the final validation result.
 
 Poller intervals, timeout values, and stale-claim windows must be greater than
-zero. Report character limits must be at least `1`; citation limits can be `0`
-or higher.
+zero. Report character limits and manual import byte limits must be at least
+`1`; citation limits can be `0` or higher.
 
 ## Default Guard Limits
 

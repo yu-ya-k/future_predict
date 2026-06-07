@@ -85,6 +85,11 @@ const LLM_STEP_LABELS: Record<string, string> = {
   verification: "Verification",
 };
 
+function attemptSourceLabel(source?: string | null): string {
+  if (source === "manual_upload") return "手動取り込み";
+  return "API";
+}
+
 function normalizeTab(value?: string): TabId {
   return TABS.some((tab) => tab.id === value) ? (value as TabId) : "attempts";
 }
@@ -126,6 +131,7 @@ function AttemptsTab({ data }: { data: AuditResponse }) {
             <th>#</th>
             <th>ステータス</th>
             <th>日時</th>
+            <th>ソース</th>
             <th>モデル</th>
             <th>レスポンスID</th>
             <th>エラー</th>
@@ -137,6 +143,7 @@ function AttemptsTab({ data }: { data: AuditResponse }) {
               <td className="mono">{a.run_no}</td>
               <td>{a.status}</td>
               <td className="audit-date">{formatAuditDate(a.created_at)}</td>
+              <td>{attemptSourceLabel(a.source)}</td>
               <td className="mono">{a.model}</td>
               <td className="mono">{a.response_id ?? "—"}</td>
               <td>{a.error ?? "—"}</td>

@@ -3,7 +3,17 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    status,
+)
+from pydantic import ValidationError
 
 from api.research.dependencies import get_research_orchestrator, require_research_api_key
 from api.research.schemas import (
@@ -32,6 +42,7 @@ from api.research.schemas import (
     ResearchCheckpointsResponse,
     ResearchItemsResponse,
     ResearchRunLineageResponse,
+    ResearchRunOptions,
     ResearchRunStatusResponse,
     ReviewRecord,
     RunProgress,
@@ -54,6 +65,72 @@ def create_research_run(
     orchestrator: OrchestratorDependency,
 ) -> CreateResearchRunResponse:
     run = orchestrator.create_run(request)
+    return CreateResearchRunResponse(
+        run_id=run.id,
+        thread_id=run.thread_id,
+        status=run.status,
+        created_at=run.created_at,
+    )
+
+
+@router.post(
+    "/manual-import",
+    response_model=CreateResearchRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_manual_import_run(
+    background_tasks: BackgroundTasks,
+    orchestrator: OrchestratorDependency,
+    allow_remote_review: Annotated[bool, Form()],
+    allow_api_reruns: Annotated[bool, Form()],
+    input_prompt_file: Annotated[UploadFile | None, File()] = None,
+    input_prompt_text: Annotated[str | None, Form(max_length=50000)] = None,
+    report_file: Annotated[UploadFile | None, File()] = None,
+    report_text: Annotated[str | None, Form()] = None,
+    options_json: Annotated[str | None, Form()] = None,
+    idempotency_key: Annotated[str | None, Form(max_length=200)] = None,
+) -> CreateResearchRunResponse:
+    input_prompt, input_meta = await _read_manual_import_text(
+        label="input_prompt",
+        file=input_prompt_file,
+        text=input_prompt_text,
+        max_chars=50000,
+        max_file_bytes=orchestrator.settings.research_manual_import_max_file_bytes,
+    )
+    report, report_meta = await _read_manual_import_text(
+        label="report",
+        file=report_file,
+        text=report_text,
+        max_chars=orchestrator.settings.research_manual_import_max_report_chars,
+        max_file_bytes=orchestrator.settings.research_manual_import_max_file_bytes,
+    )
+    options = _parse_manual_options(options_json)
+    normalized_idempotency_key = idempotency_key.strip() if idempotency_key else None
+    if normalized_idempotency_key == "":
+        normalized_idempotency_key = None
+
+    try:
+        run, dispatch_review = orchestrator.create_manual_import_run(
+            input_prompt=input_prompt,
+            report=report,
+            options=options,
+            allow_remote_review=allow_remote_review,
+            allow_api_reruns=allow_api_reruns,
+            idempotency_key=normalized_idempotency_key,
+            metadata={
+                "input_prompt": input_meta,
+                "report": report_meta,
+            },
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        ) from error
+
+    if dispatch_review:
+        background_tasks.add_task(orchestrator.review_run, run.id)
+
     return CreateResearchRunResponse(
         run_id=run.id,
         thread_id=run.thread_id,
@@ -491,3 +568,97 @@ def _item_progress_fields(
             for item in items
         ),
     }
+
+
+async def _read_manual_import_text(
+    *,
+    label: str,
+    file: UploadFile | None,
+    text: str | None,
+    max_chars: int,
+    max_file_bytes: int,
+) -> tuple[str, dict[str, object]]:
+    has_file = file is not None
+    has_text = text is not None
+    if has_file == has_text:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Provide exactly one of {label}_file or {label}_text.",
+        )
+
+    if has_text:
+        assert text is not None
+        stripped = text.strip()
+        if not stripped:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{label}_text must not be blank.",
+            )
+        if len(stripped) > max_chars:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{label} exceeds the {max_chars} character limit.",
+            )
+        return stripped, {
+            "source": "text",
+            "chars": len(stripped),
+            "sha256": _sha256_text(stripped),
+        }
+
+    assert file is not None
+    filename = file.filename or ""
+    if not filename.lower().endswith((".md", ".txt")):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}_file must be a .md or .txt file.",
+        )
+    data = await file.read(max_file_bytes + 1)
+    if len(data) > max_file_bytes:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}_file exceeds the {max_file_bytes} byte limit.",
+        )
+    try:
+        decoded = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}_file must be valid UTF-8.",
+        ) from error
+    stripped = decoded.strip()
+    if not stripped:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}_file must not be blank.",
+        )
+    if len(stripped) > max_chars:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label} exceeds the {max_chars} character limit.",
+        )
+    return stripped, {
+        "source": "file",
+        "filename": filename,
+        "content_type": file.content_type,
+        "bytes": len(data),
+        "chars": len(stripped),
+        "sha256": _sha256_text(stripped),
+    }
+
+
+def _parse_manual_options(options_json: str | None) -> ResearchRunOptions:
+    if options_json is None or not options_json.strip():
+        return ResearchRunOptions()
+    try:
+        return ResearchRunOptions.model_validate_json(options_json)
+    except ValidationError as error:
+        raise HTTPException(
+            status_code=422,
+            detail=error.errors(),
+        ) from error
+
+
+def _sha256_text(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()

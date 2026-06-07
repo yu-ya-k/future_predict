@@ -59,6 +59,45 @@ export function createRun(
   return apiClient.request(BASE, { method: "POST", body: request, signal });
 }
 
+type ManualImportSource =
+  | { source: "text"; text: string }
+  | { source: "file"; file: File };
+
+export interface CreateManualImportRunRequest {
+  input_prompt: ManualImportSource;
+  report: ManualImportSource;
+  options?: CreateResearchRunRequest["options"];
+  allow_remote_review: boolean;
+  allow_api_reruns: boolean;
+  idempotency_key?: string | null;
+}
+
+export function createManualImportRun(
+  request: CreateManualImportRunRequest,
+  signal?: AbortSignal,
+): Promise<CreateResearchRunResponse> {
+  const body = new FormData();
+  if (request.input_prompt.source === "file") {
+    body.append("input_prompt_file", request.input_prompt.file);
+  } else {
+    body.append("input_prompt_text", request.input_prompt.text);
+  }
+  if (request.report.source === "file") {
+    body.append("report_file", request.report.file);
+  } else {
+    body.append("report_text", request.report.text);
+  }
+  if (request.options) {
+    body.append("options_json", JSON.stringify(request.options));
+  }
+  body.append("allow_remote_review", String(request.allow_remote_review));
+  body.append("allow_api_reruns", String(request.allow_api_reruns));
+  if (request.idempotency_key?.trim()) {
+    body.append("idempotency_key", request.idempotency_key.trim());
+  }
+  return apiClient.request(`${BASE}/manual-import`, { method: "POST", body, signal });
+}
+
 export function listHumanReviews(signal?: AbortSignal): Promise<HumanReviewQueueItem[]> {
   return apiClient.request(`${BASE}/human-reviews`, { signal });
 }

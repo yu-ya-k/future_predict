@@ -1100,6 +1100,336 @@ describe("NewResearch (SCR-1)", () => {
       expect(screen.getByRole("alert")).toBeInTheDocument();
     });
   });
+
+  it("submits manual import as FormData without setting Content-Type and tracks the monitor run", async () => {
+    localStorage.setItem("dro.researchApiKey", "browser-secret");
+    const runId = "run-manual-import-test";
+    const createdAt = new Date().toISOString();
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      void init;
+      const url = String(input);
+      if (url.endsWith("/research-runs/manual-import")) {
+        return Promise.resolve({
+          ok: true,
+          status: 202,
+          json: () =>
+            Promise.resolve({
+              run_id: runId,
+              thread_id: "thread-1",
+              status: "reviewing",
+              created_at: createdAt,
+            }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/audit`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(makeAuditResponse({ run_id: runId })),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/items`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, items: [] }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/checkpoints?include_forks=true`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, checkpoints: [] }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/lineage`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, lineage: null }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "reviewing",
+            done_reason: null,
+            needs_human_review: false,
+            progress: null,
+          }),
+      } as Response);
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.click(
+      screen.getByRole("radio", { name: "ChatGPT結果を取り込み" }),
+    );
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "入力プロンプト" }),
+      "手動実行したプロンプト",
+    );
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "出力レポート" }),
+      "手動実行したレポート",
+    );
+    await userEvent.click(screen.getByLabelText("LLMレビューを許可する"));
+    await userEvent.click(
+      screen.getByRole("button", { name: /取り込んでレビューを開始/i }),
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const manualImportCall = fetchMock.mock.calls.find(([input]) =>
+      String(input).endsWith("/research-runs/manual-import"),
+    );
+    expect(manualImportCall).toBeDefined();
+    const init = manualImportCall?.[1] as RequestInit;
+    const headers = init.headers as Record<string, string>;
+    const body = init.body as FormData;
+
+    expect(manualImportCall?.[0]).toBe(
+      "http://localhost:8000/research-runs/manual-import",
+    );
+    expect(headers).toEqual({ "X-API-Key": "browser-secret" });
+    expect(body).toBeInstanceOf(FormData);
+    expect(body.get("input_prompt_text")).toBe("手動実行したプロンプト");
+    expect(body.get("report_text")).toBe("手動実行したレポート");
+    expect(body.get("allow_remote_review")).toBe("true");
+    expect(body.get("allow_api_reruns")).toBe("false");
+    expect(body.has("input_prompt_file")).toBe(false);
+    expect(body.has("report_file")).toBe(false);
+    await waitFor(() => expect(window.location.hash).toBe(`#/runs/${runId}`));
+    const trackedRuns = JSON.parse(localStorage.getItem("dro.trackedRuns") ?? "[]") as Array<{
+      run_id: string;
+      last_status: string;
+    }>;
+    expect(trackedRuns).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ run_id: runId, last_status: "reviewing" }),
+      ]),
+    );
+  });
+
+  it("does not promise remote review when manual review permission is off", async () => {
+    render(<App />);
+
+    await userEvent.click(
+      screen.getByRole("radio", { name: "ChatGPT結果を取り込み" }),
+    );
+
+    expect(
+      screen.getByRole("button", { name: "手動結果を取り込む" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /取り込んでレビューを開始/i }),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByLabelText("LLMレビューを許可する"));
+
+    expect(
+      screen.getByRole("button", { name: /取り込んでレビューを開始/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows manual required field errors only after touch or submit and clears them on source switch", async () => {
+    render(<App />);
+
+    await userEvent.click(
+      screen.getByRole("radio", { name: "ChatGPT結果を取り込み" }),
+    );
+
+    expect(screen.queryByText("入力してください")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "手動結果を取り込む" }));
+
+    expect(screen.getAllByText("入力してください")).toHaveLength(2);
+
+    const promptSection = screen.getByText("入力プロンプト").closest("section");
+    expect(promptSection).not.toBeNull();
+    await userEvent.click(
+      within(promptSection as HTMLElement).getByRole("radio", { name: "ファイル" }),
+    );
+
+    expect(
+      within(promptSection as HTMLElement).queryByText("ファイルを選択してください"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("disables manual rerun controls and sends zero rerun limits until API reruns are allowed", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 202,
+      json: () =>
+        Promise.resolve({
+          run_id: "run-manual-rerun-controls-test",
+          thread_id: "thread-1",
+          status: "needs_human_review",
+          created_at: new Date().toISOString(),
+        }),
+    } as Response);
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.click(
+      screen.getByRole("radio", { name: "ChatGPT結果を取り込み" }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: /詳細オプション/i }));
+
+    const targetedInput = screen.getByLabelText(/最大Targeted rerun回数/i);
+    const fullInput = screen.getByLabelText(/最大Full rerun回数/i);
+    expect(targetedInput).toBeDisabled();
+    expect(fullInput).toBeDisabled();
+    expect(
+      screen.getByText(/API rerun未許可のため、Targeted rerun \/ Full rerun は0回として送信されます。/),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByLabelText("API rerunを許可する"));
+    expect(targetedInput).not.toBeDisabled();
+    expect(fullInput).not.toBeDisabled();
+    await userEvent.click(screen.getByLabelText("API rerunを許可する"));
+
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "入力プロンプト" }),
+      "手動プロンプト",
+    );
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "出力レポート" }),
+      "手動レポート",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "手動結果を取り込む" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const body = fetchMock.mock.calls[0][1]?.body as FormData;
+    const options = JSON.parse(String(body.get("options_json"))) as Record<string, number>;
+    expect(options.max_targeted_rerun_runs).toBe(0);
+    expect(options.max_full_rerun_runs).toBe(0);
+  });
+
+  it("omits inactive manual text and sends the selected file source", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 202,
+      json: () =>
+        Promise.resolve({
+          run_id: "run-manual-file-test",
+          thread_id: "thread-1",
+          status: "needs_human_review",
+          created_at: new Date().toISOString(),
+        }),
+    } as Response);
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.click(
+      screen.getByRole("radio", { name: "ChatGPT結果を取り込み" }),
+    );
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "入力プロンプト" }),
+      "送られない古いテキスト",
+    );
+    const promptSection = screen.getByText("入力プロンプト").closest("section");
+    expect(promptSection).not.toBeNull();
+    await userEvent.click(
+      within(promptSection as HTMLElement).getByRole("radio", { name: "ファイル" }),
+    );
+    await userEvent.upload(
+      screen.getByLabelText("入力プロンプトファイル"),
+      new File(["file prompt"], "prompt.md", { type: "text/markdown" }),
+    );
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "出力レポート" }),
+      "手動レポート",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "手動結果を取り込む" }),
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const body = fetchMock.mock.calls[0][1]?.body as FormData;
+
+    expect(body.has("input_prompt_text")).toBe(false);
+    expect(body.get("input_prompt_file")).toBeInstanceOf(File);
+    expect((body.get("input_prompt_file") as File).name).toBe("prompt.md");
+    expect(body.get("report_text")).toBe("手動レポート");
+    expect(body.has("report_file")).toBe(false);
+    const options = JSON.parse(String(body.get("options_json"))) as Record<string, number>;
+    expect(options.max_targeted_rerun_runs).toBe(0);
+    expect(options.max_full_rerun_runs).toBe(0);
+  });
+
+  it("blocks oversized manual files before submit", async () => {
+    const fetchMock = vi.fn();
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.click(
+      screen.getByRole("radio", { name: "ChatGPT結果を取り込み" }),
+    );
+    const promptSection = screen.getByText("入力プロンプト").closest("section");
+    expect(promptSection).not.toBeNull();
+    await userEvent.click(
+      within(promptSection as HTMLElement).getByRole("radio", { name: "ファイル" }),
+    );
+    await userEvent.upload(
+      screen.getByLabelText("入力プロンプトファイル"),
+      new File([new Uint8Array(1_048_577)], "too-large.md", {
+        type: "text/markdown",
+      }),
+    );
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "出力レポート" }),
+      "手動レポート",
+    );
+
+    expect(screen.getByText("ファイルサイズは1MB以下にしてください")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "手動結果を取り込む" }),
+    ).toBeDisabled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("shows manual import server errors", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      json: () => Promise.resolve({ detail: "Idempotency conflict" }),
+    } as Response);
+
+    render(<App />);
+
+    await userEvent.click(
+      screen.getByRole("radio", { name: "ChatGPT結果を取り込み" }),
+    );
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "入力プロンプト" }),
+      "手動プロンプト",
+    );
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "出力レポート" }),
+      "手動レポート",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "手動結果を取り込む" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Idempotency conflict",
+    );
+  });
 });
 
 describe("RunMonitor (SCR-3)", () => {
@@ -1474,6 +1804,30 @@ describe("RunMonitor (SCR-3)", () => {
       expect.stringContaining(`/research-runs/${runId}/attempts`),
       expect.any(Object),
     );
+  });
+
+  it("labels manual upload attempts in the monitor prompt panel", async () => {
+    mockRunMonitorFetch({
+      attempts: [
+        makeResearchAttempt(1, {
+          response_id: null,
+          model: "chatgpt-deep-research-manual",
+          source: "manual_upload",
+        }),
+      ],
+    });
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "指示内容" }));
+
+    const promptPanel = await screen.findByRole("region", {
+      name: "Deep Researchへの指示内容",
+    });
+    expect(
+      within(promptPanel).getByText("Deep Research 1回目 手動取り込み"),
+    ).toBeInTheDocument();
+    expect(within(promptPanel).getByText("手動取り込み")).toBeInTheDocument();
   });
 
   it("returns to the dashboard from the run monitor", async () => {
@@ -3320,7 +3674,12 @@ describe("RunMonitor (SCR-3)", () => {
 describe("ReportViewer (SCR-5)", () => {
   const runId = "run-report-back-test";
 
-  function makeAttempt(runNo: number, report: string, status = "completed") {
+  function makeAttempt(
+    runNo: number,
+    report: string,
+    status = "completed",
+    overrides: Partial<ResearchAttempt> = {},
+  ) {
     return {
       run_no: runNo,
       response_id: `resp_collect_${runNo}`,
@@ -3331,6 +3690,7 @@ describe("ReportViewer (SCR-5)", () => {
       citations: [],
       tool_calls_summary: [],
       error: null,
+      ...overrides,
     };
   }
 
@@ -3400,6 +3760,55 @@ describe("ReportViewer (SCR-5)", () => {
     await userEvent.click(await screen.findByRole("link", { name: "Runへ戻る" }));
 
     expect(window.location.hash).toBe(`#/runs/${runId}`);
+  });
+
+  it("labels manual upload attempts in the report history", async () => {
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/citations`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve([
+              makeAttempt(1, "# Imported report", "completed", {
+                response_id: null,
+                model: "chatgpt-deep-research-manual",
+                source: "manual_upload",
+              }),
+            ]),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "completed",
+            final_report: null,
+            report: null,
+            warnings: [],
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: /1回目 手動取り込み/ }),
+    );
+
+    expect(screen.getByRole("button", { name: /1回目 手動取り込み/ })).toBeInTheDocument();
+    expect(screen.getByText("Source")).toBeInTheDocument();
+    expect(screen.getByText("手動取り込み")).toBeInTheDocument();
   });
 
   it("defaults to the final report without mixed tabs or PDF printing", async () => {
@@ -4054,6 +4463,42 @@ describe("ReportViewer (SCR-5)", () => {
 
 describe("AuditLog (SCR-6)", () => {
   const runId = "run-audit-test";
+
+  it("labels manual upload attempts in the audit attempts table", async () => {
+    window.location.hash = `#/runs/${runId}/audit`;
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve(
+          makeAuditResponse({
+            run_id: runId,
+            attempts: [
+              {
+                run_no: 1,
+                response_id: null,
+                status: "completed",
+                model: "chatgpt-deep-research-manual",
+                prompt: "# Manual prompt",
+                report: "# Manual report",
+                source: "manual_upload",
+                citations: [],
+                tool_calls_summary: [],
+                error: null,
+                created_at: "2026-06-06T01:02:03.000Z",
+              },
+            ],
+          }),
+        ),
+    } as Response);
+
+    render(<App />);
+
+    expect(await screen.findByRole("tab", { name: "調査試行" }))
+      .toHaveAttribute("aria-selected", "true");
+    expect(screen.getByText("手動取り込み")).toBeInTheDocument();
+    expect(screen.getByText("chatgpt-deep-research-manual")).toBeInTheDocument();
+  });
 
   it("renders only http and https citation URLs as links in the audit log", async () => {
     window.location.hash = `#/runs/${runId}/audit?tab=citations`;

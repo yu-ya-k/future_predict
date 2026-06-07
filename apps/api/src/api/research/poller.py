@@ -61,6 +61,15 @@ class ResearchPoller:
             except Exception:
                 logger.exception("Failed to mark review run %s as timed out", run.id)
 
+        manual_review_pending = (
+            self.orchestrator.repository.list_manual_import_review_pending_runs()
+        )
+        for run in manual_review_pending:
+            try:
+                await asyncio.to_thread(self.orchestrator.review_run, run.id)
+            except Exception:
+                logger.exception("Failed to resume manual import review for run %s", run.id)
+
         waiting = self.orchestrator.repository.list_waiting_runs(
             timeout_seconds=settings.research_deep_research_timeout_seconds,
         )

@@ -42,6 +42,52 @@ Response status is `202 Accepted`:
 }
 ```
 
+## Manual Import
+
+`POST /research-runs/manual-import` imports a Deep Research prompt and report
+that were produced manually in ChatGPT. The request must be
+`multipart/form-data`.
+
+Fields:
+
+- `input_prompt_file` or `input_prompt_text`, exactly one.
+- `report_file` or `report_text`, exactly one.
+- `allow_remote_review`, required boolean. When false, the run stops in human
+  review without calling the reviewer, finalizer, or verifier.
+- `allow_api_reruns`, required boolean. When false, targeted and full API reruns
+  are forced to zero for the imported run.
+- `options_json`, optional JSON matching `ResearchRunOptions`.
+- `idempotency_key`, optional. Repeating the same key with the same request
+  returns the existing run; the same key with different content returns `409`.
+
+Only `.md` and `.txt` uploads are accepted. Files must be UTF-8, non-blank, and
+within `RESEARCH_MANUAL_IMPORT_MAX_FILE_BYTES`. Prompt text is capped at 50,000
+characters. Report text is capped by `RESEARCH_MANUAL_IMPORT_MAX_REPORT_CHARS`.
+The API is the source of truth for these limits and rejects oversized requests
+with `422`. The web app performs client-side checks that mirror the shipped
+defaults, so operators who change the server-side manual import limits should
+keep the web deployment aligned or expect the server to enforce the final
+decision.
+
+```sh
+curl -sS -X POST http://127.0.0.1:8000/research-runs/manual-import \
+  -F input_prompt_file=@prompt.md \
+  -F report_file=@report.md \
+  -F allow_remote_review=true \
+  -F allow_api_reruns=false \
+  -F idempotency_key=operator-ticket-1234
+```
+
+Manual import creates Deep Research attempt `1` with
+`source="manual_upload"`, `model="chatgpt-deep-research-manual"`,
+`status="completed"`, and no Responses API `response_id`. Imported URLs and
+Markdown links are saved as unverified manual citations. Prompt/report bodies
+are saved as artifacts; idempotency metadata stores hashes, lengths, filenames,
+content types, and import time, not the raw bodies.
+
+If the prompt or report contains sensitive terms, no external LLM/API call is
+made and the run enters `needs_human_review`.
+
 ## Status And Progress
 
 ```sh
@@ -490,6 +536,7 @@ endpoints return `404`.
 ## Public Interface Summary
 
 - `POST /research-runs`
+- `POST /research-runs/manual-import`
 - `GET /research-runs/{run_id}`
 - `GET /research-runs/{run_id}/contract`
 - `GET /research-runs/{run_id}/items`

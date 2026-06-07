@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -45,6 +46,7 @@ from api.research.routing import (
     route_after_review_decision,
 )
 from api.research.schemas import (
+    Citation,
     CostEvent,
     CreateResearchRunRequest,
     FailureMode,
@@ -63,6 +65,7 @@ from api.research.schemas import (
     ResearchCheckpoint,
     ResearchItem,
     ResearchRunLineage,
+    ResearchRunOptions,
     ResearchRunRecord,
     ReviewRecord,
     RunStatus,
@@ -97,6 +100,174 @@ class ResearchOrchestrator:
             settings=self.settings,
         )
         return self.submit_deep_research(run.id)
+
+    def create_manual_import_run(
+        self,
+        *,
+        input_prompt: str,
+        report: str,
+        options: ResearchRunOptions,
+        allow_remote_review: bool,
+        allow_api_reruns: bool,
+        idempotency_key: str | None,
+        metadata: dict[str, Any],
+    ) -> tuple[ResearchRunRecord, bool]:
+        if not allow_api_reruns:
+            options = options.model_copy(
+                update={
+                    "max_targeted_rerun_runs": 0,
+                    "max_full_rerun_runs": 0,
+                }
+            )
+
+        imported_at = utc_now()
+        options_payload = options.model_dump(mode="json")
+        request_metadata = {
+            **metadata,
+            "prompt_sha256": hashlib.sha256(input_prompt.encode("utf-8")).hexdigest(),
+            "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+            "prompt_chars": len(input_prompt),
+            "report_chars": len(report),
+            "allow_remote_review": allow_remote_review,
+            "allow_api_reruns": allow_api_reruns,
+            "options": options_payload,
+            "imported_at": imported_at.isoformat(),
+        }
+        request_hash = _manual_import_request_hash(
+            input_prompt=input_prompt,
+            report=report,
+            options=options_payload,
+            allow_remote_review=allow_remote_review,
+            allow_api_reruns=allow_api_reruns,
+        )
+        if idempotency_key:
+            existing = self.repository.get_manual_import_idempotency(idempotency_key)
+            if existing is not None:
+                existing_run, existing_hash = existing
+                if existing_hash != request_hash:
+                    raise ValueError(
+                        "Manual import idempotency key already exists with a "
+                        "different request."
+                    )
+                return existing_run, False
+
+        contract, research_items, _optimized_prompt = build_objective_contract(
+            user_prompt=input_prompt,
+        )
+        run_id = uuid4()
+        thread_id = str(uuid4())
+        try:
+            prompt_path, _ = self.artifacts.save_text(
+                run_id,
+                "prompts/manual_import_prompt.txt",
+                input_prompt,
+            )
+            report_path, _ = self.artifacts.save_text(
+                run_id,
+                "reports/report_attempt_001.md",
+                report,
+            )
+            raw_path, _ = self.artifacts.save_json(
+                run_id,
+                "raw-responses/manual_import_001.json",
+                {
+                    **request_metadata,
+                    "source": "manual_upload",
+                    "prompt_path": prompt_path,
+                    "report_path": report_path,
+                    "request_hash": request_hash,
+                },
+            )
+            citations = _manual_upload_citations(report, retrieved_at=imported_at.isoformat())
+            attempt = ResearchAttempt(
+                run_no=1,
+                response_id=None,
+                status="completed",
+                model="chatgpt-deep-research-manual",
+                source="manual_upload",
+                prompt=input_prompt,
+                report=report,
+                citations=citations,
+                raw_response_artifact_path=raw_path,
+            )
+            report_digest = report_hash(report)
+            manual_checkpoint_snapshot = _manual_import_checkpoint_snapshot(
+                kind="deep_research_collected",
+                status=RunStatus.REVIEWING,
+                input_prompt=input_prompt,
+                report=report,
+                source_attempt_no=1,
+                snapshot_extra={
+                    "source": "manual_upload",
+                    "prompt_path": prompt_path,
+                    "report_path": report_path,
+                    "citations_count": len(citations),
+                },
+            )
+            sensitive = contains_sensitive_terms(input_prompt) or contains_sensitive_terms(report)
+            done_reason: str | None = None
+            if sensitive:
+                done_reason = "manual_import_sensitive_content"
+            elif not allow_remote_review:
+                done_reason = "manual_import_remote_review_not_allowed"
+            dispatch_review = done_reason is None
+            initial_status = (
+                RunStatus.REVIEWING if dispatch_review else RunStatus.NEEDS_HUMAN_REVIEW
+            )
+            human_review_checkpoint_snapshot = None
+            if done_reason is not None:
+                human_review_checkpoint_snapshot = _manual_import_checkpoint_snapshot(
+                    kind="human_review_required",
+                    status=RunStatus.NEEDS_HUMAN_REVIEW,
+                    input_prompt=input_prompt,
+                    report=report,
+                    source_attempt_no=1,
+                    snapshot_extra={
+                        "reason": done_reason,
+                        "audit_summary": {
+                            "deep_research_runs": 1,
+                            "targeted_rerun_runs": 0,
+                            "full_rerun_runs": 0,
+                            "llm_patch_runs": 0,
+                            "verification_runs": 0,
+                            "total_reviews": 0,
+                            "no_progress_count": 0,
+                            "total_tool_calls": 0,
+                            "estimated_cost_usd": 0,
+                        },
+                    },
+                )
+
+            run, created = self.repository.create_manual_import_run(
+                run_id=run_id,
+                thread_id=thread_id,
+                input_prompt=input_prompt,
+                report=report,
+                options=options,
+                settings=self.settings,
+                request_hash=request_hash,
+                request_metadata=request_metadata,
+                idempotency_key=idempotency_key,
+                contract=contract,
+                research_items=research_items,
+                attempt=attempt,
+                prompt_path=prompt_path,
+                report_path=report_path,
+                initial_status=initial_status,
+                needs_human_review=not dispatch_review,
+                done_reason=done_reason,
+                manual_checkpoint_snapshot=manual_checkpoint_snapshot,
+                manual_checkpoint_report_hash=report_digest,
+                human_review_checkpoint_snapshot=human_review_checkpoint_snapshot,
+                human_review_checkpoint_report_hash=report_digest if done_reason else None,
+            )
+        except Exception:
+            self.artifacts.delete_run(run_id)
+            raise
+        if not created:
+            self.artifacts.delete_run(run_id)
+            return run, False
+        return run, dispatch_review
 
     def submit_deep_research(
         self,
@@ -2129,13 +2300,16 @@ class ResearchOrchestrator:
         research_items: list[ResearchItem],
     ) -> tuple[Any, str | None, dict[str, Any]]:
         last_error: Exception | None = None
-        citations = [citation.model_dump() for citation in self.repository.get_citations(run.id)]
+        all_citations = [
+            citation.model_dump() for citation in self.repository.get_citations(run.id)
+        ]
+        citations = all_citations[: self.settings.research_review_max_citations]
         omitted_report_chars = max(
             len(run.report or "") - self.settings.research_review_max_report_chars,
             0,
         )
         omitted_citations = max(
-            len(citations) - self.settings.research_review_max_citations,
+            len(all_citations) - self.settings.research_review_max_citations,
             0,
         )
         if omitted_report_chars or omitted_citations:
@@ -2641,6 +2815,94 @@ def _extract_response_error(response: Any) -> str:
     if raw.get("incomplete_details"):
         return str(raw["incomplete_details"])
     return "Deep Research ended without a completed response."
+
+
+def _manual_import_request_hash(
+    *,
+    input_prompt: str,
+    report: str,
+    options: dict[str, Any],
+    allow_remote_review: bool,
+    allow_api_reruns: bool,
+) -> str:
+    payload = {
+        "input_prompt_sha256": hashlib.sha256(input_prompt.encode("utf-8")).hexdigest(),
+        "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+        "options": options,
+        "allow_remote_review": allow_remote_review,
+        "allow_api_reruns": allow_api_reruns,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _manual_import_checkpoint_snapshot(
+    *,
+    kind: str,
+    status: RunStatus,
+    input_prompt: str,
+    report: str,
+    source_attempt_no: int,
+    snapshot_extra: dict[str, Any],
+) -> dict[str, Any]:
+    snapshot = {
+        "kind": kind,
+        "status": status.value,
+        "source_prompt": input_prompt,
+        "source_report": report,
+        "source_report_excerpt": _excerpt(report),
+        "source_prompt_excerpt": _excerpt(input_prompt),
+        "source_attempt_no": source_attempt_no,
+        "source_review_no": None,
+        "source_response_id": None,
+    }
+    snapshot.update(snapshot_extra)
+    return snapshot
+
+
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]{1,300})\]\((https?://[^)\s]+)\)")
+_URL_RE = re.compile(r"https?://[^\s<>\]\)\"']+")
+
+
+def _manual_upload_citations(report: str, *, retrieved_at: str) -> list[Citation]:
+    citations: list[Citation] = []
+    seen_urls: set[str] = set()
+    for match in _MARKDOWN_LINK_RE.finditer(report):
+        title = match.group(1).strip() or None
+        url = _clean_manual_url(match.group(2))
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        citations.append(
+            Citation(
+                title=title,
+                url=url,
+                start_index=match.start(2),
+                end_index=match.end(2),
+                source_type="manual_upload_url_unverified",
+                retrieved_at=retrieved_at,
+            )
+        )
+    for match in _URL_RE.finditer(report):
+        url = _clean_manual_url(match.group(0))
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        citations.append(
+            Citation(
+                title=None,
+                url=url,
+                start_index=match.start(),
+                end_index=match.end(),
+                source_type="manual_upload_url_unverified",
+                retrieved_at=retrieved_at,
+            )
+        )
+    return citations
+
+
+def _clean_manual_url(url: str) -> str:
+    return url.rstrip(".,;:")
 
 
 def _acceptance_criteria_from_history(history: list[dict[str, Any]]) -> list[str]:

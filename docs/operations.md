@@ -10,7 +10,9 @@ This guide covers common Research Orchestrator checks while the API is running.
    curl -sS http://127.0.0.1:8000/research-runs/{run_id}
    ```
 
-2. If status is `waiting_deep_research`, confirm the poller is enabled:
+2. If status is `waiting_deep_research`, or a manual import is stuck in
+   `reviewing` before any `review_attempt_started` audit entry, confirm the
+   poller is enabled:
 
    ```sh
    grep '^RESEARCH_POLLER_ENABLED=' .env
@@ -51,6 +53,41 @@ curl -sS http://127.0.0.1:8000/research-runs/{run_id}/human-review
 
 The payload includes the latest report, latest review, unresolved ResearchItems,
 allowed actions, warnings, and audit summary.
+
+## Manual Import
+
+Import a ChatGPT Deep Research run from local Markdown or text files:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8000/research-runs/manual-import \
+  -F input_prompt_file=@prompt.md \
+  -F report_file=@report.md \
+  -F allow_remote_review=true \
+  -F allow_api_reruns=false \
+  -F idempotency_key=operator-ticket-1234
+```
+
+Use `allow_remote_review=false` when the report should be archived and queued
+for a human before any reviewer/finalizer/verification model call. If sensitive
+terms are detected in either imported body, the API also stops in human review
+without external calls. Use `allow_api_reruns=false` to prevent future targeted
+or full Deep Research API reruns from this imported run.
+
+Keep uploaded files within the server's
+`RESEARCH_MANUAL_IMPORT_MAX_FILE_BYTES` limit and report text within
+`RESEARCH_MANUAL_IMPORT_MAX_REPORT_CHARS`. The web app may block at its
+client-side default before submission, but the API returns `422` for any request
+that exceeds the deployed server configuration.
+
+Manual imports appear in audit attempts with `source=manual_upload`. Extracted
+URLs are saved as `manual_upload_url_unverified` citations and do not count as
+tool calls.
+
+If the API process exits after the import is saved but before background review
+starts, the poller resumes the pending manual review on a later tick. With
+`RESEARCH_POLLER_ENABLED=false`, that recovery does not run; operators should
+either re-enable the poller or resume/review the run through the normal human
+review path after inspecting the audit log.
 
 ## Checkpoint Forks
 

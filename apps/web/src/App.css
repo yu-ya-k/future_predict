@@ -372,6 +372,109 @@ body {
   flex-direction: column;
 }
 
+.mode-fieldset,
+.source-fieldset,
+.manual-gates {
+  margin: 0 0 var(--space-6);
+  padding: 0;
+  border: 0;
+}
+
+.segmented-control {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  width: 100%;
+  border: var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.segmented-option {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-height: 40px;
+  padding: var(--space-2) var(--space-3);
+  color: var(--ink-soft);
+  font-size: var(--text-label);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+}
+
+.segmented-option + .segmented-option {
+  border-left: var(--border);
+}
+
+.segmented-option--active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.segmented-option input {
+  margin: 0;
+}
+
+.source-switch,
+.manual-gates {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.manual-gate-note {
+  flex-basis: 100%;
+  margin: calc(-1 * var(--space-2)) 0 0;
+  color: var(--ink-faint);
+  font-size: var(--text-caption);
+}
+
+.source-switch label,
+.checkbox-row {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 32px;
+  color: var(--ink-soft);
+  font-size: var(--text-label);
+  font-weight: var(--weight-medium);
+}
+
+.manual-import-field .source-fieldset {
+  margin-bottom: var(--space-3);
+}
+
+.file-input-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 44px;
+  padding: var(--inset-sm);
+  border: var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  flex-wrap: wrap;
+}
+
+.file-input-row input {
+  max-width: 100%;
+}
+
+.file-input-meta {
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: var(--text-caption);
+  overflow-wrap: anywhere;
+}
+
+.field-error {
+  margin: var(--space-2) 0 0;
+  color: var(--error);
+  font-size: var(--text-caption);
+}
+
 .prompt-textarea {
   width: 100%;
   padding: var(--inset-md);
@@ -448,6 +551,12 @@ body {
   border: var(--border);
   border-radius: var(--radius);
   background: var(--surface-raised);
+}
+
+.option-note {
+  margin: 0 0 var(--space-4);
+  color: var(--ink-faint);
+  font-size: var(--text-caption);
 }
 
 .options-grid {

@@ -346,6 +346,7 @@ class ResearchAttempt(BaseModel):
     status: str
     model: str
     prompt: str
+    source: str = "api"
     report: str = ""
     citations: list[Citation] = Field(default_factory=_empty_citations)
     tool_calls_summary: list[ToolCallSummary] = Field(default_factory=_empty_tool_calls)

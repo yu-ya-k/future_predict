@@ -226,6 +226,11 @@ function checkpointKindLabel(kind: string): string {
   return CHECKPOINT_KIND_LABEL[kind] ?? kind;
 }
 
+function attemptSourceLabel(source?: string | null): string {
+  if (source === "manual_upload") return "手動取り込み";
+  return "API";
+}
+
 function shortId(value: string | null | undefined, length = 10): string | null {
   if (!value) return null;
   return value.length > length ? `${value.slice(0, length)}...` : value;
@@ -1785,7 +1790,13 @@ export function RunMonitor({ runId }: RunMonitorProps) {
               {attempts.map((attempt) => (
                 <article key={`${attempt.run_no}-${attempt.response_id ?? "pending"}`} className="prompt-attempt">
                   <div className="prompt-attempt-header">
-                    <span className="prompt-attempt-title">Deep Research {attempt.run_no}回目</span>
+                    <span className="prompt-attempt-title">
+                      Deep Research {attempt.run_no}回目
+                      {attempt.source === "manual_upload" ? " 手動取り込み" : ""}
+                    </span>
+                    <span className="prompt-attempt-status">
+                      {attemptSourceLabel(attempt.source)}
+                    </span>
                     <span className="prompt-attempt-status">{attempt.status}</span>
                   </div>
                   <pre className="prompt-attempt-body">{attempt.prompt}</pre>

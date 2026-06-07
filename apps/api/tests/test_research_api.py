@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
@@ -11,6 +12,8 @@ from api.config import get_settings
 from api.main import create_app
 from api.research.azure_responses import ReviewRequestTimeout
 from api.research.dependencies import get_research_orchestrator
+from api.research.poller import ResearchPoller
+from api.research.repository import ResearchRepository
 from api.research.schemas import (
     CreateResearchRunRequest,
     FailureMode,
@@ -18,6 +21,7 @@ from api.research.schemas import (
     ItemAssessment,
     ItemStatus,
     RecommendedAction,
+    ResearchRunOptions,
     ReviewResult,
     RunStatus,
     Severity,
@@ -260,6 +264,618 @@ async def test_research_api_rejects_blank_prompt_fields(tmp_path: Path) -> None:
     assert valid_preview_response.status_code == 200
     assert blank_fork_prompt_response.status_code == 422
     assert blank_idempotency_response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_manual_import_text_dispatches_review_without_deep_research_submit(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure()
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "公開情報だけで市場調査をしてください。",
+                "report_text": "調査レポート本文\n\n[Example](https://example.com/source)",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "false",
+                "idempotency_key": "manual-import-pass",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        status_response = await client.get(f"/research-runs/{run_id}")
+        audit_response = await client.get(f"/research-runs/{run_id}/audit")
+
+    assert fake.submitted_prompts == []
+    assert fake.review_calls == 1
+    status_json = status_response.json()
+    assert status_json["status"] == "completed"
+    assert status_json["progress"]["deep_research_runs"] == 1
+    assert status_json["progress"]["total_tool_calls"] == 0
+    audit_json = audit_response.json()
+    assert audit_json["attempts"][0]["source"] == "manual_upload"
+    assert audit_json["attempts"][0]["model"] == "chatgpt-deep-research-manual"
+    assert audit_json["attempts"][0]["response_id"] is None
+    assert audit_json["citations"][0]["source_type"] == "manual_upload_url_unverified"
+    assert audit_json["cost_events"] == [
+        event for event in audit_json["cost_events"] if event["step"] != "deep_research"
+    ]
+
+
+@pytest.mark.anyio
+async def test_manual_import_without_remote_review_enters_human_review(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure()
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "公開情報だけで調べてください。",
+                "report_text": "調査レポート本文",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        status_response = await client.get(f"/research-runs/{run_id}")
+
+    assert fake.submitted_prompts == []
+    assert fake.review_calls == 0
+    status_json = status_response.json()
+    assert status_json["status"] == "needs_human_review"
+    assert status_json["done_reason"] == "manual_import_remote_review_not_allowed"
+
+
+@pytest.mark.anyio
+async def test_manual_import_sensitive_content_never_calls_remote_llm(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure()
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "api_key を含む内容は外部に出さないでください。",
+                "report_text": "調査レポート本文",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "true",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        status_response = await client.get(f"/research-runs/{run_id}")
+
+    assert fake.submitted_prompts == []
+    assert fake.review_calls == 0
+    status_json = status_response.json()
+    assert status_json["status"] == "needs_human_review"
+    assert status_json["done_reason"] == "manual_import_sensitive_content"
+
+
+@pytest.mark.anyio
+async def test_manual_import_disables_api_reruns_when_not_allowed(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure(verdict=Verdict.NEEDS_TARGETED_RERUN)
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "公開情報だけで調べてください。",
+                "report_text": "追加調査が必要なレポート本文",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "false",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        status_response = await client.get(f"/research-runs/{run_id}")
+
+    assert fake.review_calls == 1
+    assert fake.submitted_prompts == []
+    status_json = status_response.json()
+    assert status_json["status"] == "needs_human_review"
+    assert status_json["progress"]["targeted_rerun_runs"] == 0
+
+
+@pytest.mark.anyio
+async def test_manual_import_allows_next_deep_research_attempt_when_reruns_allowed(
+    tmp_path: Path,
+) -> None:
+    fake = V2FakeAzure(verdict=Verdict.NEEDS_TARGETED_RERUN)
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "公開情報だけで調べてください。",
+                "report_text": "追加調査が必要なレポート本文",
+                "allow_remote_review": "true",
+                "allow_api_reruns": "true",
+            },
+        )
+        assert create_response.status_code == 202
+        run_id = create_response.json()["run_id"]
+        status_response = await client.get(f"/research-runs/{run_id}")
+        attempts_response = await client.get(f"/research-runs/{run_id}/attempts")
+
+    assert fake.review_calls == 1
+    assert len(fake.submitted_prompts) == 1
+    status_json = status_response.json()
+    assert status_json["status"] == "waiting_deep_research"
+    assert status_json["progress"]["deep_research_runs"] == 2
+    assert status_json["progress"]["targeted_rerun_runs"] == 1
+    attempts = attempts_response.json()
+    assert attempts[0]["source"] == "manual_upload"
+    assert attempts[1]["source"] == "api"
+    assert attempts[1]["run_no"] == 2
+
+
+@pytest.mark.anyio
+async def test_manual_import_validates_file_text_xor_and_options(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        both_prompt_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "report_text": "report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+            files={"input_prompt_file": ("prompt.txt", b"prompt", "text/plain")},
+        )
+        blank_text_and_file_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": " ",
+                "report_text": "report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+            files={"input_prompt_file": ("prompt.txt", b"prompt", "text/plain")},
+        )
+        missing_report_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+        )
+        blank_prompt_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": " \n\t ",
+                "report_text": "report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+        )
+        bad_ext_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "report_text": "report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+            files={"input_prompt_file": ("prompt.pdf", b"prompt", "application/pdf")},
+        )
+        non_utf_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+            files={"report_file": ("report.md", b"\xff\xfe", "text/markdown")},
+        )
+        oversize_file_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+            files={
+                "report_file": (
+                    "report.md",
+                    b"a" * (orchestrator.settings.research_manual_import_max_file_bytes + 1),
+                    "text/markdown",
+                )
+            },
+        )
+        prompt_limit_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "a" * 50001,
+                "report_text": "report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+        )
+        orchestrator.settings.research_manual_import_max_report_chars = 10
+        report_limit_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "report_text": "a" * 11,
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+            },
+        )
+        bad_options_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "report_text": "report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+                "options_json": "{not-json",
+            },
+        )
+
+    assert both_prompt_response.status_code == 422
+    assert blank_text_and_file_response.status_code == 422
+    assert missing_report_response.status_code == 422
+    assert blank_prompt_response.status_code == 422
+    assert bad_ext_response.status_code == 422
+    assert non_utf_response.status_code == 422
+    assert oversize_file_response.status_code == 422
+    assert prompt_limit_response.status_code == 422
+    assert report_limit_response.status_code == 422
+    assert bad_options_response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_manual_import_idempotency_replay_and_conflict(tmp_path: Path) -> None:
+    fake = V2FakeAzure()
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        first = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "report_text": "report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+                "idempotency_key": "same-key",
+            },
+        )
+        replay = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "report_text": "report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+                "idempotency_key": "same-key",
+            },
+        )
+        conflict = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "prompt",
+                "report_text": "different report",
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+                "idempotency_key": "same-key",
+            },
+        )
+
+    assert first.status_code == 202
+    assert replay.status_code == 202
+    assert first.json()["run_id"] == replay.json()["run_id"]
+    assert conflict.status_code == 409
+    assert fake.review_calls == 0
+
+
+def test_manual_import_idempotency_race_cleans_unused_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
+    metadata = {"input_prompt": {"source": "text"}, "report": {"source": "text"}}
+
+    first, dispatch_review = orchestrator.create_manual_import_run(
+        input_prompt="prompt",
+        report="report",
+        options=ResearchRunOptions(),
+        allow_remote_review=False,
+        allow_api_reruns=False,
+        idempotency_key="race-key",
+        metadata=metadata,
+    )
+    assert dispatch_review is False
+    assert (orchestrator.settings.research_artifact_dir / str(first.id)).is_dir()
+
+    def miss_manual_import_idempotency(_idempotency_key: str) -> None:
+        return None
+
+    monkeypatch.setattr(
+        orchestrator.repository,
+        "get_manual_import_idempotency",
+        miss_manual_import_idempotency,
+    )
+
+    replay, dispatch_review = orchestrator.create_manual_import_run(
+        input_prompt="prompt",
+        report="report",
+        options=ResearchRunOptions(),
+        allow_remote_review=False,
+        allow_api_reruns=False,
+        idempotency_key="race-key",
+        metadata=metadata,
+    )
+
+    assert replay.id == first.id
+    assert dispatch_review is False
+    artifact_dirs = sorted(
+        path.name
+        for path in orchestrator.settings.research_artifact_dir.iterdir()
+        if path.is_dir()
+    )
+    assert artifact_dirs == [str(first.id)]
+
+    with pytest.raises(ValueError, match="different request"):
+        orchestrator.create_manual_import_run(
+            input_prompt="prompt",
+            report="different report",
+            options=ResearchRunOptions(),
+            allow_remote_review=False,
+            allow_api_reruns=False,
+            idempotency_key="race-key",
+            metadata=metadata,
+        )
+
+    artifact_dirs = sorted(
+        path.name
+        for path in orchestrator.settings.research_artifact_dir.iterdir()
+        if path.is_dir()
+    )
+    assert artifact_dirs == [str(first.id)]
+
+
+def test_manual_import_artifact_failure_does_not_persist_idempotency(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
+    original_save_json = orchestrator.artifacts.save_json
+
+    def fail_save_json(*_args: Any, **_kwargs: Any) -> tuple[str, str]:
+        raise RuntimeError("artifact write failed")
+
+    orchestrator.artifacts.save_json = fail_save_json  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="artifact write failed"):
+        orchestrator.create_manual_import_run(
+            input_prompt="public prompt",
+            report="public report",
+            options=ResearchRunOptions(),
+            allow_remote_review=False,
+            allow_api_reruns=False,
+            idempotency_key="atomic-key",
+            metadata={"input_prompt": {"source": "text"}, "report": {"source": "text"}},
+        )
+
+    with orchestrator.repository.connect() as connection:
+        run_count = connection.execute("SELECT COUNT(*) AS count FROM research_runs").fetchone()
+        request_count = connection.execute(
+            "SELECT COUNT(*) AS count FROM manual_import_requests"
+        ).fetchone()
+    assert run_count["count"] == 0
+    assert request_count["count"] == 0
+
+    orchestrator.artifacts.save_json = original_save_json  # type: ignore[method-assign]
+    run, dispatch_review = orchestrator.create_manual_import_run(
+        input_prompt="public prompt",
+        report="public report",
+        options=ResearchRunOptions(),
+        allow_remote_review=False,
+        allow_api_reruns=False,
+        idempotency_key="atomic-key",
+        metadata={"input_prompt": {"source": "text"}, "report": {"source": "text"}},
+    )
+
+    assert dispatch_review is False
+    assert run.status == RunStatus.NEEDS_HUMAN_REVIEW
+
+
+@pytest.mark.anyio
+async def test_manual_import_metadata_omits_prompt_and_report_bodies(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+    prompt_body = "unique prompt body should not be in metadata"
+    report_body = "unique report body should not be in metadata"
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": prompt_body,
+                "report_text": report_body,
+                "allow_remote_review": "false",
+                "allow_api_reruns": "false",
+                "idempotency_key": "metadata-key",
+            },
+        )
+
+    assert create_response.status_code == 202
+    run_id = create_response.json()["run_id"]
+    attempt = orchestrator.repository.get_attempts(UUID(run_id))[0]
+    raw_metadata = json.loads(Path(attempt.raw_response_artifact_path or "").read_text())
+    with orchestrator.repository.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT request_metadata_json
+            FROM manual_import_requests
+            WHERE idempotency_key = ?
+            """,
+            ("metadata-key",),
+        ).fetchone()
+    idempotency_metadata = json.loads(row["request_metadata_json"])
+
+    assert prompt_body not in json.dumps(raw_metadata, ensure_ascii=False)
+    assert report_body not in json.dumps(raw_metadata, ensure_ascii=False)
+    assert prompt_body not in json.dumps(idempotency_metadata, ensure_ascii=False)
+    assert report_body not in json.dumps(idempotency_metadata, ensure_ascii=False)
+    assert raw_metadata["prompt_sha256"]
+    assert raw_metadata["report_sha256"]
+    assert idempotency_metadata["prompt_chars"] == len(prompt_body)
+    assert idempotency_metadata["report_chars"] == len(report_body)
+
+
+@pytest.mark.anyio
+async def test_manual_import_poller_resumes_pending_review(tmp_path: Path) -> None:
+    fake = V2FakeAzure()
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    run, dispatch_review = orchestrator.create_manual_import_run(
+        input_prompt="公開情報だけで調べてください。",
+        report="調査レポート本文",
+        options=ResearchRunOptions(),
+        allow_remote_review=True,
+        allow_api_reruns=False,
+        idempotency_key=None,
+        metadata={"input_prompt": {"source": "text"}, "report": {"source": "text"}},
+    )
+    poller = ResearchPoller(orchestrator=orchestrator, interval_seconds=60)
+
+    assert dispatch_review is True
+    assert run.status == RunStatus.REVIEWING
+    assert fake.review_calls == 0
+
+    await poller.tick()
+
+    updated = orchestrator.repository.get_run(run.id)
+    assert fake.review_calls == 1
+    assert updated.status == RunStatus.COMPLETED
+
+
+@pytest.mark.anyio
+async def test_manual_import_review_respects_citation_cap(tmp_path: Path) -> None:
+    class CitationRecordingAzure(V2FakeAzure):
+        def __init__(self) -> None:
+            super().__init__()
+            self.review_citation_counts: list[int] = []
+
+        def review_report(self, **kwargs: Any) -> tuple[ReviewResult, str, dict[str, object]]:
+            self.review_citation_counts.append(len(kwargs.get("citations") or []))
+            return super().review_report(**kwargs)
+
+    fake = CitationRecordingAzure()
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    orchestrator.settings.research_review_max_citations = 2
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+    report = "\n".join(f"[Source {index}](https://example.com/{index})" for index in range(5))
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs/manual-import",
+            data={
+                "input_prompt_text": "公開情報だけで調べてください。",
+                "report_text": report,
+                "allow_remote_review": "true",
+                "allow_api_reruns": "false",
+            },
+        )
+
+    assert create_response.status_code == 202
+    assert fake.review_citation_counts == [2]
+
+
+def test_research_attempt_source_column_is_added_to_legacy_sqlite(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy.sqlite3"
+    repository = ResearchRepository(db_path)
+    with repository.connect() as connection:
+        connection.executescript(
+            """
+            ALTER TABLE research_attempts RENAME TO research_attempts_current;
+            CREATE TABLE research_attempts (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
+                attempt_no INTEGER NOT NULL,
+                response_id TEXT,
+                model TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                output_text TEXT,
+                status TEXT NOT NULL,
+                error TEXT,
+                tool_calls TEXT NOT NULL DEFAULT '[]',
+                citations TEXT NOT NULL DEFAULT '[]',
+                raw_response_artifact_path TEXT,
+                created_at TEXT NOT NULL
+            );
+            DROP TABLE research_attempts_current;
+            """
+        )
+
+    reopened = ResearchRepository(db_path)
+    with reopened.connect() as connection:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(research_attempts)")
+        }
+
+    assert "source" in columns
 
 
 def test_review_missing_research_items_enters_human_review(tmp_path: Path) -> None:
