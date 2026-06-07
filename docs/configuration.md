@@ -16,8 +16,8 @@ Do not commit secrets. Values prefixed with `VITE_` are exposed to browser code.
 
 | Variable | Default | Used for |
 | --- | --- | --- |
-| `RESEARCH_DB_PATH` | `.data/research.sqlite3` | SQLite database for runs, objective contracts, research items, rerun plans, verification queries, reviews, citations, tool calls, cost events, human decisions, and history. |
-| `RESEARCH_ARTIFACT_DIR` | `.data/research-runs` | Local artifact root for prompts, raw Responses API JSON, and report markdown files. |
+| `RESEARCH_DB_PATH` | `.data/research.sqlite3` | SQLite database for runs, objective contracts, research items, rerun plans, verification queries, checkpoints, run lineage, reviews, citations, tool calls, cost events, human decisions, and history. |
+| `RESEARCH_ARTIFACT_DIR` | `.data/research-runs` | Local artifact root for prompts, raw Responses API JSON, report markdown files, and child-local source snapshots for checkpoint forks. |
 
 The repository and artifact store create parent directories as needed.
 
@@ -28,6 +28,7 @@ The repository and artifact store create parent directories as needed.
 | `RESEARCH_POLLER_ENABLED` | `true` | Starts `ResearchPoller` during FastAPI lifespan. |
 | `RESEARCH_POLLER_INTERVAL_SECONDS` | `5` | Delay between poller ticks. |
 | `RESEARCH_DEEP_RESEARCH_TIMEOUT_SECONDS` | `7200` | Marks waiting Deep Research runs as timed out after this many seconds. |
+| `RESEARCH_DEEP_RESEARCH_COLLECTING_STALE_SECONDS` | `60` | Requeues a stale local `collecting` claim after this many seconds so polling can recover after a worker interruption. |
 | `RESEARCH_REVIEW_TIMEOUT_SECONDS` | `180` | Bounds GPT-5.5 review calls and marks stale `reviewing` runs as `review_timeout`. |
 | `RESEARCH_REVIEW_MAX_REPORT_CHARS` | `50000` | Caps report text sent to the reviewer. Long reports are truncated with a marker. |
 | `RESEARCH_REVIEW_MAX_CITATIONS` | `40` | Caps citation metadata sent to the reviewer. |

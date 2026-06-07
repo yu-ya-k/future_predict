@@ -19,8 +19,16 @@ import type {
   HumanReviewResumeResponse,
   ObjectiveContract,
   ReportResponse,
+  ResearchCheckpoint,
+  ResearchCheckpointListResponse,
+  ResearchForkPreviewRequest,
+  ResearchForkPreviewResponse,
+  ResearchForkSubmitRequest,
+  ResearchForkSubmitResponse,
   ResearchAttempt,
   ResearchItem,
+  ResearchRunLineage,
+  ResearchRunLineageResponse,
   RerunPlan,
   ResearchRunStatusResponse,
   ToolCallSummary,
@@ -112,6 +120,70 @@ export function getToolCalls(runId: string, signal?: AbortSignal): Promise<ToolC
 
 export function getCostEvents(runId: string, signal?: AbortSignal): Promise<CostEvent[]> {
   return apiClient.request(`${BASE}/${runId}/cost-events`, { signal });
+}
+
+export async function getRunCheckpoints(
+  runId: string,
+  includeForks = true,
+  signal?: AbortSignal,
+): Promise<ResearchCheckpoint[]> {
+  const params = new URLSearchParams({ include_forks: String(includeForks) });
+  const response = await apiClient.request<ResearchCheckpointListResponse | ResearchCheckpoint[]>(
+    `${BASE}/${runId}/checkpoints?${params.toString()}`,
+    { signal },
+  );
+  if (Array.isArray(response)) return response;
+  if (response && Array.isArray(response.checkpoints)) return response.checkpoints;
+  return [];
+}
+
+export function getRunCheckpoint(
+  runId: string,
+  checkpointId: string,
+  signal?: AbortSignal,
+): Promise<ResearchCheckpoint> {
+  return apiClient.request(
+    `${BASE}/${runId}/checkpoints/${encodeURIComponent(checkpointId)}`,
+    { signal },
+  );
+}
+
+export function previewCheckpointFork(
+  runId: string,
+  checkpointId: string,
+  request: ResearchForkPreviewRequest,
+  signal?: AbortSignal,
+): Promise<ResearchForkPreviewResponse> {
+  return apiClient.request(
+    `${BASE}/${runId}/checkpoints/${encodeURIComponent(checkpointId)}/fork-preview`,
+    { method: "POST", body: request, signal },
+  );
+}
+
+export function createCheckpointFork(
+  runId: string,
+  checkpointId: string,
+  request: ResearchForkSubmitRequest,
+  signal?: AbortSignal,
+): Promise<ResearchForkSubmitResponse> {
+  return apiClient.request(
+    `${BASE}/${runId}/checkpoints/${encodeURIComponent(checkpointId)}/forks`,
+    { method: "POST", body: request, signal },
+  );
+}
+
+export async function getRunLineage(
+  runId: string,
+  signal?: AbortSignal,
+): Promise<ResearchRunLineage | null> {
+  const response = await apiClient.request<ResearchRunLineageResponse | ResearchRunLineage | null>(
+    `${BASE}/${runId}/lineage`,
+    { signal },
+  );
+  if (!response) return null;
+  if ("lineage" in response) return response.lineage;
+  if ("parent_run_id" in response) return response;
+  return null;
 }
 
 export function getHumanReviewPayload(

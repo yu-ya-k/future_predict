@@ -52,6 +52,54 @@ curl -sS http://127.0.0.1:8000/research-runs/{run_id}/human-review
 The payload includes the latest report, latest review, unresolved ResearchItems,
 allowed actions, warnings, and audit summary.
 
+## Checkpoint Forks
+
+List saved checkpoints for a run:
+
+```sh
+curl -sS 'http://127.0.0.1:8000/research-runs/{run_id}/checkpoints?include_forks=true'
+```
+
+Fetch the checkpoint detail before deciding to fork:
+
+```sh
+curl -sS http://127.0.0.1:8000/research-runs/{run_id}/checkpoints/{checkpoint_id}
+```
+
+Create a preview. Operators should inspect the composed prompt, source excerpts,
+warnings, and query-policy status before submitting:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8000/research-runs/{run_id}/checkpoints/{checkpoint_id}/fork-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"additional_prompt":"Re-check this branch with the latest 2026 sources."}'
+```
+
+Submit with the returned `preview_hash` and a stable `idempotency_key`:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8000/research-runs/{run_id}/checkpoints/{checkpoint_id}/forks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "additional_prompt": "Re-check this branch with the latest 2026 sources.",
+    "idempotency_key": "operator-ticket-1234",
+    "confirmed_preview_hash": "sha256:..."
+  }'
+```
+
+Forks are cost and execution boundaries. A fork creates an independent child
+run; the parent report, audit, counters, cost, and progress are unchanged. The
+child starts with zero counters and records only new child execution. If query
+policy blocks the fork prompt, no remote Deep Research call is made; the child
+is created in human review with
+`done_reason=fork_deep_research_blocked_by_query_policy`.
+
+Inspect lineage from the child:
+
+```sh
+curl -sS http://127.0.0.1:8000/research-runs/{child_run_id}/lineage
+```
+
 ## Resume Decisions
 
 Approve the current report:
@@ -182,7 +230,9 @@ By default:
 - Artifacts: `.data/research-runs`
 
 Artifacts include prompts, rerun briefs, raw response JSON, report attempts,
-LLM patches, and final reports.
+LLM patches, final reports, and child-local source snapshots for checkpoint
+forks. SQLite stores checkpoint rows and denormalized child lineage so lineage
+remains available from the child after parent deletion.
 
 ## Failure Checklist
 
@@ -192,5 +242,7 @@ LLM patches, and final reports.
 - Confirm live service credentials separately with the opt-in live tests before
   relying on them operationally.
 - Review `/audit` history before inspecting SQLite directly.
+- For fork issues, compare the latest preview hash with the submit payload and
+  check `/lineage` from the child run.
 - Check artifact files when raw Responses API payloads or saved prompts are
   needed for debugging.

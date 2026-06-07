@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     research_poller_enabled: bool = True
     research_poller_interval_seconds: float = 5.0
     research_deep_research_timeout_seconds: int = 7200
+    research_deep_research_collecting_stale_seconds: int = 60
     research_review_timeout_seconds: int = 180
     research_review_max_report_chars: int = 50000
     research_review_max_citations: int = 40

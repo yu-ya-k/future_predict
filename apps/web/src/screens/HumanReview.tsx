@@ -8,6 +8,7 @@
  *  - Any action not in payload.allowed_actions → disabled.
  *  - request_targeted_rerun shows a warning when audit_summary.no_progress_count >= 2
  *    so reviewers see the item-loop context before resuming.
+ *  - request_full_rerun is used for empty-report recovery and full replacement.
  *  - 409 conflict → show detail + refetch payload.
  */
 
@@ -157,6 +158,7 @@ export function HumanReview({ runId }: HumanReviewProps) {
 
   const noProgressWarn =
     audit_summary.no_progress_count >= NO_PROGRESS_WARN_THRESHOLD;
+  const latestReportIsEmpty = payload.latest_report.trim().length === 0;
 
   const isAllowed = (action: HumanReviewAction) => allowed_actions.includes(action);
   const canRetryReview = isAllowed("request_review");
@@ -164,6 +166,18 @@ export function HumanReview({ runId }: HumanReviewProps) {
   const targetedRerunGuardMessage = noProgressWarn
     ? `改善停滞が${audit_summary.no_progress_count}回続いています。同じitemへの再実行効果は限定的かもしれません。`
     : undefined;
+  const fullRerunButton = (
+    <DecisionButton
+      action="request_full_rerun"
+      label="全体再実行"
+      consequence="Deep Researchを最初から再実行"
+      tone="warning"
+      costHint="追加コスト発生予定"
+      disabled={!isAllowed("request_full_rerun") || submitting}
+      block
+      onClick={() => void handleDecision("request_full_rerun")}
+    />
+  );
 
   return (
     <div className="screen-review">
@@ -375,6 +389,7 @@ export function HumanReview({ runId }: HumanReviewProps) {
       <section className="review-decisions" aria-labelledby="decision-heading">
         <h2 id="decision-heading" className="section-title">判断を選択してください</h2>
         <div className="decision-buttons">
+          {latestReportIsEmpty && fullRerunButton}
           <DecisionButton
             action="approve"
             label="承認"
@@ -433,6 +448,7 @@ export function HumanReview({ runId }: HumanReviewProps) {
             block
             onClick={() => void handleDecision("request_targeted_rerun")}
           />
+          {!latestReportIsEmpty && fullRerunButton}
           <DecisionButton
             action="request_item_revision"
             label="Item revision"

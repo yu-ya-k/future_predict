@@ -268,6 +268,94 @@ The audit response contains:
 - `human_decisions`
 - `history`
 
+## Checkpoints And Forks
+
+Checkpoint endpoints expose persisted phase-boundary snapshots. They use
+`research_checkpoints` as the source of truth; older runs without checkpoint
+rows do not infer checkpoints from audit history.
+
+List checkpoints for a run:
+
+```sh
+curl -sS 'http://127.0.0.1:8000/research-runs/{run_id}/checkpoints?include_forks=true'
+```
+
+Response shape:
+
+```json
+{
+  "run_id": "00000000-0000-0000-0000-000000000000",
+  "checkpoints": [
+    {
+      "checkpoint_id": "cp_001",
+      "run_id": "00000000-0000-0000-0000-000000000000",
+      "checkpoint_no": 1,
+      "kind": "deep_research_collected",
+      "node_anchor": "deep_research_attempt_1",
+      "forkable": true,
+      "source_attempt_no": 1,
+      "source_review_no": null,
+      "source_response_id": "resp_deep_1",
+      "report_hash": "sha256:...",
+      "created_at": "2026-06-06T04:45:00Z",
+      "forks": []
+    }
+  ]
+}
+```
+
+Fetch one checkpoint, including its saved snapshot:
+
+```sh
+curl -sS http://127.0.0.1:8000/research-runs/{run_id}/checkpoints/{checkpoint_id}
+```
+
+Previewing is required before creating a fork:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8000/research-runs/{run_id}/checkpoints/{checkpoint_id}/fork-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"additional_prompt":"Re-run from this point with 2026 assumptions."}'
+```
+
+The preview returns the composed prompt, query-policy decision, source prompt
+and report excerpts, warnings, and `preview_hash`. Submit must include the same
+additional prompt, a caller-generated `idempotency_key`, and the confirmed
+preview hash:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8000/research-runs/{run_id}/checkpoints/{checkpoint_id}/forks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "additional_prompt": "Re-run from this point with 2026 assumptions.",
+    "idempotency_key": "client-generated-key",
+    "confirmed_preview_hash": "sha256:..."
+  }'
+```
+
+If the preview hash no longer matches, submit returns `409`. A non-forkable
+checkpoint also returns `409`. Repeating the same submit with the same
+`idempotency_key` returns the same child run and must not submit a second remote
+Deep Research request.
+
+A forked run is independent of the parent. The child copies the contract,
+research items, source prompt, and source report snapshot into child-local state
+and artifacts. Child counters, cost events, and tool-call counts start at zero
+and include only child execution; the source snapshot is not counted as a child
+Deep Research attempt. The parent is not modified by previewing or submitting a
+fork.
+
+If query policy blocks the fork prompt, submit still creates or returns an
+auditable child run in `needs_human_review` with
+`done_reason=fork_deep_research_blocked_by_query_policy`; no remote Deep
+Research request is made.
+
+Lineage is readable from the child even if the parent is later deleted:
+
+```sh
+curl -sS http://127.0.0.1:8000/research-runs/{child_run_id}/lineage
+```
+
 ## Human Review Queue
 
 ```sh
@@ -395,6 +483,9 @@ endpoints return `404`.
 - `GET /research-runs/{run_id}/tool-calls`
 - `GET /research-runs/{run_id}/cost-events`
 - `GET /research-runs/{run_id}/human-decisions`
+- `GET /research-runs/{run_id}/checkpoints`
+- `GET /research-runs/{run_id}/checkpoints/{checkpoint_id}`
+- `GET /research-runs/{run_id}/lineage`
 
 ## Public Interface Summary
 
@@ -411,3 +502,8 @@ endpoints return `404`.
 - `POST /research-runs/{run_id}/resume`
 - `POST /research-runs/{run_id}/cancel`
 - `DELETE /research-runs/{run_id}`
+- `GET /research-runs/{run_id}/checkpoints`
+- `GET /research-runs/{run_id}/checkpoints/{checkpoint_id}`
+- `POST /research-runs/{run_id}/checkpoints/{checkpoint_id}/fork-preview`
+- `POST /research-runs/{run_id}/checkpoints/{checkpoint_id}/forks`
+- `GET /research-runs/{run_id}/lineage`

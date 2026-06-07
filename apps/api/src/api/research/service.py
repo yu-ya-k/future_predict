@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -37,11 +39,17 @@ from api.research.nodes import build_objective_contract
 from api.research.progress import compute_no_progress_count, report_hash
 from api.research.query_policy import contains_sensitive_terms, query_policy_gate
 from api.research.repository import ResearchRepository
-from api.research.routing import MIN_REVIEWER_CONFIDENCE_FOR_AUTO_FINALIZE, route_after_review
+from api.research.routing import (
+    MIN_REVIEWER_CONFIDENCE_FOR_AUTO_FINALIZE,
+    RouteState,
+    route_after_review_decision,
+)
 from api.research.schemas import (
     CostEvent,
     CreateResearchRunRequest,
     FailureMode,
+    ForkPreviewResponse,
+    ForkSubmitResponse,
     HumanReviewAction,
     HumanReviewAuditSummary,
     HumanReviewPayload,
@@ -52,7 +60,9 @@ from api.research.schemas import (
     RecommendedAction,
     RerunPlan,
     ResearchAttempt,
+    ResearchCheckpoint,
     ResearchItem,
+    ResearchRunLineage,
     ResearchRunRecord,
     ReviewRecord,
     RunStatus,
@@ -125,6 +135,18 @@ class ResearchOrchestrator:
                 },
             )
             run = self.repository.update_run(run.id, optimized_prompt=optimized_prompt)
+            self._save_checkpoint(
+                run,
+                kind="research_brief_created",
+                node_anchor="brief",
+                report_override="",
+                snapshot_extra={
+                    "artifact_path": prompt_path,
+                    "contract_id": contract.contract_id,
+                    "research_item_ids": [item.item_id for item in research_items],
+                },
+                forkable=False,
+            )
         else:
             optimized_prompt = run.optimized_prompt or run.user_prompt
             plan = self._build_rerun_plan(
@@ -251,7 +273,10 @@ class ResearchOrchestrator:
             return run
 
         if run.status == RunStatus.WAITING_DEEP_RESEARCH:
-            claimed = self.repository.claim_deep_research_run(run.id)
+            claimed = self.repository.claim_deep_research_run(
+                run.id,
+                lease_seconds=self.settings.research_deep_research_timeout_seconds,
+            )
             if claimed is None:
                 return self.repository.get_run(run.id)
             run = claimed
@@ -293,6 +318,9 @@ class ResearchOrchestrator:
                 {RunStatus.COLLECTING},
                 status=RunStatus.WAITING_DEEP_RESEARCH,
                 deep_research_status="retrieve_retryable_error",
+                review_claim_token=None,
+                review_claim_operation=None,
+                review_claim_expires_at=None,
             )
             return retried or self.repository.get_run(run.id)
 
@@ -318,6 +346,9 @@ class ResearchOrchestrator:
                 {RunStatus.COLLECTING},
                 status=RunStatus.WAITING_DEEP_RESEARCH,
                 deep_research_status=response_status,
+                review_claim_token=None,
+                review_claim_operation=None,
+                review_claim_expires_at=None,
             )
             return waiting or self.repository.get_run(run.id)
 
@@ -379,9 +410,15 @@ class ResearchOrchestrator:
 
         report = get_response_output_text(response)
         latest_plan = _latest_rerun_plan(self.repository.get_rerun_plans(run.id))
+        lineage = self.repository.get_lineage(run.id)
+        should_merge_seed_report = (
+            lineage is not None
+            and run.deep_research_runs == 1
+            and bool((run.report or "").strip())
+        )
         merge_error: str | None = None
         merged_report = report
-        if run.deep_research_runs > 1 and (
+        if should_merge_seed_report or run.deep_research_runs > 1 and (
             latest_plan is None or latest_plan.scope != "full_rerun"
         ):
             try:
@@ -456,6 +493,19 @@ class ResearchOrchestrator:
                 "report_path": report_path,
             },
         )
+        self._save_checkpoint(
+            run,
+            kind="deep_research_collected",
+            node_anchor=f"deep_research:{run.deep_research_runs}",
+            source_attempt_no=run.deep_research_runs,
+            source_response_id=response_id,
+            report_override=merged_report,
+            snapshot_extra={
+                "report_path": report_path,
+                "citations_count": len(citations),
+                "tool_calls_count": len(tool_calls),
+            },
+        )
         updated = self.repository.update_run_if_status(
             run.id,
             {RunStatus.COLLECTING},
@@ -464,6 +514,9 @@ class ResearchOrchestrator:
             deep_research_status=response_status,
             total_tool_calls=run.total_tool_calls + tool_call_delta,
             estimated_cost_usd=run.estimated_cost_usd + cost_delta,
+            review_claim_token=None,
+            review_claim_operation=None,
+            review_claim_expires_at=None,
         )
         if updated is None:
             self.repository.append_history_event(
@@ -673,31 +726,48 @@ class ResearchOrchestrator:
             review=review,
             model=self.azure.reviewer_deployment,
         )
-
-        route = route_after_review(
-            {
-                "review": review.model_dump(),
-                "total_reviews": run.total_reviews + 1,
-                "targeted_rerun_runs": run.targeted_rerun_runs,
-                "full_rerun_runs": run.full_rerun_runs,
-                "llm_patch_runs": run.llm_patch_runs,
-                "verification_runs": run.verification_runs,
-                "no_progress_count": no_progress_count,
-                "max_total_iterations": run.max_total_iterations,
-                "max_targeted_rerun_runs": run.max_targeted_rerun_runs,
-                "max_full_rerun_runs": run.max_full_rerun_runs,
-                "max_llm_patch_runs": run.max_llm_patch_runs,
-                "max_verification_runs": run.max_verification_runs,
-                "total_tool_calls": next_total_tool_calls,
-                "max_total_tool_calls": run.max_total_tool_calls,
-            }
+        self._save_checkpoint(
+            run,
+            kind="review_recorded",
+            node_anchor=f"review:{review.review_no}",
+            source_attempt_no=run.deep_research_runs,
+            source_review_no=review.review_no,
+            source_response_id=response_id,
+            snapshot_extra={
+                "review": review.model_dump(mode="json"),
+                "review_response_id": response_id,
+            },
         )
+
+        route_state: RouteState = {
+            "review": review.model_dump(),
+            "total_reviews": run.total_reviews + 1,
+            "targeted_rerun_runs": run.targeted_rerun_runs,
+            "full_rerun_runs": run.full_rerun_runs,
+            "llm_patch_runs": run.llm_patch_runs,
+            "verification_runs": run.verification_runs,
+            "no_progress_count": no_progress_count,
+            "max_total_iterations": run.max_total_iterations,
+            "max_targeted_rerun_runs": run.max_targeted_rerun_runs,
+            "max_full_rerun_runs": run.max_full_rerun_runs,
+            "max_llm_patch_runs": run.max_llm_patch_runs,
+            "max_verification_runs": run.max_verification_runs,
+            "total_tool_calls": next_total_tool_calls,
+            "max_total_tool_calls": run.max_total_tool_calls,
+        }
+        route_decision = route_after_review_decision(route_state)
+        route = route_decision["selected_route"]
 
         self.repository.append_history_event(
             run.id,
             {
                 "step": "route_after_review",
                 "route": route,
+                "candidate_route": route_decision["candidate_route"],
+                "selected_route": route,
+                "blocked_reason": route_decision["blocked_reason"],
+                "dominant_actions": route_decision["dominant_actions"],
+                "budget_snapshot": _route_budget_snapshot(route_state),
                 "verdict": review.verdict.value,
                 "total_reviews": run.total_reviews + 1,
                 "no_progress_count": no_progress_count,
@@ -718,6 +788,16 @@ class ResearchOrchestrator:
             self.repository.append_history_event(
                 run.id,
                 {"step": "finalized", "final_report_path": final_path},
+            )
+            self._save_checkpoint(
+                run,
+                kind="finalized",
+                node_anchor="finalized",
+                source_attempt_no=run.deep_research_runs,
+                source_review_no=review.review_no,
+                source_response_id=response_id,
+                report_override=final_report,
+                snapshot_extra={"final_report_path": final_path},
             )
             completed = self.repository.update_run_if_status(
                 run.id,
@@ -741,9 +821,15 @@ class ResearchOrchestrator:
             return completed
 
         if route == "human_review":
+            done_reason = (
+                route_decision["blocked_reason"]
+                if route_decision["candidate_route"] != "human_review"
+                and route_decision["blocked_reason"] is not None
+                else _human_review_route_reason(review)
+            )
             return self._enter_human_review(
                 run.id,
-                done_reason=_human_review_route_reason(review),
+                done_reason=done_reason,
                 allowed_statuses={RunStatus.REVIEWING},
                 total_reviews=run.total_reviews + 1,
                 no_progress_count=no_progress_count,
@@ -971,6 +1057,19 @@ class ResearchOrchestrator:
                 "report_path": report_path,
             },
         )
+        self._save_checkpoint(
+            run,
+            kind="llm_patch_applied",
+            node_anchor=f"llm_patch:{run_no}",
+            source_attempt_no=run.deep_research_runs,
+            source_review_no=latest_review.review_no,
+            source_response_id=response_id,
+            report_override=revised_report,
+            snapshot_extra={
+                "llm_patch_run_no": run_no,
+                "report_path": report_path,
+            },
+        )
         updated = self.repository.update_run_if_status(
             run.id,
             {RunStatus.REVIEWING},
@@ -1042,6 +1141,320 @@ class ResearchOrchestrator:
         if not cost_events:
             return fallback
         return sum(event.estimated_cost_usd for event in cost_events)
+
+    def build_fork_preview(
+        self,
+        run_id: UUID,
+        checkpoint_id: UUID,
+        *,
+        additional_prompt: str,
+    ) -> ForkPreviewResponse:
+        self.repository.get_run(run_id)
+        checkpoint = self.repository.get_checkpoint(
+            run_id,
+            checkpoint_id,
+            include_forks=True,
+        )
+        if not checkpoint.forkable:
+            raise ValueError("Checkpoint is not forkable.")
+
+        source_prompt = _checkpoint_source_prompt(checkpoint)
+        source_report = _checkpoint_source_report(checkpoint)
+        composed_prompt = _build_fork_deep_research_prompt(
+            checkpoint=checkpoint,
+            source_prompt=source_prompt,
+            source_report=source_report,
+            additional_prompt=additional_prompt,
+        )
+        query_policy = _deep_research_query_policy_decision(composed_prompt)
+        warnings: list[str] = []
+        if query_policy.status != "allowed":
+            warnings.append(
+                query_policy.blocked_reason or "Fork prompt was blocked by query policy."
+            )
+        if not source_report.strip():
+            warnings.append("Source checkpoint has no report snapshot.")
+        preview_hash = _fork_preview_hash(
+            checkpoint_id=checkpoint.checkpoint_id,
+            additional_prompt=additional_prompt,
+            composed_prompt=composed_prompt,
+            query_policy=query_policy,
+        )
+        return ForkPreviewResponse(
+            run_id=run_id,
+            checkpoint_id=checkpoint.checkpoint_id,
+            composed_prompt=composed_prompt,
+            query_policy=query_policy,
+            policy_decision=query_policy,
+            source_prompt_excerpt=_excerpt(source_prompt),
+            source_report_excerpt=_excerpt(source_report),
+            warnings=warnings,
+            preview_hash=preview_hash,
+        )
+
+    def fork_from_checkpoint(
+        self,
+        run_id: UUID,
+        checkpoint_id: UUID,
+        *,
+        additional_prompt: str,
+        idempotency_key: str,
+        confirmed_preview_hash: str,
+    ) -> ForkSubmitResponse:
+        parent = self.repository.get_run(run_id)
+        checkpoint = self.repository.get_checkpoint(run_id, checkpoint_id, include_forks=True)
+        if not checkpoint.forkable:
+            raise ValueError("Checkpoint is not forkable.")
+
+        existing = self.repository.get_lineage_by_fork_request(
+            parent_run_id=parent.id,
+            checkpoint_id=checkpoint.checkpoint_id,
+            idempotency_key=idempotency_key,
+        )
+        if existing is not None:
+            _validate_existing_fork_lineage(
+                existing,
+                additional_prompt=additional_prompt,
+                confirmed_preview_hash=confirmed_preview_hash,
+            )
+            child = self.repository.get_run(existing.run_id)
+            return _fork_submit_response(child, existing)
+
+        preview = self.build_fork_preview(
+            parent.id,
+            checkpoint.checkpoint_id,
+            additional_prompt=additional_prompt,
+        )
+        if preview.preview_hash != confirmed_preview_hash:
+            raise RuntimeError("Fork preview hash does not match the current preview.")
+
+        source_report = _checkpoint_source_report(checkpoint)
+        root_run_id = self._root_run_id(parent.id)
+        child, lineage, created = self.repository.create_fork_run(
+            parent=parent,
+            root_run_id=root_run_id,
+            checkpoint=checkpoint,
+            additional_prompt=additional_prompt,
+            confirmed_preview_hash=confirmed_preview_hash,
+            idempotency_key=idempotency_key,
+            source_snapshot_json=checkpoint.snapshot_json,
+            source_report_artifact_path=None,
+            seed_report=source_report,
+        )
+        if not created:
+            _validate_existing_fork_lineage(
+                lineage,
+                additional_prompt=additional_prompt,
+                confirmed_preview_hash=confirmed_preview_hash,
+            )
+            return _fork_submit_response(child, lineage)
+
+        try:
+            source_report_artifact_path, _ = self.artifacts.save_text(
+                child.id,
+                "reports/fork_source_report.md",
+                source_report,
+            )
+            self.artifacts.save_text(
+                child.id,
+                "prompts/fork_source_prompt.txt",
+                _checkpoint_source_prompt(checkpoint),
+            )
+            lineage = self.repository.update_lineage_source_report_artifact_path(
+                child.id,
+                source_report_artifact_path,
+            )
+
+            contract = self.repository.get_objective_contract(parent.id)
+            if contract is not None:
+                self.repository.save_objective_contract(child.id, contract)
+            research_items = self.repository.get_research_items(parent.id)
+            if research_items:
+                self.repository.upsert_research_items(child.id, research_items)
+        except Exception as error:
+            failed = self._mark_fork_initialization_failed(
+                child,
+                prompt=preview.composed_prompt,
+                error=error,
+            )
+            lineage = self.repository.get_lineage(child.id) or lineage
+            return _fork_submit_response(failed, lineage)
+
+        if preview.query_policy.status != "allowed":
+            blocked = self._enter_human_review(
+                child.id,
+                done_reason="fork_deep_research_blocked_by_query_policy",
+            )
+            lineage = self.repository.get_lineage(child.id) or lineage
+            return _fork_submit_response(blocked, lineage)
+
+        submitted = self._submit_fork_deep_research(
+            child.id,
+            prompt=preview.composed_prompt,
+        )
+        lineage = self.repository.get_lineage(child.id) or lineage
+        return _fork_submit_response(submitted, lineage)
+
+    def _root_run_id(self, run_id: UUID) -> UUID:
+        lineage = self.repository.get_lineage(run_id)
+        return lineage.root_run_id if lineage is not None else run_id
+
+    def _submit_fork_deep_research(
+        self,
+        run_id: UUID,
+        *,
+        prompt: str,
+    ) -> ResearchRunRecord:
+        run = self.repository.get_run(run_id)
+        run_no = run.deep_research_runs + 1
+        remaining_tool_calls = run.max_total_tool_calls - run.total_tool_calls
+        if remaining_tool_calls <= 0:
+            return self._enter_human_review(
+                run.id,
+                done_reason="max_total_tool_calls_reached_before_deep_research_submit",
+            )
+        try:
+            response = self.azure.submit_deep_research(
+                prompt=prompt,
+                max_tool_calls=min(
+                    remaining_tool_calls,
+                    self.settings.default_max_total_tool_calls,
+                ),
+            )
+            raw_path, _ = self.artifacts.save_json(
+                run.id,
+                f"raw-responses/fork_deep_research_submit_{run_no:03d}.json",
+                response_to_jsonable(response),
+            )
+            response_id = get_response_id(response)
+            response_status = get_response_status(response) or "queued"
+            self.repository.add_attempt(
+                run.id,
+                ResearchAttempt(
+                    run_no=run_no,
+                    response_id=response_id,
+                    status=response_status,
+                    model=self.azure.deep_research_deployment,
+                    prompt=prompt,
+                    raw_response_artifact_path=raw_path,
+                ),
+            )
+            updated = self.repository.update_run_if_status(
+                run.id,
+                {RunStatus.QUEUED, RunStatus.REVIEWING, RunStatus.SUBMITTED},
+                optimized_prompt=prompt,
+                status=RunStatus.WAITING_DEEP_RESEARCH,
+                needs_human_review=False,
+                pending_deep_research_response_id=response_id,
+                deep_research_status=response_status,
+                deep_research_runs=run_no,
+                done_reason=None,
+            )
+            if updated is None:
+                self._cancel_submitted_response_after_status_change(run.id, response_id)
+                return self.repository.get_run(run.id)
+            return updated
+        except Exception as error:
+            self.repository.add_attempt(
+                run.id,
+                ResearchAttempt(
+                    run_no=run_no,
+                    response_id=None,
+                    status="failed_to_submit",
+                    model=self.azure.deep_research_deployment,
+                    prompt=prompt,
+                    error=repr(error),
+                ),
+            )
+            return self._enter_human_review(
+                run.id,
+                done_reason="fork_deep_research_submit_failed",
+                deep_research_runs=run_no,
+            )
+
+    def _mark_fork_initialization_failed(
+        self,
+        child: ResearchRunRecord,
+        *,
+        prompt: str,
+        error: Exception,
+    ) -> ResearchRunRecord:
+        run_no = child.deep_research_runs + 1
+        self.repository.add_attempt(
+            child.id,
+            ResearchAttempt(
+                run_no=run_no,
+                response_id=None,
+                status="failed_to_initialize",
+                model=self.azure.deep_research_deployment,
+                prompt=prompt,
+                error=repr(error),
+            ),
+        )
+        self.repository.append_history_event(
+            child.id,
+            {
+                "step": "fork_initialization_failed",
+                "run_no": run_no,
+                "error": repr(error),
+            },
+        )
+        return self._enter_human_review(
+            child.id,
+            done_reason="fork_deep_research_initialization_failed",
+            deep_research_runs=run_no,
+        )
+
+    def _save_checkpoint(
+        self,
+        run: ResearchRunRecord,
+        *,
+        kind: str,
+        node_anchor: str,
+        source_attempt_no: int | None = None,
+        source_review_no: int | None = None,
+        source_response_id: str | None = None,
+        report_override: str | None = None,
+        snapshot_extra: dict[str, Any] | None = None,
+        forkable: bool = True,
+    ) -> ResearchCheckpoint:
+        source_prompt = run.optimized_prompt or run.user_prompt
+        source_report = report_override if report_override is not None else (
+            run.final_report or run.report or ""
+        )
+        checkpoint_report_hash = report_hash(source_report) if source_report else None
+        dedupe_parts = [
+            kind,
+            str(source_attempt_no or ""),
+            str(source_review_no or ""),
+            source_response_id or "",
+            checkpoint_report_hash or "",
+        ]
+        snapshot = {
+            "kind": kind,
+            "status": run.status.value,
+            "source_prompt": source_prompt,
+            "source_report": source_report,
+            "source_report_excerpt": _excerpt(source_report),
+            "source_prompt_excerpt": _excerpt(source_prompt),
+            "source_attempt_no": source_attempt_no,
+            "source_review_no": source_review_no,
+            "source_response_id": source_response_id,
+        }
+        if snapshot_extra:
+            snapshot.update(snapshot_extra)
+        return self.repository.add_checkpoint(
+            run.id,
+            kind=kind,
+            node_anchor=node_anchor,
+            forkable=forkable and bool(source_report.strip()),
+            dedupe_key=":".join(dedupe_parts),
+            source_attempt_no=source_attempt_no,
+            source_review_no=source_review_no,
+            source_response_id=source_response_id,
+            checkpoint_report_hash=checkpoint_report_hash,
+            snapshot_json=snapshot,
+        )
 
     def verify_items(
         self,
@@ -1196,6 +1609,19 @@ class ResearchOrchestrator:
                 "tool_calls_count": len(verification_tool_calls),
             },
         )
+        self._save_checkpoint(
+            updated,
+            kind="verification_completed",
+            node_anchor=f"verification:{run_no}",
+            source_attempt_no=updated.deep_research_runs,
+            source_review_no=latest_review.review_no if latest_review else None,
+            source_response_id=response_id,
+            report_override=patched_report,
+            snapshot_extra={
+                "verification_run_no": run_no,
+                "target_item_ids": target_items,
+            },
+        )
         return self.review_run(updated.id, _review_claim_token=_review_claim_token)
 
     def _finalize_with_limitation(self, run_id: UUID) -> ResearchRunRecord:
@@ -1246,6 +1672,18 @@ class ResearchOrchestrator:
             run.id,
             {
                 "step": "finalized_with_limitation",
+                "final_report_path": final_path,
+                "unresolved_item_ids": [item.item_id for item in unresolved],
+            },
+        )
+        self._save_checkpoint(
+            run,
+            kind="finalized",
+            node_anchor="finalized_with_limitation",
+            source_attempt_no=run.deep_research_runs,
+            source_review_no=run.total_reviews or None,
+            report_override=final_report,
+            snapshot_extra={
                 "final_report_path": final_path,
                 "unresolved_item_ids": [item.item_id for item in unresolved],
             },
@@ -1318,6 +1756,15 @@ class ResearchOrchestrator:
                 run.id,
                 {"step": "finalized_by_human", "final_report_path": final_path},
             )
+            self._save_checkpoint(
+                run,
+                kind="finalized",
+                node_anchor="finalized_by_human",
+                source_attempt_no=run.deep_research_runs,
+                source_review_no=run.total_reviews or None,
+                report_override=run.report,
+                snapshot_extra={"final_report_path": final_path},
+            )
             completed = self.repository.update_run_if_status(
                 run.id,
                 {RunStatus.REVIEWING},
@@ -1353,6 +1800,13 @@ class ResearchOrchestrator:
         if request.action == HumanReviewAction.REQUEST_TARGETED_RERUN:
             return self.submit_deep_research(run.id, human_comment=request.comment)
 
+        if request.action == HumanReviewAction.REQUEST_FULL_RERUN:
+            return self.submit_deep_research(
+                run.id,
+                human_comment=request.comment,
+                scope="full_rerun",
+            )
+
         if request.action == HumanReviewAction.REQUEST_VERIFICATION:
             return self.verify_items(run.id)
 
@@ -1383,7 +1837,10 @@ class ResearchOrchestrator:
             return run
 
         if run.status == RunStatus.WAITING_DEEP_RESEARCH:
-            claimed = self.repository.claim_deep_research_run(run.id)
+            claimed = self.repository.claim_deep_research_run(
+                run.id,
+                lease_seconds=self.settings.research_deep_research_timeout_seconds,
+            )
             if claimed is None:
                 return self.repository.get_run(run.id)
             run = claimed
@@ -1770,6 +2227,22 @@ class ResearchOrchestrator:
                 "audit_summary": self._human_review_audit_summary(updated).model_dump(),
             },
         )
+        self._save_checkpoint(
+            updated,
+            kind="human_review_required",
+            node_anchor=(
+                f"human_review:{latest_review.review_no}"
+                if latest_review
+                else "human_review"
+            ),
+            source_attempt_no=updated.deep_research_runs or None,
+            source_review_no=latest_review.review_no if latest_review else None,
+            source_response_id=updated.pending_deep_research_response_id,
+            snapshot_extra={
+                "reason": done_reason,
+                "audit_summary": self._human_review_audit_summary(updated).model_dump(),
+            },
+        )
         return updated
 
     def _human_review_audit_summary(
@@ -2100,6 +2573,103 @@ def _deep_research_query_policy_decision(prompt: str) -> QueryPolicyDecision:
     )
 
 
+def _checkpoint_source_prompt(checkpoint: ResearchCheckpoint) -> str:
+    value = checkpoint.snapshot_json.get("source_prompt")
+    return value if isinstance(value, str) else ""
+
+
+def _checkpoint_source_report(checkpoint: ResearchCheckpoint) -> str:
+    value = checkpoint.snapshot_json.get("source_report")
+    return value if isinstance(value, str) else ""
+
+
+def _excerpt(text: str, *, limit: int = 1200) -> str:
+    normalized = text.strip()
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[:limit].rstrip()}\n..."
+
+
+def _build_fork_deep_research_prompt(
+    *,
+    checkpoint: ResearchCheckpoint,
+    source_prompt: str,
+    source_report: str,
+    additional_prompt: str,
+) -> str:
+    return f"""# Fork Source
+Parent run: {checkpoint.run_id}
+Checkpoint: {checkpoint.checkpoint_id}
+Checkpoint kind: {checkpoint.kind}
+Source attempt: {checkpoint.source_attempt_no or "n/a"}
+Source review: {checkpoint.source_review_no or "n/a"}
+
+# Original Research Brief
+{source_prompt}
+
+# Source Report Snapshot
+{source_report}
+
+# Additional Fork Instructions
+{additional_prompt}
+
+# Fork Policy
+Run a new Deep Research pass as a child run. Treat the source report as preserved
+context, then return only the new or changed findings needed to satisfy the
+additional instructions. Do not mutate the parent run. Write the output in English
+unless the additional instructions explicitly require another language.
+"""
+
+
+def _fork_preview_hash(
+    *,
+    checkpoint_id: UUID,
+    additional_prompt: str,
+    composed_prompt: str,
+    query_policy: QueryPolicyDecision,
+) -> str:
+    payload = {
+        "checkpoint_id": str(checkpoint_id),
+        "additional_prompt": additional_prompt,
+        "composed_prompt": composed_prompt,
+        "query_policy": query_policy.model_dump(mode="json"),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _fork_submit_response(
+    child: ResearchRunRecord,
+    lineage: ResearchRunLineage,
+) -> ForkSubmitResponse:
+    return ForkSubmitResponse(
+        run_id=child.id,
+        parent_run_id=lineage.parent_run_id,
+        forked_from_checkpoint_id=lineage.forked_from_checkpoint_id,
+        child_run_id=child.id,
+        status=child.status,
+        done_reason=child.done_reason,
+        needs_human_review=child.needs_human_review,
+        source_snapshot_json=lineage.source_snapshot_json,
+        lineage=lineage,
+    )
+
+
+def _validate_existing_fork_lineage(
+    lineage: ResearchRunLineage,
+    *,
+    additional_prompt: str,
+    confirmed_preview_hash: str,
+) -> None:
+    if (
+        lineage.additional_prompt != additional_prompt
+        or lineage.confirmed_preview_hash != confirmed_preview_hash
+    ):
+        raise ValueError(
+            "Fork idempotency key already exists with a different prompt or preview hash."
+        )
+
+
 def _latest_rerun_plan(plans: list[RerunPlan]) -> RerunPlan | None:
     if not plans:
         return None
@@ -2394,10 +2964,38 @@ def _allowed_human_review_actions(run: ResearchRunRecord) -> list[HumanReviewAct
     ]
 
 
+def _route_budget_snapshot(route_state: RouteState) -> dict[str, object]:
+    route_state_dict = cast(dict[str, object], route_state)
+    keys = [
+        "total_reviews",
+        "max_total_iterations",
+        "targeted_rerun_runs",
+        "max_targeted_rerun_runs",
+        "full_rerun_runs",
+        "max_full_rerun_runs",
+        "llm_patch_runs",
+        "max_llm_patch_runs",
+        "verification_runs",
+        "max_verification_runs",
+        "no_progress_count",
+        "total_tool_calls",
+        "max_total_tool_calls",
+    ]
+    return {key: route_state_dict.get(key) for key in keys if key in route_state_dict}
+
+
 def _blocked_human_resume_reason(
     run: ResearchRunRecord,
     action: HumanReviewAction,
 ) -> str | None:
+    if action in {
+        HumanReviewAction.APPROVE,
+        HumanReviewAction.APPROVE_WITH_LIMITATION,
+    }:
+        if not run.report:
+            return "missing_report_for_approval"
+        return None
+
     if action == HumanReviewAction.REQUEST_REVIEW:
         if run.done_reason not in {
             "review_timeout",
@@ -2408,9 +3006,19 @@ def _blocked_human_resume_reason(
             return "missing_report_for_review_retry"
         return None
 
+    if action == HumanReviewAction.REQUEST_LLM_PATCH and not run.report:
+        return "missing_report_for_llm_patch"
+
+    if action == HumanReviewAction.REQUEST_VERIFICATION and run.total_reviews == 0:
+        return "missing_review_for_verification"
+
+    if action == HumanReviewAction.REQUEST_TARGETED_RERUN and not run.report:
+        return "missing_report_for_targeted_rerun_use_full_rerun"
+
     if action not in {
         HumanReviewAction.REQUEST_LLM_PATCH,
         HumanReviewAction.REQUEST_TARGETED_RERUN,
+        HumanReviewAction.REQUEST_FULL_RERUN,
         HumanReviewAction.REQUEST_VERIFICATION,
         HumanReviewAction.REQUEST_ITEM_REVISION,
     }:
@@ -2422,7 +3030,11 @@ def _blocked_human_resume_reason(
     if run.total_reviews >= run.max_total_iterations:
         return "max_total_iterations_reached"
 
-    if run.no_progress_count >= 2:
+    if run.no_progress_count >= 2 and action not in {
+        HumanReviewAction.REQUEST_TARGETED_RERUN,
+        HumanReviewAction.REQUEST_FULL_RERUN,
+        HumanReviewAction.REQUEST_ITEM_REVISION,
+    }:
         return "max_no_progress_count_reached"
 
     if (
@@ -2430,6 +3042,12 @@ def _blocked_human_resume_reason(
         and run.targeted_rerun_runs >= run.max_targeted_rerun_runs
     ):
         return "max_targeted_rerun_runs_reached"
+
+    if (
+        action == HumanReviewAction.REQUEST_FULL_RERUN
+        and run.full_rerun_runs >= run.max_full_rerun_runs
+    ):
+        return "max_full_rerun_runs_reached"
 
     if (
         action == HumanReviewAction.REQUEST_LLM_PATCH

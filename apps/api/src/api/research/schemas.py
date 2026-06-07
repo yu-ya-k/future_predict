@@ -39,6 +39,7 @@ class HumanReviewAction(StrEnum):
     REQUEST_LLM_PATCH = "request_llm_patch"
     REQUEST_VERIFICATION = "request_verification"
     REQUEST_TARGETED_RERUN = "request_targeted_rerun"
+    REQUEST_FULL_RERUN = "request_full_rerun"
     REQUEST_ITEM_REVISION = "request_item_revision"
     REJECT = "reject"
 
@@ -397,6 +398,114 @@ class AuditResponse(BaseModel):
     cost_events: list[CostEvent]
     human_decisions: list[HumanReviewDecision]
     history: list[dict[str, Any]]
+
+
+class ResearchCheckpointChildFork(BaseModel):
+    run_id: UUID
+    status: RunStatus
+    done_reason: str | None = None
+    created_at: datetime
+
+
+def _empty_checkpoint_child_forks() -> list[ResearchCheckpointChildFork]:
+    return []
+
+
+class ResearchCheckpoint(BaseModel):
+    checkpoint_id: UUID
+    run_id: UUID
+    checkpoint_no: int
+    kind: str
+    node_anchor: str
+    forkable: bool
+    dedupe_key: str
+    source_attempt_no: int | None = None
+    source_review_no: int | None = None
+    source_response_id: str | None = None
+    report_hash: str | None = None
+    snapshot_json: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    forks: list[ResearchCheckpointChildFork] = Field(
+        default_factory=_empty_checkpoint_child_forks
+    )
+    child_forks: list[ResearchCheckpointChildFork] = Field(
+        default_factory=_empty_checkpoint_child_forks
+    )
+
+
+class ResearchCheckpointsResponse(BaseModel):
+    run_id: UUID
+    checkpoints: list[ResearchCheckpoint]
+
+
+class ResearchRunLineage(BaseModel):
+    run_id: UUID
+    root_run_id: UUID
+    parent_run_id: UUID
+    forked_from_checkpoint_id: UUID
+    fork_mode: str
+    additional_prompt: str
+    confirmed_preview_hash: str
+    idempotency_key: str
+    source_snapshot_json: dict[str, Any] = Field(default_factory=dict)
+    source_report_artifact_path: str | None = None
+    created_at: datetime
+
+
+class ResearchRunLineageResponse(BaseModel):
+    run_id: UUID
+    root_run_id: UUID | None = None
+    parent_run_id: UUID | None = None
+    forked_from_checkpoint_id: UUID | None = None
+    fork_mode: str | None = None
+    additional_prompt: str | None = None
+    confirmed_preview_hash: str | None = None
+    idempotency_key: str | None = None
+    source_snapshot_json: dict[str, Any] = Field(default_factory=dict)
+    source_report_artifact_path: str | None = None
+    created_at: datetime | None = None
+    lineage: ResearchRunLineage | None = None
+    child_forks: list[ResearchCheckpointChildFork] = Field(
+        default_factory=_empty_checkpoint_child_forks
+    )
+
+
+class ForkPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    additional_prompt: str = Field(min_length=1, max_length=20000)
+
+
+class ForkPreviewResponse(BaseModel):
+    run_id: UUID
+    checkpoint_id: UUID
+    composed_prompt: str
+    query_policy: QueryPolicyDecision
+    policy_decision: QueryPolicyDecision
+    source_prompt_excerpt: str
+    source_report_excerpt: str
+    warnings: list[str] = Field(default_factory=list)
+    preview_hash: str
+
+
+class ForkSubmitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    additional_prompt: str = Field(min_length=1, max_length=20000)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    confirmed_preview_hash: str = Field(min_length=1, max_length=128)
+
+
+class ForkSubmitResponse(BaseModel):
+    run_id: UUID
+    parent_run_id: UUID
+    forked_from_checkpoint_id: UUID
+    child_run_id: UUID
+    status: RunStatus
+    done_reason: str | None = None
+    needs_human_review: bool
+    source_snapshot_json: dict[str, Any] = Field(default_factory=dict)
+    lineage: ResearchRunLineage
 
 
 class ObjectiveContractResponse(BaseModel):

@@ -38,6 +38,7 @@ export type HumanReviewAction =
   | "request_llm_patch"
   | "request_verification"
   | "request_targeted_rerun"
+  | "request_full_rerun"
   | "request_item_revision"
   | "reject";
 
@@ -393,6 +394,96 @@ export interface HumanReviewPayload {
   allowed_actions: HumanReviewAction[];
   audit_summary: HumanReviewAuditSummary;
   warnings: string[];
+}
+
+// ── Research checkpoints / fork lineage ─────────────────────────────────────
+
+export interface ResearchCheckpointChildFork {
+  run_id: string;
+  status: RunStatus;
+  done_reason?: string | null;
+  created_at?: string | null;
+}
+
+export interface ResearchCheckpoint {
+  checkpoint_id: string;
+  run_id: string;
+  checkpoint_no: number;
+  kind: string;
+  node_anchor: string;
+  forkable: boolean;
+  dedupe_key: string;
+  source_attempt_no?: number | null;
+  source_review_no?: number | null;
+  source_response_id?: string | null;
+  report_hash?: string | null;
+  snapshot_json?: Record<string, unknown> | null;
+  created_at: string;
+  child_forks?: ResearchCheckpointChildFork[];
+}
+
+export interface ResearchCheckpointListResponse {
+  run_id: string;
+  checkpoints: ResearchCheckpoint[];
+}
+
+export interface ResearchRunLineage {
+  run_id: string;
+  root_run_id: string;
+  parent_run_id: string;
+  forked_from_checkpoint_id: string;
+  fork_mode: string;
+  additional_prompt: string;
+  confirmed_preview_hash: string;
+  idempotency_key: string;
+  source_snapshot_json?: Record<string, unknown> | null;
+  source_report_artifact_path?: string | null;
+  created_at: string;
+}
+
+export interface ResearchRunLineageResponse {
+  run_id: string;
+  lineage: ResearchRunLineage | null;
+}
+
+export interface QueryPolicyDecision {
+  status: string;
+  safe_queries: string[];
+  blocked_reason?: string | null;
+}
+
+export interface ResearchForkPreviewRequest {
+  additional_prompt: string;
+}
+
+export interface ResearchForkPreviewResponse {
+  run_id?: string;
+  checkpoint_id?: string;
+  composed_prompt: string;
+  query_policy: QueryPolicyDecision;
+  policy_decision: QueryPolicyDecision;
+  source_prompt_excerpt: string;
+  source_report_excerpt: string;
+  warnings: string[];
+  preview_hash: string;
+}
+
+export interface ResearchForkSubmitRequest {
+  additional_prompt: string;
+  idempotency_key: string;
+  confirmed_preview_hash: string;
+}
+
+export interface ResearchForkSubmitResponse {
+  run_id: string;
+  parent_run_id: string;
+  forked_from_checkpoint_id: string;
+  child_run_id: string;
+  status: RunStatus;
+  done_reason?: string | null;
+  needs_human_review: boolean;
+  source_snapshot_json: Record<string, unknown>;
+  lineage: ResearchRunLineage;
 }
 
 // ── Option constraints (schemas.py ResearchRunOptions Field bounds) ──────────

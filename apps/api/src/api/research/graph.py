@@ -209,6 +209,8 @@ def _graph_route_after_human_review(state: GraphState) -> str:
         return "verify_items"
     if action == HumanReviewAction.REQUEST_TARGETED_RERUN:
         return "build_targeted_rerun_plan"
+    if action == HumanReviewAction.REQUEST_FULL_RERUN:
+        return "full_rerun_submit"
     if action == HumanReviewAction.REQUEST_ITEM_REVISION:
         return "revise_research_items"
     if action == HumanReviewAction.REJECT:
