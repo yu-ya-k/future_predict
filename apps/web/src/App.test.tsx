@@ -1184,7 +1184,6 @@ describe("NewResearch (SCR-1)", () => {
       screen.getByRole("textbox", { name: "出力レポート" }),
       "手動実行したレポート",
     );
-    await userEvent.click(screen.getByLabelText("LLMレビューを許可する"));
     await userEvent.click(
       screen.getByRole("button", { name: /取り込んでレビューを開始/i }),
     );
@@ -1206,7 +1205,7 @@ describe("NewResearch (SCR-1)", () => {
     expect(body.get("input_prompt_text")).toBe("手動実行したプロンプト");
     expect(body.get("report_text")).toBe("手動実行したレポート");
     expect(body.get("allow_remote_review")).toBe("true");
-    expect(body.get("allow_api_reruns")).toBe("false");
+    expect(body.get("allow_api_reruns")).toBe("true");
     expect(body.has("input_prompt_file")).toBe(false);
     expect(body.has("report_file")).toBe(false);
     await waitFor(() => expect(window.location.hash).toBe(`#/runs/${runId}`));
@@ -1221,7 +1220,7 @@ describe("NewResearch (SCR-1)", () => {
     );
   });
 
-  it("does not promise remote review when manual review permission is off", async () => {
+  it("always enables remote review and API rerun permissions for manual imports", async () => {
     render(<App />);
 
     await userEvent.click(
@@ -1229,17 +1228,11 @@ describe("NewResearch (SCR-1)", () => {
     );
 
     expect(
-      screen.getByRole("button", { name: "手動結果を取り込む" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: /取り込んでレビューを開始/i }),
-    ).not.toBeInTheDocument();
-
-    await userEvent.click(screen.getByLabelText("LLMレビューを許可する"));
-
-    expect(
       screen.getByRole("button", { name: /取り込んでレビューを開始/i }),
     ).toBeInTheDocument();
+    expect(screen.queryByText("実行許可")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("LLMレビューを許可する")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("API rerunを許可する")).not.toBeInTheDocument();
   });
 
   it("shows manual required field errors only after touch or submit and clears them on source switch", async () => {
@@ -1251,7 +1244,9 @@ describe("NewResearch (SCR-1)", () => {
 
     expect(screen.queryByText("入力してください")).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "手動結果を取り込む" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: /取り込んでレビューを開始/i }),
+    );
 
     expect(screen.getAllByText("入力してください")).toHaveLength(2);
 
@@ -1266,7 +1261,7 @@ describe("NewResearch (SCR-1)", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("disables manual rerun controls and sends zero rerun limits until API reruns are allowed", async () => {
+  it("keeps manual rerun controls enabled and sends rerun limits", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 202,
@@ -1289,16 +1284,11 @@ describe("NewResearch (SCR-1)", () => {
 
     const targetedInput = screen.getByLabelText(/最大Targeted rerun回数/i);
     const fullInput = screen.getByLabelText(/最大Full rerun回数/i);
-    expect(targetedInput).toBeDisabled();
-    expect(fullInput).toBeDisabled();
-    expect(
-      screen.getByText(/API rerun未許可のため、Targeted rerun \/ Full rerun は0回として送信されます。/),
-    ).toBeInTheDocument();
-
-    await userEvent.click(screen.getByLabelText("API rerunを許可する"));
     expect(targetedInput).not.toBeDisabled();
     expect(fullInput).not.toBeDisabled();
-    await userEvent.click(screen.getByLabelText("API rerunを許可する"));
+    expect(
+      screen.queryByText(/API rerun未許可のため、Targeted rerun \/ Full rerun は0回として送信されます。/),
+    ).not.toBeInTheDocument();
 
     await userEvent.type(
       screen.getByRole("textbox", { name: "入力プロンプト" }),
@@ -1308,13 +1298,17 @@ describe("NewResearch (SCR-1)", () => {
       screen.getByRole("textbox", { name: "出力レポート" }),
       "手動レポート",
     );
-    await userEvent.click(screen.getByRole("button", { name: "手動結果を取り込む" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: /取り込んでレビューを開始/i }),
+    );
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
     const body = fetchMock.mock.calls[0][1]?.body as FormData;
     const options = JSON.parse(String(body.get("options_json"))) as Record<string, number>;
-    expect(options.max_targeted_rerun_runs).toBe(0);
-    expect(options.max_full_rerun_runs).toBe(0);
+    expect(body.get("allow_remote_review")).toBe("true");
+    expect(body.get("allow_api_reruns")).toBe("true");
+    expect(options.max_targeted_rerun_runs).toBe(2);
+    expect(options.max_full_rerun_runs).toBe(1);
   });
 
   it("omits inactive manual text and sends the selected file source", async () => {
@@ -1354,7 +1348,7 @@ describe("NewResearch (SCR-1)", () => {
       "手動レポート",
     );
     await userEvent.click(
-      screen.getByRole("button", { name: "手動結果を取り込む" }),
+      screen.getByRole("button", { name: /取り込んでレビューを開始/i }),
     );
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
@@ -1366,8 +1360,10 @@ describe("NewResearch (SCR-1)", () => {
     expect(body.get("report_text")).toBe("手動レポート");
     expect(body.has("report_file")).toBe(false);
     const options = JSON.parse(String(body.get("options_json"))) as Record<string, number>;
-    expect(options.max_targeted_rerun_runs).toBe(0);
-    expect(options.max_full_rerun_runs).toBe(0);
+    expect(body.get("allow_remote_review")).toBe("true");
+    expect(body.get("allow_api_reruns")).toBe("true");
+    expect(options.max_targeted_rerun_runs).toBe(2);
+    expect(options.max_full_rerun_runs).toBe(1);
   });
 
   it("blocks oversized manual files before submit", async () => {
@@ -1397,7 +1393,7 @@ describe("NewResearch (SCR-1)", () => {
 
     expect(screen.getByText("ファイルサイズは1MB以下にしてください")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "手動結果を取り込む" }),
+      screen.getByRole("button", { name: /取り込んでレビューを開始/i }),
     ).toBeDisabled();
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -1423,7 +1419,7 @@ describe("NewResearch (SCR-1)", () => {
       "手動レポート",
     );
     await userEvent.click(
-      screen.getByRole("button", { name: "手動結果を取り込む" }),
+      screen.getByRole("button", { name: /取り込んでレビューを開始/i }),
     );
 
     expect(await screen.findByRole("alert")).toHaveTextContent(

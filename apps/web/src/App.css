@@ -373,8 +373,7 @@ body {
 }
 
 .mode-fieldset,
-.source-fieldset,
-.manual-gates {
+.source-fieldset {
   margin: 0 0 var(--space-6);
   padding: 0;
   border: 0;
@@ -416,23 +415,14 @@ body {
   margin: 0;
 }
 
-.source-switch,
-.manual-gates {
+.source-switch {
   display: flex;
   align-items: center;
   gap: var(--space-4);
   flex-wrap: wrap;
 }
 
-.manual-gate-note {
-  flex-basis: 100%;
-  margin: calc(-1 * var(--space-2)) 0 0;
-  color: var(--ink-faint);
-  font-size: var(--text-caption);
-}
-
-.source-switch label,
-.checkbox-row {
+.source-switch label {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);

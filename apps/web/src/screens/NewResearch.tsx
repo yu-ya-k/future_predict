@@ -64,8 +64,6 @@ export function NewResearch() {
   const [manualReportFile, setManualReportFile] = useState<File | null>(null);
   const [manualPromptValidationVisible, setManualPromptValidationVisible] = useState(false);
   const [manualReportValidationVisible, setManualReportValidationVisible] = useState(false);
-  const [allowRemoteReview, setAllowRemoteReview] = useState(false);
-  const [allowApiReruns, setAllowApiReruns] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -134,7 +132,6 @@ export function NewResearch() {
     mode === "api"
       ? apiPromptTrimmed.length > 0 && !apiOverLimit && !submitting
       : !manualPromptBlockingError && !manualReportBlockingError && !submitting;
-  const rerunOptionsDisabled = mode === "manual" && !allowApiReruns;
 
   function handleOptionChange(key: keyof ResearchDefaults, value: string) {
     const normalized = normalizeResearchDefaultValue(key, value);
@@ -179,14 +176,7 @@ export function NewResearch() {
 
     try {
       const normalizedOptions = options();
-      const requestOptions =
-        mode === "manual" && !allowApiReruns
-          ? {
-              ...normalizedOptions,
-              max_targeted_rerun_runs: 0,
-              max_full_rerun_runs: 0,
-            }
-          : normalizedOptions;
+      const requestOptions = normalizedOptions;
       if (mode === "manual" && (manualPromptError || manualReportError)) {
         setManualPromptValidationVisible(true);
         setManualReportValidationVisible(true);
@@ -210,8 +200,8 @@ export function NewResearch() {
                   ? { source: "file", file: manualReportFile as File }
                   : { source: "text", text: manualReportText.trim() },
               options: requestOptions,
-              allow_remote_review: allowRemoteReview,
-              allow_api_reruns: allowApiReruns,
+              allow_remote_review: true,
+              allow_api_reruns: true,
             });
 
       const title =
@@ -374,32 +364,6 @@ export function NewResearch() {
                 setManualReportValidationVisible(true);
               }}
             />
-            <fieldset className="manual-gates">
-              <legend className="form-label">実行許可</legend>
-              <label className="checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={allowRemoteReview}
-                  onChange={(e) => setAllowRemoteReview(e.target.checked)}
-                  disabled={submitting}
-                />
-                LLMレビューを許可する
-              </label>
-              <label className="checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={allowApiReruns}
-                  onChange={(e) => setAllowApiReruns(e.target.checked)}
-                  disabled={submitting}
-                />
-                API rerunを許可する
-              </label>
-              {!allowRemoteReview && (
-                <p className="manual-gate-note">
-                  LLMレビューを許可しない場合、取り込み後は人間レビュー待ちになります。
-                </p>
-              )}
-            </fieldset>
           </>
         )}
 
@@ -418,18 +382,13 @@ export function NewResearch() {
 
           {showAdvanced && (
             <div className="advanced-options" role="group" aria-label="詳細オプション">
-              {rerunOptionsDisabled && (
-                <p className="option-note">
-                  API rerun未許可のため、Targeted rerun / Full rerun は0回として送信されます。
-                </p>
-              )}
               <div className="options-grid">
                 <OptionField
                   id="max-targeted-rerun"
                   label="最大Targeted rerun回数"
                   value={maxTargetedRerun}
                   optionKey="max_targeted_rerun_runs"
-                  disabled={submitting || rerunOptionsDisabled}
+                  disabled={submitting}
                   onChange={handleOptionChange}
                 />
                 <OptionField
@@ -437,7 +396,7 @@ export function NewResearch() {
                   label="最大Full rerun回数"
                   value={maxFullRerun}
                   optionKey="max_full_rerun_runs"
-                  disabled={submitting || rerunOptionsDisabled}
+                  disabled={submitting}
                   onChange={handleOptionChange}
                 />
                 <OptionField
@@ -497,9 +456,7 @@ export function NewResearch() {
                 : "取り込み中..."
               : mode === "api"
                 ? "リサーチを開始"
-                : allowRemoteReview
-                  ? "取り込んでレビューを開始"
-                  : "手動結果を取り込む"}
+                : "取り込んでレビューを開始"}
           </button>
         </div>
       </form>
