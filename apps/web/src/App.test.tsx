@@ -1026,6 +1026,12 @@ describe("RunMonitor (SCR-3)", () => {
   });
 
   it("separates total elapsed time from the current Deep Research attempt", async () => {
+    const submittedAt = "2026-06-06T04:30:00.000Z";
+    const expectedStartedLabel = new Intl.DateTimeFormat("ja-JP", {
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(new Date(submittedAt));
+
     vi.spyOn(Date, "now").mockReturnValue(
       new Date("2026-06-06T05:00:00.000Z").getTime(),
     );
@@ -1062,7 +1068,7 @@ describe("RunMonitor (SCR-3)", () => {
             status: "waiting_deep_research",
             done_reason: null,
             needs_human_review: false,
-            deep_research_submitted_at: "2026-06-06T04:30:00.000Z",
+            deep_research_submitted_at: submittedAt,
             progress: {
               targeted_rerun_runs: 2,
               llm_patch_runs: 0,
@@ -1081,7 +1087,7 @@ describe("RunMonitor (SCR-3)", () => {
     expect(await screen.findByText("トータル経過時間")).toBeInTheDocument();
     expect(screen.getByText("120:00")).toBeInTheDocument();
     expect(screen.getByText(/今回の経過時間: 30分/)).toBeInTheDocument();
-    expect(screen.getByText(/開始時刻: 13:30/)).toBeInTheDocument();
+    expect(screen.getByText(new RegExp(`開始時刻: ${expectedStartedLabel}`))).toBeInTheDocument();
   });
 
   it("shows Deep Research instructions from attempts", async () => {
