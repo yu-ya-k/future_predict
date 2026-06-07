@@ -22,7 +22,15 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
-import type { AuditResponse, ItemAssessment, ResearchCheckpoint, ReviewRecord } from "./types";
+import type {
+  AuditResponse,
+  ItemAssessment,
+  ResearchAttempt,
+  ResearchCheckpoint,
+  ResearchRunStatusResponse,
+  ReviewRecord,
+  RunStatus,
+} from "./types";
 
 // ── Global jsdom stubs ────────────────────────────────────────────────────────
 
@@ -948,6 +956,118 @@ describe("RunMonitor (SCR-3)", () => {
       ]),
     );
   });
+
+  function makeResearchAttempt(
+    runNo: number,
+    overrides: Partial<ResearchAttempt> = {},
+  ): ResearchAttempt {
+    return {
+      run_no: runNo,
+      response_id: `resp_research_${runNo}`,
+      status: "completed",
+      model: "o3-deep-research",
+      prompt: `# 指示 ${runNo}`,
+      report: `# Deep Research ${runNo}`,
+      citations: [],
+      tool_calls_summary: [],
+      error: null,
+      ...overrides,
+    };
+  }
+
+  function makeRunProgress(
+    overrides: Partial<ResearchRunStatusResponse["progress"]> = {},
+  ): ResearchRunStatusResponse["progress"] {
+    return {
+      deep_research_runs: 1,
+      items_total: 0,
+      items_answered: 0,
+      items_partial: 0,
+      items_unanswered: 0,
+      items_unverifiable: 0,
+      blockers_unresolved: 0,
+      targeted_rerun_runs: 0,
+      full_rerun_runs: 0,
+      llm_patch_runs: 0,
+      verification_runs: 0,
+      total_reviews: 0,
+      latest_verdict: null,
+      latest_score: null,
+      total_tool_calls: 0,
+      estimated_cost_usd: 0,
+      ...overrides,
+    };
+  }
+
+  function mockRunMonitorFetch({
+    status = "completed",
+    doneReason = null,
+    needsHumanReview = false,
+    attempts = [makeResearchAttempt(1)],
+    reviews = [],
+    history = [],
+    progress = makeRunProgress({ deep_research_runs: attempts.length }),
+  }: {
+    status?: RunStatus;
+    doneReason?: string | null;
+    needsHumanReview?: boolean;
+    attempts?: ResearchAttempt[];
+    reviews?: ReviewRecord[];
+    history?: AuditResponse["history"];
+    progress?: ResearchRunStatusResponse["progress"];
+  }) {
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/audit`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve(makeAuditResponse({ run_id: runId, reviews, history })),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(attempts),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/items`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, items: [] }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/checkpoints?include_forks=true`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, checkpoints: [] }),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/lineage`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ run_id: runId, lineage: null }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status,
+            done_reason: doneReason,
+            needs_human_review: needsHumanReview,
+            progress,
+          }),
+      } as Response);
+    });
+  }
 
   it("unwraps ResearchItem API wrapper responses in the monitor", async () => {
     globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
@@ -2318,6 +2438,217 @@ describe("RunMonitor (SCR-3)", () => {
     expect(nodeTitles.indexOf("人間判断")).toBe(
       nodeTitles.indexOf("LLMレビュー 1回目") + 1,
     );
+  });
+
+  it.each([
+    {
+      route: "verify_items",
+      verdict: "needs_verification" as const,
+      progressKey: "verification_runs" as const,
+      title: "検証 1回目",
+      action: "verify" as const,
+    },
+    {
+      route: "llm_patch",
+      verdict: "needs_llm_patch" as const,
+      progressKey: "llm_patch_runs" as const,
+      title: "LLMパッチ 1回目",
+      action: "llm_patch" as const,
+    },
+  ])(
+    "keeps an in-flight $route follow-up active instead of showing the next review",
+    async ({ route, verdict, progressKey, title, action }) => {
+      mockRunMonitorFetch({
+        status: "reviewing",
+        attempts: [makeResearchAttempt(1)],
+        reviews: [
+          makeReviewRecord({
+            review_no: 1,
+            verdict,
+            recommended_route: verdict,
+            score: 67,
+            item_assessments: [makeItemAssessment({ recommended_action: action })],
+          }),
+        ],
+        history: [
+          {
+            step: "route_after_review",
+            route,
+            total_reviews: 1,
+          },
+        ],
+        progress: makeRunProgress({
+          deep_research_runs: 1,
+          total_reviews: 1,
+          latest_verdict: verdict,
+          latest_score: 67,
+          [progressKey]: 0,
+        }),
+      });
+
+      render(<App />);
+
+      const followUpNode = await screen.findByRole("button", {
+        name: `${title}を選択`,
+      });
+      expect(within(followUpNode).getByText("実行中")).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "LLMレビュー 2回目を選択" }),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it("renders an executed targeted rerun between review and Deep Research 2 when progress lags", async () => {
+    mockRunMonitorFetch({
+      status: "reviewing",
+      attempts: [
+        makeResearchAttempt(1),
+        makeResearchAttempt(2, {
+          response_id: "resp_targeted_rerun_1",
+          prompt: "# Targeted rerun brief",
+          report: "# Targeted rerun delta",
+        }),
+      ],
+      reviews: [
+        makeReviewRecord({
+          review_no: 1,
+          verdict: "needs_targeted_rerun",
+          recommended_route: "needs_targeted_rerun",
+          score: 64,
+          item_assessments: [
+            makeItemAssessment({ recommended_action: "targeted_rerun" }),
+          ],
+        }),
+      ],
+      history: [
+        {
+          step: "route_after_review",
+          route: "build_targeted_rerun_plan",
+          total_reviews: 1,
+        },
+      ],
+      progress: makeRunProgress({
+        deep_research_runs: 1,
+        targeted_rerun_runs: 0,
+        total_reviews: 1,
+        latest_verdict: "needs_targeted_rerun",
+        latest_score: 64,
+      }),
+    });
+
+    render(<App />);
+
+    const dag = await screen.findByRole("region", { name: "具体的な実行フロー" });
+    const nodeTitles = within(dag)
+      .getAllByRole("heading", { level: 3 })
+      .map((heading) => heading.textContent);
+    expect(nodeTitles).toEqual(
+      expect.arrayContaining([
+        "LLMレビュー 1回目",
+        "Targeted rerun 1",
+        "Deep Research 2回目",
+      ]),
+    );
+    expect(nodeTitles.indexOf("Targeted rerun 1")).toBe(
+      nodeTitles.indexOf("LLMレビュー 1回目") + 1,
+    );
+    expect(nodeTitles.indexOf("Deep Research 2回目")).toBe(
+      nodeTitles.indexOf("Targeted rerun 1") + 1,
+    );
+  });
+
+  it("does not render a rerun follow-up from a plan without a submitted attempt", async () => {
+    mockRunMonitorFetch({
+      status: "needs_human_review",
+      doneReason: "deep_research_blocked_by_query_policy",
+      needsHumanReview: true,
+      attempts: [makeResearchAttempt(1)],
+      reviews: [
+        makeReviewRecord({
+          review_no: 1,
+          verdict: "needs_targeted_rerun",
+          recommended_route: "needs_targeted_rerun",
+          score: 64,
+          item_assessments: [
+            makeItemAssessment({ recommended_action: "targeted_rerun" }),
+          ],
+        }),
+      ],
+      history: [
+        {
+          step: "route_after_review",
+          route: "build_targeted_rerun_plan",
+          total_reviews: 1,
+        },
+        {
+          step: "rerun_plan_created",
+          rerun_id: "rerun_1",
+          scope: "targeted_gap_closure",
+        },
+        {
+          step: "deep_research_submit_blocked",
+          reason: "query_policy_blocked",
+        },
+      ],
+      progress: makeRunProgress({
+        deep_research_runs: 1,
+        targeted_rerun_runs: 0,
+        total_reviews: 1,
+        latest_verdict: "needs_targeted_rerun",
+        latest_score: 64,
+      }),
+    });
+
+    render(<App />);
+
+    const dag = await screen.findByRole("region", { name: "具体的な実行フロー" });
+    const nodeTitles = within(dag)
+      .getAllByRole("heading", { level: 3 })
+      .map((heading) => heading.textContent);
+    expect(nodeTitles).toEqual(expect.arrayContaining(["LLMレビュー 1回目", "人間判断"]));
+    expect(nodeTitles).not.toContain("Targeted rerun 1");
+    expect(nodeTitles).not.toContain("Deep Research 2回目");
+  });
+
+  it("does not mark a progress-only synthetic Deep Research node done", async () => {
+    mockRunMonitorFetch({
+      status: "completed",
+      doneReason: "passed_review",
+      attempts: [makeResearchAttempt(1)],
+      reviews: [
+        makeReviewRecord({
+          review_no: 1,
+          verdict: "needs_targeted_rerun",
+          recommended_route: "needs_targeted_rerun",
+          score: 65,
+          item_assessments: [
+            makeItemAssessment({ recommended_action: "targeted_rerun" }),
+          ],
+        }),
+      ],
+      history: [
+        {
+          step: "route_after_review",
+          route: "build_targeted_rerun_plan",
+          total_reviews: 1,
+        },
+      ],
+      progress: makeRunProgress({
+        deep_research_runs: 2,
+        targeted_rerun_runs: 1,
+        total_reviews: 1,
+        latest_verdict: "needs_targeted_rerun",
+        latest_score: 65,
+      }),
+    });
+
+    render(<App />);
+
+    const syntheticResearchNode = await screen.findByRole("button", {
+      name: "Deep Research 2回目を選択",
+    });
+    expect(within(syntheticResearchNode).getByText("待機")).toBeInTheDocument();
+    expect(within(syntheticResearchNode).queryByText("完了")).not.toBeInTheDocument();
   });
 
   it("links the active human decision DAG node to the review screen", async () => {

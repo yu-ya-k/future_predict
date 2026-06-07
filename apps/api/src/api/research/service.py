@@ -273,7 +273,10 @@ class ResearchOrchestrator:
             return run
 
         if run.status == RunStatus.WAITING_DEEP_RESEARCH:
-            claimed = self.repository.claim_deep_research_run(run.id)
+            claimed = self.repository.claim_deep_research_run(
+                run.id,
+                lease_seconds=self.settings.research_deep_research_timeout_seconds,
+            )
             if claimed is None:
                 return self.repository.get_run(run.id)
             run = claimed
@@ -315,6 +318,9 @@ class ResearchOrchestrator:
                 {RunStatus.COLLECTING},
                 status=RunStatus.WAITING_DEEP_RESEARCH,
                 deep_research_status="retrieve_retryable_error",
+                review_claim_token=None,
+                review_claim_operation=None,
+                review_claim_expires_at=None,
             )
             return retried or self.repository.get_run(run.id)
 
@@ -340,6 +346,9 @@ class ResearchOrchestrator:
                 {RunStatus.COLLECTING},
                 status=RunStatus.WAITING_DEEP_RESEARCH,
                 deep_research_status=response_status,
+                review_claim_token=None,
+                review_claim_operation=None,
+                review_claim_expires_at=None,
             )
             return waiting or self.repository.get_run(run.id)
 
@@ -505,6 +514,9 @@ class ResearchOrchestrator:
             deep_research_status=response_status,
             total_tool_calls=run.total_tool_calls + tool_call_delta,
             estimated_cost_usd=run.estimated_cost_usd + cost_delta,
+            review_claim_token=None,
+            review_claim_operation=None,
+            review_claim_expires_at=None,
         )
         if updated is None:
             self.repository.append_history_event(
@@ -809,9 +821,15 @@ class ResearchOrchestrator:
             return completed
 
         if route == "human_review":
+            done_reason = (
+                route_decision["blocked_reason"]
+                if route_decision["candidate_route"] != "human_review"
+                and route_decision["blocked_reason"] is not None
+                else _human_review_route_reason(review)
+            )
             return self._enter_human_review(
                 run.id,
-                done_reason=_human_review_route_reason(review),
+                done_reason=done_reason,
                 allowed_statuses={RunStatus.REVIEWING},
                 total_reviews=run.total_reviews + 1,
                 no_progress_count=no_progress_count,
@@ -1819,7 +1837,10 @@ class ResearchOrchestrator:
             return run
 
         if run.status == RunStatus.WAITING_DEEP_RESEARCH:
-            claimed = self.repository.claim_deep_research_run(run.id)
+            claimed = self.repository.claim_deep_research_run(
+                run.id,
+                lease_seconds=self.settings.research_deep_research_timeout_seconds,
+            )
             if claimed is None:
                 return self.repository.get_run(run.id)
             run = claimed

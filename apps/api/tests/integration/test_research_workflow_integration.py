@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -36,6 +37,26 @@ class BlockingReviewFakeAzure(IntegrationFakeAzure):
         if not self.review_can_finish.wait(timeout=5):
             raise TimeoutError("Timed out waiting to finish blocked review.")
         return super().review_report(**kwargs)
+
+
+class BlockingRetrieveFakeAzure(IntegrationFakeAzure):
+    def __init__(self) -> None:
+        super().__init__(verdicts=[Verdict.PASS])
+        self.retrieve_started = threading.Event()
+        self.retrieve_can_finish = threading.Event()
+
+    def retrieve_response(self, response_id: str) -> dict[str, object]:
+        self.retrieve_calls.append(response_id)
+        self.retrieve_started.set()
+        if not self.retrieve_can_finish.wait(timeout=5):
+            raise TimeoutError("Timed out waiting to finish blocked retrieve.")
+        return {
+            "id": response_id,
+            "status": "completed",
+            "output_text": f"調査レポート本文 {response_id}",
+            "usage": self.deep_research_usage,
+            "output": [],
+        }
 
 
 def _records_json(records: list[Any]) -> list[dict[str, Any]]:
@@ -292,6 +313,12 @@ async def test_poller_recovers_stale_collecting_deep_research_run(
 
     assert claimed is not None
     assert claimed.status == RunStatus.COLLECTING
+    orchestrator.repository.update_run(
+        run.id,
+        review_claim_token=None,
+        review_claim_operation=None,
+        review_claim_expires_at=None,
+    )
 
     poller = ResearchPoller(orchestrator=orchestrator, interval_seconds=0.01)
     await poller.tick()
@@ -303,6 +330,49 @@ async def test_poller_recovers_stale_collecting_deep_research_run(
     assert fake.retrieve_calls == [claimed.pending_deep_research_response_id]
     assert "attempt_updated" in history_steps
     assert "review_recorded" in history_steps
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_poller_claims_stale_collecting_run_before_recovery(
+    integration_orchestrator_factory: Callable[[IntegrationFakeAzure], ResearchOrchestrator],
+) -> None:
+    fake = BlockingRetrieveFakeAzure()
+    orchestrator = integration_orchestrator_factory(fake)
+    orchestrator.settings.research_deep_research_collecting_stale_seconds = 0
+
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(
+            user_prompt="公開情報に基づく市場調査をしてください。",
+        )
+    )
+    response_id = run.pending_deep_research_response_id
+    assert response_id is not None
+
+    first_poller = ResearchPoller(orchestrator=orchestrator, interval_seconds=0.01)
+    first_tick = asyncio.create_task(first_poller.tick())
+    try:
+        assert await asyncio.to_thread(fake.retrieve_started.wait, 5)
+
+        duplicate_claim = orchestrator.repository.claim_stale_collecting_run(
+            run.id,
+            stale_seconds=orchestrator.settings.research_deep_research_collecting_stale_seconds,
+            timeout_seconds=orchestrator.settings.research_deep_research_timeout_seconds,
+            lease_seconds=orchestrator.settings.research_deep_research_timeout_seconds,
+        )
+        second_poller = ResearchPoller(orchestrator=orchestrator, interval_seconds=0.01)
+        await second_poller.tick()
+
+        assert duplicate_claim is None
+        assert fake.retrieve_calls == [response_id]
+    finally:
+        fake.retrieve_can_finish.set()
+        await asyncio.wait_for(first_tick, timeout=5)
+
+    completed = orchestrator.repository.get_run(run.id)
+
+    assert completed.status == RunStatus.COMPLETED
+    assert fake.retrieve_calls == [response_id]
 
 
 @pytest.mark.integration

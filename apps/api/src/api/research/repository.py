@@ -584,6 +584,11 @@ class ResearchRepository:
                 WHERE r.status = ?
                   AND r.pending_deep_research_response_id IS NOT NULL
                   AND r.updated_at <= ?
+                  AND (
+                      r.review_claim_token IS NULL
+                      OR r.review_claim_expires_at IS NULL
+                      OR r.review_claim_expires_at <= ?
+                  )
                   AND a.created_at > ?
                   AND a.created_at = (
                       SELECT MIN(created_at)
@@ -597,26 +602,41 @@ class ResearchRepository:
                 (
                     RunStatus.COLLECTING.value,
                     cutoff.isoformat(),
+                    utc_now().isoformat(),
                     timeout_cutoff.isoformat(),
                 ),
             ).fetchall()
 
         return [self._row_to_run(row) for row in rows]
 
-    def claim_deep_research_run(self, run_id: UUID) -> ResearchRunRecord | None:
-        now = utc_now().isoformat()
+    def claim_deep_research_run(
+        self,
+        run_id: UUID,
+        *,
+        lease_seconds: int = 60,
+    ) -> ResearchRunRecord | None:
+        now = utc_now()
+        expires_at = now + timedelta(seconds=max(lease_seconds, 1))
+        token = str(uuid4())
         with self.connect() as connection:
             cursor = connection.execute(
                 """
                 UPDATE research_runs
-                SET status = ?, updated_at = ?
+                SET status = ?,
+                    review_claim_token = ?,
+                    review_claim_operation = ?,
+                    review_claim_expires_at = ?,
+                    updated_at = ?
                 WHERE id = ?
                   AND status = ?
                   AND pending_deep_research_response_id IS NOT NULL
                 """,
                 (
                     RunStatus.COLLECTING.value,
-                    now,
+                    token,
+                    "deep_research_collect",
+                    expires_at.isoformat(),
+                    now.isoformat(),
                     str(run_id),
                     RunStatus.WAITING_DEEP_RESEARCH.value,
                 ),
@@ -625,6 +645,73 @@ class ResearchRepository:
                 return None
 
         return self.get_run(run_id)
+
+    def claim_stale_collecting_run(
+        self,
+        run_id: UUID,
+        *,
+        stale_seconds: int,
+        timeout_seconds: int,
+        lease_seconds: int,
+    ) -> ResearchRunRecord | None:
+        now = utc_now()
+        cutoff = now - timedelta(seconds=stale_seconds)
+        timeout_cutoff = now - timedelta(seconds=timeout_seconds)
+        expires_at = now + timedelta(seconds=max(lease_seconds, 1))
+        token = str(uuid4())
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE research_runs
+                SET review_claim_token = ?,
+                    review_claim_operation = ?,
+                    review_claim_expires_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status = ?
+                  AND pending_deep_research_response_id IS NOT NULL
+                  AND updated_at <= ?
+                  AND (
+                      review_claim_token IS NULL
+                      OR review_claim_expires_at IS NULL
+                      OR review_claim_expires_at <= ?
+                  )
+                  AND EXISTS (
+                      SELECT 1
+                      FROM research_attempts a
+                      WHERE a.run_id = research_runs.id
+                        AND a.response_id = research_runs.pending_deep_research_response_id
+                        AND a.created_at > ?
+                        AND a.created_at = (
+                            SELECT MIN(created_at)
+                            FROM research_attempts
+                            WHERE run_id = research_runs.id
+                              AND response_id = research_runs.pending_deep_research_response_id
+                        )
+                  )
+                """,
+                (
+                    token,
+                    "deep_research_collect",
+                    expires_at.isoformat(),
+                    now.isoformat(),
+                    str(run_id),
+                    RunStatus.COLLECTING.value,
+                    cutoff.isoformat(),
+                    now.isoformat(),
+                    timeout_cutoff.isoformat(),
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM research_runs WHERE id = ?",
+                (str(run_id),),
+            ).fetchone()
+
+        if row is None:
+            raise KeyError(str(run_id))
+        return self._row_to_run(row)
 
     def claim_review_operation(
         self,

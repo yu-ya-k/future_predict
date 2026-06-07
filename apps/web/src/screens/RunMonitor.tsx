@@ -403,13 +403,6 @@ function historyStep(event: AuditResponse["history"][number] | undefined): strin
   return historyString(event, "step");
 }
 
-function countHistorySteps(
-  history: AuditResponse["history"],
-  step: string,
-): number {
-  return history.filter((event) => historyStep(event) === step).length;
-}
-
 function routeFollowUpForReview(
   history: AuditResponse["history"],
   reviewNo: number,
@@ -426,21 +419,56 @@ function routeFollowUpForReview(
   return route ? ROUTE_FOLLOW_UP_KIND[route] ?? null : null;
 }
 
+function eventCompletesFollowUp(
+  event: AuditResponse["history"][number],
+  kind: FollowUpKind,
+): boolean {
+  const step = historyStep(event);
+  if (kind === "llm_patch") return step === "llm_patch";
+  if (kind === "verification") return step === "verification_completed";
+  if (kind === "finalize_with_limitation") return step === "finalized_with_limitation";
+  return false;
+}
+
+function countCompletedFollowUps(
+  history: AuditResponse["history"],
+  kind: FollowUpKind,
+): number {
+  const completed = history.filter((event) => eventCompletesFollowUp(event, kind));
+  if (!isRerunFollowUp(kind)) return completed.length;
+
+  const unique = new Set<string>();
+  completed.forEach((event, index) => {
+    const runNo = historyNumber(event, "run_no");
+    unique.add(
+      historyString(event, "rerun_id") ??
+        (runNo !== null ? `run:${runNo}` : `event:${index}`),
+    );
+  });
+  return unique.size;
+}
+
 function executedFollowUpLimits(
   progress: ResearchRunStatusResponse["progress"] | undefined,
   history: AuditResponse["history"],
 ): Record<FollowUpKind, number> {
   return {
-    llm_patch: Math.max(progress?.llm_patch_runs ?? 0, countHistorySteps(history, "llm_patch")),
+    llm_patch: Math.max(progress?.llm_patch_runs ?? 0, countCompletedFollowUps(history, "llm_patch")),
     verification: Math.max(
       progress?.verification_runs ?? 0,
-      countHistorySteps(history, "verification_completed"),
+      countCompletedFollowUps(history, "verification"),
     ),
-    targeted_rerun: progress?.targeted_rerun_runs ?? 0,
-    full_rerun: progress?.full_rerun_runs ?? 0,
+    targeted_rerun: Math.max(
+      progress?.targeted_rerun_runs ?? 0,
+      countCompletedFollowUps(history, "targeted_rerun"),
+    ),
+    full_rerun: Math.max(
+      progress?.full_rerun_runs ?? 0,
+      countCompletedFollowUps(history, "full_rerun"),
+    ),
     item_revision: 0,
     human_review: 0,
-    finalize_with_limitation: countHistorySteps(history, "finalized_with_limitation"),
+    finalize_with_limitation: countCompletedFollowUps(history, "finalize_with_limitation"),
   };
 }
 
@@ -450,6 +478,35 @@ function hasExecutedFollowUp(
   limits: Record<FollowUpKind, number>,
 ): boolean {
   return counts[kind] < limits[kind];
+}
+
+function isRerunFollowUp(kind: FollowUpKind): boolean {
+  return kind === "targeted_rerun" || kind === "full_rerun";
+}
+
+function historyHasAttemptForRunNo(
+  history: AuditResponse["history"],
+  runNo: number,
+): boolean {
+  return history.some((event) => {
+    const step = historyStep(event);
+    return (
+      (step === "attempt_recorded" || step === "attempt_updated") &&
+      historyNumber(event, "run_no") === runNo
+    );
+  });
+}
+
+function shouldShowRoutedIncompleteFollowUp(
+  status: RunStatus,
+  kind: FollowUpKind,
+  isLatestReview: boolean,
+): boolean {
+  return (
+    isLatestReview &&
+    (status === "reviewing" || status === "needs_action") &&
+    (kind === "llm_patch" || kind === "verification")
+  );
 }
 
 function buildExecutionDag({
@@ -521,8 +578,9 @@ function buildExecutionDag({
 
   function appendResearchNode() {
     const runNo = nextResearchRunNo;
+    const existingAttempt = attemptsByRunNo.get(runNo);
     const attempt =
-      attemptsByRunNo.get(runNo) ??
+      existingAttempt ??
       ({
         run_no: runNo,
         status: activeId === `research-${runNo}` ? "running" : "pending",
@@ -534,11 +592,13 @@ function buildExecutionDag({
       } satisfies ResearchAttempt);
     nextResearchRunNo += 1;
     const researchId = `research-${attempt.run_no}`;
+    const researchStatus =
+      activeId === researchId ? "active" : existingAttempt ? "done" : "pending";
     nodes.push({
       id: researchId,
       title: `Deep Research ${attempt.run_no}回目`,
       meta: `status: ${attempt.status}`,
-      status: activeId === researchId ? "active" : "done",
+      status: researchStatus,
       tone: "research",
       lane: 1,
       col,
@@ -549,7 +609,7 @@ function buildExecutionDag({
       id: `${previousId}-${researchId}`,
       from: previousId,
       to: researchId,
-      status: activeId === researchId ? "active" : "done",
+      status: researchStatus === "active" ? "active" : researchStatus === "done" ? "done" : "pending",
     });
     previousId = researchId;
     col += 1;
@@ -560,6 +620,9 @@ function buildExecutionDag({
   }
 
   for (const review of reviews) {
+    const hasNextReviewRecord = reviews.some(
+      (candidate) => candidate.review_no === review.review_no + 1,
+    );
     const reviewId = `review-${review.review_no}`;
     nodes.push({
       id: reviewId,
@@ -583,19 +646,48 @@ function buildExecutionDag({
     col += 1;
 
     const followUp = routeFollowUpForReview(history, review.review_no);
-    if (!followUp || !hasExecutedFollowUp(followUp, followUpCounts, executedLimits)) {
+    if (!followUp) {
       continue;
     }
 
-    followUpCounts[followUp] += 1;
-    const followUpIndex = followUpCounts[followUp];
+    const completedByHistory = hasExecutedFollowUp(followUp, followUpCounts, {
+      ...executedLimits,
+      [followUp]: countCompletedFollowUps(history, followUp),
+    });
+    const completedByActualAttempt =
+      isRerunFollowUp(followUp) &&
+      (attemptsByRunNo.has(nextResearchRunNo) ||
+        historyHasAttemptForRunNo(history, nextResearchRunNo));
+    const completedByNextReview = hasNextReviewRecord;
+    const completedByProgressFallback = hasExecutedFollowUp(
+      followUp,
+      followUpCounts,
+      executedLimits,
+    );
+    const followUpIsDone =
+      completedByHistory ||
+      completedByActualAttempt ||
+      completedByNextReview ||
+      completedByProgressFallback;
+    const showIncompleteFollowUp = shouldShowRoutedIncompleteFollowUp(
+      status,
+      followUp,
+      review.review_no === reviews.length,
+    );
+    if (!followUpIsDone && !showIncompleteFollowUp) {
+      continue;
+    }
+
+    const followUpIndex = followUpCounts[followUp] + 1;
     const followId = `followup-${review.review_no}`;
     const label = FOLLOW_UP_LABEL[followUp];
+    const followUpStatus =
+      followUpIsDone ? "done" : activeId === `review-${review.review_no + 1}` ? "active" : "pending";
     nodes.push({
       id: followId,
       title: followUpTitle(followUp, followUpIndex),
       meta: label,
-      status: "done",
+      status: followUpStatus,
       tone: followUpTone(followUp),
       lane: review.review_no % 2 === 0 ? 2 : 0,
       col,
@@ -606,13 +698,17 @@ function buildExecutionDag({
       id: `${previousId}-${followId}`,
       from: previousId,
       to: followId,
-      status: "done",
+      status: followUpIsDone ? "done" : followUpStatus === "active" ? "active" : "pending",
       label,
     });
     previousId = followId;
     col += 1;
 
-    if (followUp === "targeted_rerun" || followUp === "full_rerun") {
+    if (followUpIsDone) {
+      followUpCounts[followUp] += 1;
+    }
+
+    if (isRerunFollowUp(followUp) && followUpIsDone) {
       appendResearchNode();
     }
   }
@@ -621,7 +717,10 @@ function buildExecutionDag({
     appendResearchNode();
   }
 
-  if (activeId === `review-${reviews.length + 1}`) {
+  const hasOpenFollowUp = nodes.some(
+    (node) => node.id.startsWith("followup-") && node.status !== "done",
+  );
+  if (activeId === `review-${reviews.length + 1}` && !hasOpenFollowUp) {
     const reviewId = `review-${reviews.length + 1}`;
     nodes.push({
       id: reviewId,
