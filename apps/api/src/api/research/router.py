@@ -36,6 +36,7 @@ from api.research.schemas import (
     ItemStatus,
     ObjectiveContractResponse,
     ReportResponse,
+    RerunExecutionMode,
     RerunPlansResponse,
     ResearchAttempt,
     ResearchCheckpoint,
@@ -83,6 +84,7 @@ async def create_manual_import_run(
     orchestrator: OrchestratorDependency,
     allow_remote_review: Annotated[bool, Form()],
     allow_api_reruns: Annotated[bool, Form()],
+    rerun_execution_mode: Annotated[str | None, Form()] = None,
     input_prompt_file: Annotated[UploadFile | None, File()] = None,
     input_prompt_text: Annotated[str | None, Form(max_length=50000)] = None,
     report_file: Annotated[UploadFile | None, File()] = None,
@@ -105,6 +107,10 @@ async def create_manual_import_run(
         max_file_bytes=orchestrator.settings.research_manual_import_max_file_bytes,
     )
     options = _parse_manual_options(options_json)
+    mode = _parse_rerun_execution_mode(
+        rerun_execution_mode,
+        allow_api_reruns=allow_api_reruns,
+    )
     normalized_idempotency_key = idempotency_key.strip() if idempotency_key else None
     if normalized_idempotency_key == "":
         normalized_idempotency_key = None
@@ -116,6 +122,7 @@ async def create_manual_import_run(
             options=options,
             allow_remote_review=allow_remote_review,
             allow_api_reruns=allow_api_reruns,
+            rerun_execution_mode=mode,
             idempotency_key=normalized_idempotency_key,
             metadata={
                 "input_prompt": input_meta,
@@ -137,6 +144,42 @@ async def create_manual_import_run(
         status=run.status,
         created_at=run.created_at,
     )
+
+
+@router.post(
+    "/{run_id}/manual-rerun-result",
+    response_model=ResearchRunStatusResponse,
+)
+async def upload_manual_rerun_result(
+    run_id: UUID,
+    orchestrator: OrchestratorDependency,
+    rerun_id: Annotated[str, Form(max_length=200)],
+    report_file: Annotated[UploadFile | None, File()] = None,
+    report_text: Annotated[str | None, Form()] = None,
+) -> ResearchRunStatusResponse:
+    _get_run_or_404(orchestrator, run_id)
+    report, _report_meta = await _read_manual_import_text(
+        label="report",
+        file=report_file,
+        text=report_text,
+        max_chars=orchestrator.settings.research_manual_import_max_report_chars,
+        max_file_bytes=orchestrator.settings.research_manual_import_max_file_bytes,
+    )
+    normalized_rerun_id = rerun_id.strip()
+    if not normalized_rerun_id:
+        raise HTTPException(status_code=422, detail="rerun_id must not be blank.")
+    try:
+        orchestrator.accept_manual_rerun_result(
+            run_id,
+            rerun_id=normalized_rerun_id,
+            report_text=report,
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        ) from error
+    return _status_response(orchestrator, run_id)
 
 
 @router.get("/human-reviews", response_model=list[HumanReviewQueueItem])
@@ -656,6 +699,30 @@ def _parse_manual_options(options_json: str | None) -> ResearchRunOptions:
             status_code=422,
             detail=error.errors(),
         ) from error
+
+
+def _parse_rerun_execution_mode(
+    value: str | None,
+    *,
+    allow_api_reruns: bool,
+) -> RerunExecutionMode:
+    if value is None or not value.strip():
+        return RerunExecutionMode.API if allow_api_reruns else RerunExecutionMode.DISABLED
+    try:
+        mode = RerunExecutionMode(value.strip())
+    except ValueError as error:
+        raise HTTPException(
+            status_code=422,
+            detail="rerun_execution_mode must be one of: api, manual_chatgpt, disabled.",
+        ) from error
+    if mode == RerunExecutionMode.MANUAL_CHATGPT and not allow_api_reruns:
+        raise HTTPException(
+            status_code=422,
+            detail="manual_chatgpt rerun execution requires allow_api_reruns=true.",
+        )
+    if not allow_api_reruns:
+        return RerunExecutionMode.DISABLED
+    return mode
 
 
 def _sha256_text(text: str) -> str:

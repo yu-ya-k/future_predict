@@ -13,8 +13,11 @@ from api.research.schemas import (
     CostEvent,
     HumanReviewAction,
     HumanReviewDecision,
+    ManualRerunPrompt,
     ObjectiveContract,
+    QueryPolicyDecision,
     RecommendedAction,
+    RerunExecutionMode,
     RerunPlan,
     ResearchAttempt,
     ResearchCheckpoint,
@@ -136,6 +139,7 @@ class ResearchRepository:
                     max_total_tool_calls INTEGER NOT NULL DEFAULT 120,
                     total_tool_calls INTEGER NOT NULL DEFAULT 0,
                     estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                    rerun_execution_mode TEXT NOT NULL DEFAULT 'api',
                     terminal_status TEXT,
                     review_claim_token TEXT,
                     review_claim_operation TEXT,
@@ -310,6 +314,24 @@ class ResearchRepository:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS manual_rerun_requests (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
+                    rerun_id TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    expected_run_no INTEGER NOT NULL,
+                    prompt TEXT NOT NULL,
+                    prompt_artifact_path TEXT NOT NULL,
+                    target_item_ids TEXT NOT NULL DEFAULT '[]',
+                    query_policy_json TEXT NOT NULL,
+                    base_report_hash TEXT,
+                    status TEXT NOT NULL,
+                    result_sha256 TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    consumed_at TEXT
+                );
+
                 CREATE UNIQUE INDEX IF NOT EXISTS research_checkpoints_run_no_unique
                 ON research_checkpoints(run_id, checkpoint_no);
 
@@ -332,11 +354,19 @@ class ResearchRepository:
 
                 CREATE INDEX IF NOT EXISTS human_review_decisions_run_order
                 ON human_review_decisions(run_id, decision_no, created_at);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS manual_rerun_requests_active_run_unique
+                ON manual_rerun_requests(run_id)
+                WHERE status = 'pending';
+
+                CREATE UNIQUE INDEX IF NOT EXISTS manual_rerun_requests_run_rerun_unique
+                ON manual_rerun_requests(run_id, rerun_id);
                 """
             )
             self._ensure_run_columns(connection)
             self._ensure_attempt_columns(connection)
             self._ensure_manual_import_table(connection)
+            self._ensure_manual_rerun_table(connection)
 
     def _ensure_run_columns(self, connection: sqlite3.Connection) -> None:
         rows = connection.execute("PRAGMA table_info(research_runs)").fetchall()
@@ -355,6 +385,7 @@ class ResearchRepository:
             "review_claim_token": "TEXT",
             "review_claim_operation": "TEXT",
             "review_claim_expires_at": "TEXT",
+            "rerun_execution_mode": "TEXT NOT NULL DEFAULT 'api'",
         }
         for name, definition in columns.items():
             if name not in existing:
@@ -386,6 +417,36 @@ class ResearchRepository:
             """
         )
 
+    def _ensure_manual_rerun_table(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS manual_rerun_requests (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
+                rerun_id TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                expected_run_no INTEGER NOT NULL,
+                prompt TEXT NOT NULL,
+                prompt_artifact_path TEXT NOT NULL,
+                target_item_ids TEXT NOT NULL DEFAULT '[]',
+                query_policy_json TEXT NOT NULL,
+                base_report_hash TEXT,
+                status TEXT NOT NULL,
+                result_sha256 TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                consumed_at TEXT
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS manual_rerun_requests_active_run_unique
+            ON manual_rerun_requests(run_id)
+            WHERE status = 'pending';
+
+            CREATE UNIQUE INDEX IF NOT EXISTS manual_rerun_requests_run_rerun_unique
+            ON manual_rerun_requests(run_id, rerun_id);
+            """
+        )
+
     def create_run(
         self,
         *,
@@ -406,9 +467,10 @@ class ResearchRepository:
                     max_targeted_rerun_runs, max_full_rerun_runs,
                     max_llm_patch_runs, max_verification_runs, max_total_iterations,
                     max_total_tool_calls,
+                    rerun_execution_mode,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(run_id),
@@ -429,6 +491,7 @@ class ResearchRepository:
                     else settings.default_max_verification_runs,
                     options.max_total_iterations or settings.default_max_total_iterations,
                     max_tool_calls,
+                    RerunExecutionMode.API.value,
                     now.isoformat(),
                     now.isoformat(),
                 ),
@@ -525,9 +588,12 @@ class ResearchRepository:
                     max_targeted_rerun_runs, max_full_rerun_runs,
                     max_llm_patch_runs, max_verification_runs, max_total_iterations,
                     max_total_tool_calls, total_tool_calls, estimated_cost_usd,
-                    warnings, created_at, updated_at
+                    rerun_execution_mode, warnings, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 1, 0, 0, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+                VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 1, 0, 0, ?, ?, ?, ?, ?, ?,
+                    0, 0, ?, ?, ?, ?
+                )
                 """,
                 (
                     str(run_id),
@@ -553,6 +619,7 @@ class ResearchRepository:
                     else settings.default_max_verification_runs,
                     options.max_total_iterations or settings.default_max_total_iterations,
                     max_tool_calls,
+                    request_metadata.get("rerun_execution_mode", RerunExecutionMode.API.value),
                     _json_dump([]),
                     now_text,
                     now_text,
@@ -669,6 +736,7 @@ class ResearchRepository:
                     "request_hash": request_hash,
                     "allow_remote_review": request_metadata.get("allow_remote_review"),
                     "allow_api_reruns": request_metadata.get("allow_api_reruns"),
+                    "rerun_execution_mode": request_metadata.get("rerun_execution_mode"),
                 },
             )
             self._insert_checkpoint(
@@ -1865,6 +1933,216 @@ class ResearchRepository:
             ).fetchall()
         return [RerunPlan.model_validate_json(row["plan_json"]) for row in rows]
 
+    def add_manual_rerun_request(
+        self,
+        run_id: UUID,
+        *,
+        plan: RerunPlan,
+        expected_run_no: int,
+        prompt: str,
+        prompt_artifact_path: str,
+        query_policy: QueryPolicyDecision,
+        base_report_hash: str | None,
+    ) -> ManualRerunPrompt:
+        now = utc_now()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO manual_rerun_requests (
+                    id, run_id, rerun_id, scope, expected_run_no, prompt,
+                    prompt_artifact_path, target_item_ids, query_policy_json,
+                    base_report_hash, status, result_sha256, created_at, updated_at,
+                    consumed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, NULL)
+                """,
+                (
+                    str(uuid4()),
+                    str(run_id),
+                    plan.rerun_id,
+                    plan.scope,
+                    expected_run_no,
+                    prompt,
+                    prompt_artifact_path,
+                    _json_dump(plan.target_item_ids),
+                    query_policy.model_dump_json(),
+                    base_report_hash,
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            self.append_history(
+                connection,
+                run_id,
+                {
+                    "step": "manual_rerun_prompt_created",
+                    "rerun_id": plan.rerun_id,
+                    "scope": plan.scope,
+                    "expected_run_no": expected_run_no,
+                    "target_item_ids": plan.target_item_ids,
+                    "prompt_artifact_path": prompt_artifact_path,
+                },
+            )
+        return ManualRerunPrompt(
+            rerun_id=plan.rerun_id,
+            scope=plan.scope,
+            expected_run_no=expected_run_no,
+            prompt=prompt,
+            prompt_artifact_path=prompt_artifact_path,
+            target_item_ids=plan.target_item_ids,
+            query_policy=query_policy,
+            base_report_hash=base_report_hash,
+            created_at=now,
+        )
+
+    def get_active_manual_rerun_request(
+        self,
+        run_id: UUID,
+    ) -> ManualRerunPrompt | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM manual_rerun_requests
+                WHERE run_id = ? AND status = 'pending'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (str(run_id),),
+            ).fetchone()
+        return None if row is None else self._row_to_manual_rerun_prompt(row)
+
+    def get_manual_rerun_request_row(
+        self,
+        run_id: UUID,
+        rerun_id: str,
+    ) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT *
+                FROM manual_rerun_requests
+                WHERE run_id = ? AND rerun_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (str(run_id), rerun_id),
+            ).fetchone()
+
+    def mark_manual_rerun_request_accepted(
+        self,
+        run_id: UUID,
+        *,
+        rerun_id: str,
+        result_sha256: str,
+    ) -> bool:
+        now = utc_now().isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE manual_rerun_requests
+                SET status = 'accepted',
+                    result_sha256 = ?,
+                    updated_at = ?,
+                    consumed_at = ?
+                WHERE run_id = ?
+                  AND rerun_id = ?
+                  AND status = 'pending'
+                """,
+                (result_sha256, now, now, str(run_id), rerun_id),
+            )
+            if cursor.rowcount == 1:
+                self.append_history(
+                    connection,
+                    run_id,
+                    {
+                        "step": "manual_rerun_result_accepted",
+                        "rerun_id": rerun_id,
+                        "result_sha256": result_sha256,
+                    },
+                )
+            return cursor.rowcount == 1
+
+    def accept_manual_rerun_request_and_update_run(
+        self,
+        run_id: UUID,
+        *,
+        rerun_id: str,
+        result_sha256: str,
+        allowed_statuses: set[RunStatus],
+        **fields: Any,
+    ) -> ResearchRunRecord | None:
+        if not allowed_statuses or not fields:
+            return None
+
+        now = utc_now().isoformat()
+        fields["updated_at"] = now
+        columns = ", ".join(f"{key} = ?" for key in fields)
+        status_placeholders = ", ".join("?" for _ in allowed_statuses)
+        run_values = [self._db_value(value) for value in fields.values()]
+        run_values.extend(
+            [
+                str(run_id),
+                *[status.value for status in allowed_statuses],
+                str(run_id),
+                rerun_id,
+            ]
+        )
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE research_runs
+                SET {columns}
+                WHERE id = ?
+                  AND status IN ({status_placeholders})
+                  AND EXISTS (
+                      SELECT 1
+                      FROM manual_rerun_requests
+                      WHERE run_id = ?
+                        AND rerun_id = ?
+                        AND status = 'pending'
+                  )
+                """,
+                run_values,
+            )
+            if cursor.rowcount != 1:
+                return None
+
+            cursor = connection.execute(
+                """
+                UPDATE manual_rerun_requests
+                SET status = 'accepted',
+                    result_sha256 = ?,
+                    updated_at = ?,
+                    consumed_at = ?
+                WHERE run_id = ?
+                  AND rerun_id = ?
+                  AND status = 'pending'
+                """,
+                (result_sha256, now, now, str(run_id), rerun_id),
+            )
+            if cursor.rowcount != 1:
+                raise sqlite3.IntegrityError("pending manual rerun was not accepted")
+
+            self.append_history(
+                connection,
+                run_id,
+                {
+                    "step": "manual_rerun_result_accepted",
+                    "rerun_id": rerun_id,
+                    "result_sha256": result_sha256,
+                },
+            )
+            row = connection.execute(
+                "SELECT * FROM research_runs WHERE id = ?",
+                (str(run_id),),
+            ).fetchone()
+
+        if row is None:
+            raise KeyError(str(run_id))
+        return self._row_to_run(row)
+
     def add_verification_query(
         self,
         run_id: UUID,
@@ -2427,6 +2705,9 @@ class ResearchRepository:
             max_total_tool_calls=row["max_total_tool_calls"],
             total_tool_calls=row["total_tool_calls"],
             estimated_cost_usd=row["estimated_cost_usd"],
+            rerun_execution_mode=RerunExecutionMode(
+                row["rerun_execution_mode"] if "rerun_execution_mode" in row.keys() else "api"
+            ),
             terminal_status=row["terminal_status"],
             review_claim_token=row["review_claim_token"],
             review_claim_operation=row["review_claim_operation"],
@@ -2460,6 +2741,19 @@ class ResearchRepository:
             ],
             error=row["error"],
             raw_response_artifact_path=row["raw_response_artifact_path"],
+            created_at=_parse_dt(row["created_at"]),
+        )
+
+    def _row_to_manual_rerun_prompt(self, row: sqlite3.Row) -> ManualRerunPrompt:
+        return ManualRerunPrompt(
+            rerun_id=row["rerun_id"],
+            scope=row["scope"],
+            expected_run_no=int(row["expected_run_no"]),
+            prompt=row["prompt"],
+            prompt_artifact_path=row["prompt_artifact_path"],
+            target_item_ids=_json_load(row["target_item_ids"], []),
+            query_policy=QueryPolicyDecision.model_validate_json(row["query_policy_json"]),
+            base_report_hash=row["base_report_hash"],
             created_at=_parse_dt(row["created_at"]),
         )
 

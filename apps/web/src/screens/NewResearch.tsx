@@ -18,7 +18,7 @@ import {
 } from "../researchDefaults";
 import { navigate, routes } from "../router";
 import { trackRun } from "../runStore";
-import { OPTION_BOUNDS } from "../types";
+import { OPTION_BOUNDS, type RerunExecutionMode } from "../types";
 
 const MAX_PROMPT_CHARS = 50_000;
 const MAX_REPORT_CHARS = 50_000;
@@ -62,6 +62,8 @@ export function NewResearch() {
   const [manualReportSource, setManualReportSource] = useState<ManualSource>("text");
   const [manualReportText, setManualReportText] = useState("");
   const [manualReportFile, setManualReportFile] = useState<File | null>(null);
+  const [rerunExecutionMode, setRerunExecutionMode] =
+    useState<RerunExecutionMode>("api");
   const [manualPromptValidationVisible, setManualPromptValidationVisible] = useState(false);
   const [manualReportValidationVisible, setManualReportValidationVisible] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -201,7 +203,8 @@ export function NewResearch() {
                   : { source: "text", text: manualReportText.trim() },
               options: requestOptions,
               allow_remote_review: true,
-              allow_api_reruns: true,
+              allow_api_reruns: rerunExecutionMode !== "disabled",
+              rerun_execution_mode: rerunExecutionMode,
             });
 
       const title =
@@ -364,6 +367,50 @@ export function NewResearch() {
                 setManualReportValidationVisible(true);
               }}
             />
+            <fieldset className="form-section mode-fieldset">
+              <legend className="form-label">Rerun実行方法</legend>
+              <div className="segmented-control segmented-control--three">
+                <label
+                  className={`segmented-option${rerunExecutionMode === "api" ? " segmented-option--active" : ""}`}
+                >
+                  <input
+                    type="radio"
+                    name="rerun-execution-mode"
+                    value="api"
+                    checked={rerunExecutionMode === "api"}
+                    onChange={() => setRerunExecutionMode("api")}
+                    disabled={submitting}
+                  />
+                  API
+                </label>
+                <label
+                  className={`segmented-option${rerunExecutionMode === "manual_chatgpt" ? " segmented-option--active" : ""}`}
+                >
+                  <input
+                    type="radio"
+                    name="rerun-execution-mode"
+                    value="manual_chatgpt"
+                    checked={rerunExecutionMode === "manual_chatgpt"}
+                    onChange={() => setRerunExecutionMode("manual_chatgpt")}
+                    disabled={submitting}
+                  />
+                  ChatGPT手動
+                </label>
+                <label
+                  className={`segmented-option${rerunExecutionMode === "disabled" ? " segmented-option--active" : ""}`}
+                >
+                  <input
+                    type="radio"
+                    name="rerun-execution-mode"
+                    value="disabled"
+                    checked={rerunExecutionMode === "disabled"}
+                    onChange={() => setRerunExecutionMode("disabled")}
+                    disabled={submitting}
+                  />
+                  無効
+                </label>
+              </div>
+            </fieldset>
           </>
         )}
 

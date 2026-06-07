@@ -31,6 +31,7 @@ import type {
   ResearchRunLineageResponse,
   RerunPlan,
   ResearchRunStatusResponse,
+  RerunExecutionMode,
   ToolCallSummary,
 } from "../types";
 import { apiClient } from "./client";
@@ -69,6 +70,7 @@ export interface CreateManualImportRunRequest {
   options?: CreateResearchRunRequest["options"];
   allow_remote_review: boolean;
   allow_api_reruns: boolean;
+  rerun_execution_mode?: RerunExecutionMode;
   idempotency_key?: string | null;
 }
 
@@ -92,10 +94,41 @@ export function createManualImportRun(
   }
   body.append("allow_remote_review", String(request.allow_remote_review));
   body.append("allow_api_reruns", String(request.allow_api_reruns));
+  if (request.rerun_execution_mode) {
+    body.append("rerun_execution_mode", request.rerun_execution_mode);
+  }
   if (request.idempotency_key?.trim()) {
     body.append("idempotency_key", request.idempotency_key.trim());
   }
   return apiClient.request(`${BASE}/manual-import`, { method: "POST", body, signal });
+}
+
+type ManualRerunResultSource =
+  | { source: "text"; text: string }
+  | { source: "file"; file: File };
+
+export interface UploadManualRerunResultRequest {
+  rerun_id: string;
+  report: ManualRerunResultSource;
+}
+
+export function uploadManualRerunResult(
+  runId: string,
+  request: UploadManualRerunResultRequest,
+  signal?: AbortSignal,
+): Promise<ResearchRunStatusResponse> {
+  const body = new FormData();
+  body.append("rerun_id", request.rerun_id);
+  if (request.report.source === "file") {
+    body.append("report_file", request.report.file);
+  } else {
+    body.append("report_text", request.report.text);
+  }
+  return apiClient.request(`${BASE}/${runId}/manual-rerun-result`, {
+    method: "POST",
+    body,
+    signal,
+  });
 }
 
 export function listHumanReviews(signal?: AbortSignal): Promise<HumanReviewQueueItem[]> {

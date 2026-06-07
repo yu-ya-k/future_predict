@@ -50,6 +50,12 @@ class HumanReviewAction(StrEnum):
     REJECT = "reject"
 
 
+class RerunExecutionMode(StrEnum):
+    API = "api"
+    MANUAL_CHATGPT = "manual_chatgpt"
+    DISABLED = "disabled"
+
+
 class ResearchRunOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -543,6 +549,18 @@ class RerunPlansResponse(BaseModel):
     rerun_plans: list[RerunPlan]
 
 
+class ManualRerunPrompt(BaseModel):
+    rerun_id: str
+    scope: str
+    expected_run_no: int
+    prompt: str
+    prompt_artifact_path: str
+    target_item_ids: list[str] = Field(default_factory=list)
+    query_policy: QueryPolicyDecision
+    base_report_hash: str | None = None
+    created_at: datetime
+
+
 class CancelResponse(BaseModel):
     run_id: UUID
     status: RunStatus
@@ -588,6 +606,7 @@ class HumanReviewPayload(BaseModel):
     allowed_actions: list[HumanReviewAction]
     audit_summary: HumanReviewAuditSummary
     warnings: list[str]
+    pending_manual_rerun: ManualRerunPrompt | None = None
 
 
 class HumanReviewDecision(BaseModel):
@@ -627,6 +646,7 @@ class ResearchRunRecord(BaseModel):
     max_total_tool_calls: int
     total_tool_calls: int
     estimated_cost_usd: float
+    rerun_execution_mode: RerunExecutionMode = RerunExecutionMode.API
     terminal_status: str | None = None
     review_claim_token: str | None = None
     review_claim_operation: str | None = None

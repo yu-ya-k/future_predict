@@ -24,7 +24,11 @@ import {
   Skeleton,
   VerdictBadge,
 } from "../components";
-import { getHumanReviewPayload, resumeRun } from "../api/research";
+import {
+  getHumanReviewPayload,
+  resumeRun,
+  uploadManualRerunResult,
+} from "../api/research";
 import { ApiError } from "../api/client";
 import { navigate, routes } from "../router";
 import {
@@ -51,6 +55,26 @@ const ITEM_SEVERITY_LABEL: Record<ResearchItem["severity"], string> = {
   minor: "Minor",
 };
 
+function safeManualRerunFilename(runId: string, rerunId: string): string {
+  const safeRunId = runId.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  const safeRerunId = rerunId.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return `${safeRunId || "research-run"}-${safeRerunId || "manual-rerun"}-prompt.md`;
+}
+
+function downloadMarkdown(filename: string, markdown: string) {
+  const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.rel = "noopener";
+  anchor.style.display = "none";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 interface HumanReviewProps {
   runId: string;
 }
@@ -63,6 +87,12 @@ export function HumanReview({ runId }: HumanReviewProps) {
   const [comment, setComment] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [manualResultText, setManualResultText] = useState("");
+  const [manualResultFile, setManualResultFile] = useState<File | null>(null);
+  const [manualUploadMode, setManualUploadMode] = useState<"text" | "file">("text");
+  const [manualUploading, setManualUploading] = useState(false);
+  const [manualUploadError, setManualUploadError] = useState<string | null>(null);
+  const [copyStatus, setCopyStatus] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
   const requestGenerationRef = useRef(0);
@@ -135,6 +165,83 @@ export function HumanReview({ runId }: HumanReviewProps) {
     }
   }
 
+  async function handleCopyManualPrompt() {
+    const prompt = payload?.pending_manual_rerun?.prompt;
+    if (!prompt) return;
+    if (!navigator.clipboard?.writeText) {
+      setCopyStatus("コピーできませんでした");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(prompt);
+      setCopyStatus("コピーしました");
+    } catch {
+      setCopyStatus("コピーできませんでした");
+    }
+  }
+
+  function handleManualUploadModeChange(mode: "text" | "file") {
+    setManualUploadMode(mode);
+    setManualUploadError(null);
+  }
+
+  function handleManualResultTextChange(value: string) {
+    setManualResultText(value);
+    setManualUploadError(null);
+  }
+
+  function handleManualResultFileChange(file: File | null) {
+    setManualResultFile(file);
+    setManualUploadError(null);
+  }
+
+  function handleDownloadManualPrompt() {
+    const pending = payload?.pending_manual_rerun;
+    if (!pending) return;
+    downloadMarkdown(safeManualRerunFilename(runId, pending.rerun_id), pending.prompt);
+  }
+
+  async function handleManualRerunUpload(e: React.FormEvent) {
+    e.preventDefault();
+    const pending = payload?.pending_manual_rerun;
+    if (!pending) return;
+    const text = manualResultText.trim();
+    if (manualUploadMode === "text" && !text) {
+      setManualUploadError("結果テキストを入力してください");
+      return;
+    }
+    if (manualUploadMode === "file" && !manualResultFile) {
+      setManualUploadError("結果ファイルを選択してください");
+      return;
+    }
+
+    setManualUploading(true);
+    setManualUploadError(null);
+    try {
+      await uploadManualRerunResult(runId, {
+        rerun_id: pending.rerun_id,
+        report:
+          manualUploadMode === "file"
+            ? { source: "file", file: manualResultFile as File }
+            : { source: "text", text },
+      });
+      navigate(routes().monitor(runId));
+    } catch (err) {
+      if (err instanceof ApiError && err.isConflict) {
+        setManualUploadError(
+          `アップロードが競合しました: ${err.detail ?? "詳細不明"}。最新の状態を確認します。`,
+        );
+        void fetchPayload();
+      } else if (err instanceof ApiError) {
+        setManualUploadError(err.detail ?? err.message);
+      } else {
+        setManualUploadError("予期しないエラーが発生しました");
+      }
+    } finally {
+      setManualUploading(false);
+    }
+  }
+
   // ── Loading state ─────────────────────────────────────────────────────────
 
   if (loading) {
@@ -167,6 +274,7 @@ export function HumanReview({ runId }: HumanReviewProps) {
   if (!payload) return null;
 
   const { latest_review, audit_summary, allowed_actions } = payload;
+  const pendingManualRerun = payload.pending_manual_rerun ?? null;
   const unresolvedItems = payload.unresolved_items ?? [];
   const latestItemAssessments = latest_review?.item_assessments ?? [];
 
@@ -372,6 +480,119 @@ export function HumanReview({ runId }: HumanReviewProps) {
         </div>
       </section>
 
+      {pendingManualRerun && (
+        <section className="review-manual-rerun" aria-labelledby="manual-rerun-heading">
+          <h2 id="manual-rerun-heading" className="section-title">
+            ChatGPT手動rerun
+          </h2>
+          <div className="latest-review-card">
+            <div className="latest-review-header">
+              <span className="reviewer-confidence">
+                {pendingManualRerun.scope === "full_rerun" ? "Full rerun" : "Targeted rerun"}
+              </span>
+              <span className="reviewer-confidence">
+                {pendingManualRerun.rerun_id}
+              </span>
+              <span className="reviewer-confidence">
+                Deep Research {pendingManualRerun.expected_run_no}回目
+              </span>
+            </div>
+            <pre className="prompt-attempt-body">{pendingManualRerun.prompt}</pre>
+            <div className="form-actions">
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => void handleCopyManualPrompt()}
+              >
+                コピー
+              </button>
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={handleDownloadManualPrompt}
+              >
+                .md ダウンロード
+              </button>
+              {copyStatus && (
+                <span className="char-counter" aria-live="polite">
+                  {copyStatus}
+                </span>
+              )}
+            </div>
+          </div>
+
+          <form className="manual-rerun-upload" onSubmit={handleManualRerunUpload}>
+            <fieldset className="source-fieldset">
+              <legend className="form-label">Rerun結果</legend>
+              <div className="source-switch">
+                <label>
+                  <input
+                    type="radio"
+                    name="manual-rerun-result-source"
+                    checked={manualUploadMode === "text"}
+                    onChange={() => handleManualUploadModeChange("text")}
+                    disabled={manualUploading}
+                  />
+                  テキスト
+                </label>
+                <label>
+                  <input
+                    type="radio"
+                    name="manual-rerun-result-source"
+                    checked={manualUploadMode === "file"}
+                    onChange={() => handleManualUploadModeChange("file")}
+                    disabled={manualUploading}
+                  />
+                  ファイル
+                </label>
+              </div>
+            </fieldset>
+            {manualUploadMode === "text" ? (
+              <textarea
+                className="comment-textarea"
+                value={manualResultText}
+                onChange={(event) => handleManualResultTextChange(event.target.value)}
+                rows={10}
+                aria-label="Rerun結果テキスト"
+                disabled={manualUploading}
+              />
+            ) : (
+              <div className="file-input-row">
+                <input
+                  type="file"
+                  accept=".md,.txt,text/markdown,text/plain"
+                  aria-label="Rerun結果ファイル"
+                  onChange={(event) =>
+                    handleManualResultFileChange(event.target.files?.[0] ?? null)
+                  }
+                  disabled={manualUploading}
+                />
+                {manualResultFile && (
+                  <span className="file-input-meta">{manualResultFile.name}</span>
+                )}
+              </div>
+            )}
+            {manualUploadError && (
+              <div className="review-submit-error" role="alert">
+                {manualUploadError}
+              </div>
+            )}
+            <div className="form-actions">
+              <button
+                type="submit"
+                className="btn-primary"
+                disabled={manualUploading}
+                aria-busy={manualUploading}
+              >
+                {manualUploading ? "アップロード中..." : "結果をアップロード"}
+              </button>
+            </div>
+          </form>
+        </section>
+      )}
+
+      {!pendingManualRerun && (
+        <>
       {/* ── Comment ───────────────────────────────────── */}
       <section className="review-comment">
         <label className="form-label" htmlFor="review-comment">
@@ -483,6 +704,8 @@ export function HumanReview({ runId }: HumanReviewProps) {
           />
         </div>
       </section>
+        </>
+      )}
     </div>
   );
 }

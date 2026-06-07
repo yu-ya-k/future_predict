@@ -33,6 +33,7 @@ import { App } from "./App";
 import { Markdown } from "./components";
 import type {
   AuditResponse,
+  HumanReviewPayload,
   ItemAssessment,
   ResearchAttempt,
   ResearchCheckpoint,
@@ -1311,6 +1312,44 @@ describe("NewResearch (SCR-1)", () => {
     expect(options.max_full_rerun_runs).toBe(1);
   });
 
+  it("sends manual ChatGPT rerun execution mode for manual imports", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 202,
+      json: () =>
+        Promise.resolve({
+          run_id: "run-manual-chatgpt-rerun-test",
+          thread_id: "thread-1",
+          status: "needs_human_review",
+          created_at: new Date().toISOString(),
+        }),
+    } as Response);
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.click(
+      screen.getByRole("radio", { name: "ChatGPT結果を取り込み" }),
+    );
+    await userEvent.click(screen.getByRole("radio", { name: "ChatGPT手動" }));
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "入力プロンプト" }),
+      "手動プロンプト",
+    );
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "出力レポート" }),
+      "手動レポート",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: /取り込んでレビューを開始/i }),
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const body = fetchMock.mock.calls[0][1]?.body as FormData;
+    expect(body.get("allow_api_reruns")).toBe("true");
+    expect(body.get("rerun_execution_mode")).toBe("manual_chatgpt");
+  });
+
   it("omits inactive manual text and sends the selected file source", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
@@ -1824,6 +1863,36 @@ describe("RunMonitor (SCR-3)", () => {
       within(promptPanel).getByText("Deep Research 1回目 手動取り込み"),
     ).toBeInTheDocument();
     expect(within(promptPanel).getByText("手動取り込み")).toBeInTheDocument();
+  });
+
+  it("labels manual ChatGPT rerun attempts in the monitor prompt panel", async () => {
+    mockRunMonitorFetch({
+      attempts: [
+        makeResearchAttempt(1, {
+          response_id: null,
+          model: "chatgpt-deep-research-manual",
+          source: "manual_upload",
+        }),
+        makeResearchAttempt(2, {
+          response_id: null,
+          model: "chatgpt-deep-research-manual",
+          source: "manual_chatgpt_rerun",
+          prompt: "# 手動rerun指示",
+        }),
+      ],
+    });
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "指示内容" }));
+
+    const promptPanel = await screen.findByRole("region", {
+      name: "Deep Researchへの指示内容",
+    });
+    expect(
+      within(promptPanel).getByText("Deep Research 2回目 ChatGPT手動rerun"),
+    ).toBeInTheDocument();
+    expect(within(promptPanel).getByText("ChatGPT手動rerun")).toBeInTheDocument();
   });
 
   it("returns to the dashboard from the run monitor", async () => {
@@ -3807,6 +3876,53 @@ describe("ReportViewer (SCR-5)", () => {
     expect(screen.getByText("手動取り込み")).toBeInTheDocument();
   });
 
+  it("labels manual ChatGPT rerun attempts in the report history", async () => {
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/citations`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve([
+              makeAttempt(2, "# Manual rerun delta", "completed", {
+                response_id: null,
+                model: "chatgpt-deep-research-manual",
+                source: "manual_chatgpt_rerun",
+              }),
+            ]),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "completed",
+            final_report: null,
+            report: null,
+            warnings: [],
+          }),
+      } as Response);
+    });
+    window.location.hash = `#/runs/${runId}/report?attempt=2`;
+
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: /2回目 ChatGPT手動rerun/ }))
+      .toBeInTheDocument();
+    expect(screen.getByText("Source")).toBeInTheDocument();
+    expect(screen.getByText("ChatGPT手動rerun")).toBeInTheDocument();
+  });
+
   it("defaults to the final report without mixed tabs or PDF printing", async () => {
     globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
@@ -4496,6 +4612,42 @@ describe("AuditLog (SCR-6)", () => {
     expect(screen.getByText("chatgpt-deep-research-manual")).toBeInTheDocument();
   });
 
+  it("labels manual ChatGPT rerun attempts in the audit attempts table", async () => {
+    window.location.hash = `#/runs/${runId}/audit`;
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve(
+          makeAuditResponse({
+            run_id: runId,
+            attempts: [
+              {
+                run_no: 2,
+                response_id: null,
+                status: "completed",
+                model: "chatgpt-deep-research-manual",
+                prompt: "# Manual rerun prompt",
+                report: "# Manual rerun result",
+                source: "manual_chatgpt_rerun",
+                citations: [],
+                tool_calls_summary: [],
+                error: null,
+                created_at: "2026-06-06T01:02:03.000Z",
+              },
+            ],
+          }),
+        ),
+    } as Response);
+
+    render(<App />);
+
+    expect(await screen.findByRole("tab", { name: "調査試行" }))
+      .toHaveAttribute("aria-selected", "true");
+    expect(screen.getByText("ChatGPT手動rerun")).toBeInTheDocument();
+    expect(screen.getByText("chatgpt-deep-research-manual")).toBeInTheDocument();
+  });
+
   it("renders only http and https citation URLs as links in the audit log", async () => {
     window.location.hash = `#/runs/${runId}/audit?tab=citations`;
     globalThis.fetch = vi.fn().mockResolvedValue({
@@ -4621,12 +4773,31 @@ describe("AuditLog (SCR-6)", () => {
 describe("HumanReview (SCR-4)", () => {
   const runId = "run-hr-test";
 
+  function makePendingManualRerun(
+    overrides: Partial<NonNullable<HumanReviewPayload["pending_manual_rerun"]>> = {},
+  ): NonNullable<HumanReviewPayload["pending_manual_rerun"]> {
+    return {
+      rerun_id: "RR-manual-1",
+      scope: "targeted_gap_closure",
+      expected_run_no: 2,
+      prompt: "# Manual rerun prompt\nFind better official sources.",
+      prompt_artifact_path: "prompts/rerun_prompt_002.txt",
+      target_item_ids: ["RI-001"],
+      query_policy: { status: "allowed", safe_queries: [], blocked_reason: null },
+      base_report_hash: "hash-base",
+      created_at: "2026-06-06T01:02:03.000Z",
+      ...overrides,
+    };
+  }
+
   function makePayload(
     allowedActions: string[],
     overrides: Partial<{
       latest_report: string;
       latest_review: null;
       reason: string;
+      pending_manual_rerun: NonNullable<HumanReviewPayload["pending_manual_rerun"]>;
+      allowed_actions: string[];
     }> = {},
   ) {
     return {
@@ -4654,8 +4825,9 @@ describe("HumanReview (SCR-4)", () => {
         high_risk_flags: [],
         public_web_search_used: false,
       },
-      allowed_actions: allowedActions,
+      allowed_actions: overrides.allowed_actions ?? allowedActions,
       audit_summary: {
+        deep_research_runs: 1,
         targeted_rerun_runs: 2,
         full_rerun_runs: 1,
         llm_patch_runs: 1,
@@ -4666,6 +4838,7 @@ describe("HumanReview (SCR-4)", () => {
         estimated_cost_usd: 1.23,
       },
       warnings: [],
+      pending_manual_rerun: overrides.pending_manual_rerun ?? null,
     };
   }
 
@@ -4735,6 +4908,299 @@ describe("HumanReview (SCR-4)", () => {
     expect(targetedRerunBtn).toBeDisabled();
     expect(fullRerunBtn).not.toBeDisabled();
     expect(firstDecisionButton?.dataset.action).toBe("request_full_rerun");
+  });
+
+  it("shows pending manual rerun prompt and preserves typed result after 409 refetch", async () => {
+    const pending = makePendingManualRerun();
+    let payloadFetches = 0;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/manual-rerun-result`)) {
+        const body = init?.body as FormData;
+        expect(body.get("rerun_id")).toBe("RR-manual-1");
+        expect(body.get("report_text")).toBe("uploaded manual result");
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          json: () => Promise.resolve({ detail: "stale rerun id" }),
+        } as Response);
+      }
+      payloadFetches += 1;
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve(
+            makePayload([], {
+              reason: "manual_chatgpt_rerun_pending",
+              pending_manual_rerun: pending,
+              allowed_actions: [],
+            }),
+          ),
+      } as Response);
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    expect(await screen.findByText("ChatGPT手動rerun")).toBeInTheDocument();
+    expect(screen.getByText(/Find better official sources/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "承認" })).not.toBeInTheDocument();
+
+    const resultBox = screen.getByRole("textbox", { name: "Rerun結果テキスト" });
+    await userEvent.type(resultBox, "uploaded manual result");
+    await userEvent.click(screen.getByRole("button", { name: "結果をアップロード" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("stale rerun id");
+    await waitFor(() => expect(payloadFetches).toBeGreaterThanOrEqual(2));
+    expect(screen.getByRole("textbox", { name: "Rerun結果テキスト" }))
+      .toHaveValue("uploaded manual result");
+  });
+
+  it("uploads pending manual rerun text and navigates to monitor on success", async () => {
+    const pending = makePendingManualRerun();
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/manual-rerun-result`)) {
+        const body = init?.body as FormData;
+        expect(body.get("rerun_id")).toBe("RR-manual-1");
+        expect(body.get("report_text")).toBe("accepted manual result");
+        expect(body.get("report_file")).toBeNull();
+        return Promise.resolve(
+          jsonResponse({
+            run_id: runId,
+            status: "reviewing",
+            done_reason: null,
+            needs_human_review: false,
+            progress: {
+              deep_research_runs: 2,
+              items_total: 0,
+              items_answered: 0,
+              items_partial: 0,
+              items_unanswered: 0,
+              items_unverifiable: 0,
+              blockers_unresolved: 0,
+              targeted_rerun_runs: 1,
+              full_rerun_runs: 0,
+              llm_patch_runs: 0,
+              verification_runs: 0,
+              total_reviews: 1,
+              latest_verdict: null,
+              latest_score: null,
+              total_tool_calls: 0,
+              estimated_cost_usd: 0,
+            },
+          }),
+        );
+      }
+      if (url.endsWith(`/research-runs/${runId}/human-review`)) {
+        return Promise.resolve(
+          jsonResponse(
+            makePayload([], {
+              reason: "manual_chatgpt_rerun_pending",
+              pending_manual_rerun: pending,
+              allowed_actions: [],
+            }),
+          ),
+        );
+      }
+      return Promise.resolve(
+        jsonResponse({
+          run_id: runId,
+          status: "reviewing",
+          done_reason: null,
+          needs_human_review: false,
+          progress: {
+            deep_research_runs: 2,
+            items_total: 0,
+            items_answered: 0,
+            items_partial: 0,
+            items_unanswered: 0,
+            items_unverifiable: 0,
+            blockers_unresolved: 0,
+            targeted_rerun_runs: 1,
+            full_rerun_runs: 0,
+            llm_patch_runs: 0,
+            verification_runs: 0,
+            total_reviews: 1,
+            latest_verdict: null,
+            latest_score: null,
+            total_tool_calls: 0,
+            estimated_cost_usd: 0,
+          },
+        }),
+      );
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.type(
+      await screen.findByRole("textbox", { name: "Rerun結果テキスト" }),
+      "accepted manual result",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "結果をアップロード" }));
+
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/runs/${runId}`);
+    });
+  });
+
+  it("uploads pending manual rerun result as a file", async () => {
+    const pending = makePendingManualRerun();
+    const reportFile = new File(["# Uploaded rerun"], "rerun-result.md", {
+      type: "text/markdown",
+    });
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/manual-rerun-result`)) {
+        const body = init?.body as FormData;
+        expect(body.get("rerun_id")).toBe("RR-manual-1");
+        expect(body.get("report_text")).toBeNull();
+        expect(body.get("report_file")).toBe(reportFile);
+        return Promise.resolve(jsonResponse({ run_id: runId, status: "reviewing" }));
+      }
+      if (url.endsWith(`/research-runs/${runId}/human-review`)) {
+        return Promise.resolve(
+          jsonResponse(
+            makePayload([], {
+              reason: "manual_chatgpt_rerun_pending",
+              pending_manual_rerun: pending,
+              allowed_actions: [],
+            }),
+          ),
+        );
+      }
+      return Promise.resolve(jsonResponse({ run_id: runId, status: "reviewing" }));
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByLabelText("ファイル"));
+    await userEvent.upload(screen.getByLabelText("Rerun結果ファイル"), reportFile);
+    expect(screen.getByText("rerun-result.md")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "結果をアップロード" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        `http://localhost:8000/research-runs/${runId}/manual-rerun-result`,
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+  });
+
+  it("copies pending manual rerun prompt and reports clipboard failures", async () => {
+    const pending = makePendingManualRerun({ prompt: "# Copy me" });
+    const originalClipboard = navigator.clipboard;
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      jsonResponse(
+        makePayload([], {
+          reason: "manual_chatgpt_rerun_pending",
+          pending_manual_rerun: pending,
+          allowed_actions: [],
+        }),
+      ),
+    );
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "コピー" }));
+    expect(writeText).toHaveBeenCalledWith("# Copy me");
+    const copyStatus = await screen.findByText("コピーしました");
+    expect(copyStatus).toHaveAttribute("aria-live", "polite");
+
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    await userEvent.click(screen.getByRole("button", { name: "コピー" }));
+    expect(await screen.findByText("コピーできませんでした")).toBeInTheDocument();
+
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: originalClipboard,
+    });
+  });
+
+  it("downloads pending manual rerun prompt as markdown", async () => {
+    const pending = makePendingManualRerun({ prompt: "# Download prompt" });
+    const createObjectURL = vi.fn((blob: Blob) => {
+      void blob;
+      return "blob:manual-rerun-prompt";
+    });
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: createObjectURL,
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: vi.fn(),
+    });
+    let clickedHref: string | null = null;
+    let clickedDownload: string | null = null;
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      clickedHref = this.href;
+      clickedDownload = this.download;
+    });
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      jsonResponse(
+        makePayload([], {
+          reason: "manual_chatgpt_rerun_pending",
+          pending_manual_rerun: pending,
+          allowed_actions: [],
+        }),
+      ),
+    );
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: ".md ダウンロード" }));
+
+    expect(createObjectURL).toHaveBeenCalledTimes(1);
+    const downloadedBlob = createObjectURL.mock.calls[0]?.[0];
+    expect(downloadedBlob).toBeInstanceOf(Blob);
+    await expect(readBlobText(downloadedBlob)).resolves.toBe("# Download prompt");
+    expect(clickedHref).toBe("blob:manual-rerun-prompt");
+    expect(clickedDownload).toBe(`${runId}-RR-manual-1-prompt.md`);
+  });
+
+  it("clears manual rerun upload validation errors when the input changes", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      jsonResponse(
+        makePayload([], {
+          reason: "manual_chatgpt_rerun_pending",
+          pending_manual_rerun: makePendingManualRerun(),
+          allowed_actions: [],
+        }),
+      ),
+    );
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "結果をアップロード" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "結果テキストを入力してください",
+    );
+
+    await userEvent.type(screen.getByRole("textbox", { name: "Rerun結果テキスト" }), "x");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await userEvent.clear(screen.getByRole("textbox", { name: "Rerun結果テキスト" }));
+    await userEvent.click(screen.getByRole("button", { name: "結果をアップロード" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "結果テキストを入力してください",
+    );
+
+    await userEvent.click(screen.getByLabelText("ファイル"));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("enables actions that are in allowed_actions", async () => {

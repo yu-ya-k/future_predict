@@ -80,12 +80,26 @@ settings, options, and import time are stored there.
 
 The run then either enters normal review or stops for human review:
 
-- Sensitive prompt/report content stops immediately with no external calls.
 - `allow_remote_review=false` stops immediately with no reviewer, finalizer, or
   verification call.
 - `allow_api_reruns=false` forces targeted and full rerun limits to zero, while
   still allowing review and bounded non-Deep-Research repair routes when remote
   review is allowed.
+- `rerun_execution_mode=api` uses the normal Deep Research API path for future
+  targeted/full reruns.
+- `rerun_execution_mode=manual_chatgpt` keeps rerun limits but pauses after
+  rerun prompt generation. The human-review payload exposes
+  `pending_manual_rerun`; operators run that prompt in ChatGPT and upload the
+  result to the same run. Targeted uploads are delta-merged, full uploads
+  replace the report, and review resumes synchronously.
+  If query policy blocks the generated prompt, the run stops with
+  `manual_rerun_prompt_blocked_by_query_policy` and no
+  `pending_manual_rerun` is exposed.
+- `rerun_execution_mode=disabled` forces targeted and full rerun limits to zero.
+
+For omitted `rerun_execution_mode`, legacy compatibility maps
+`allow_api_reruns=true` to `api` and `false` to `disabled`. If
+`allow_api_reruns=false`, an explicit `api` mode is normalized to `disabled`.
 
 If the process exits after saving a manual import but before the background
 review starts, the poller can recover the pending manual review. That recovery
@@ -265,9 +279,17 @@ Artifacts are written under `RESEARCH_ARTIFACT_DIR`:
 - `prompts/rerun_prompt_NNN.txt`
 - `raw-responses/*.json`
 - `reports/report_attempt_NNN.md`
+- `reports/report_attempt_NNN_<rerun-id>_<sha>.md` for accepted manual
+  ChatGPT rerun uploads
+- `reports/manual_chatgpt_rerun_result_NNN_<rerun-id>_<sha>.md`
 - `reports/llm_patch_NNN.md`
 - `reports/final_report.md`
 
 SQLite state, including objective contracts, research items, rerun plans, and
 verification query decisions, checkpoints, and run lineage is stored at
 `RESEARCH_DB_PATH`.
+
+Startup migrates older SQLite databases in place for this flow: existing
+`research_runs` rows default to `rerun_execution_mode=api`, and manual ChatGPT
+rerun prompt/result state is stored in `manual_rerun_requests`. A partial unique
+index keeps only one pending manual rerun request active for a run.

@@ -67,6 +67,7 @@ function safeMarkdownFilename(runId: string, attemptNo: number | null): string {
 
 function attemptSourceLabel(source?: string | null): string {
   if (source === "manual_upload") return "手動取り込み";
+  if (source === "manual_chatgpt_rerun") return "ChatGPT手動rerun";
   return "API";
 }
 
@@ -318,6 +319,8 @@ export function ReportViewer({
               title:
                 version.source === "manual_upload"
                   ? `${version.run_no}回目 手動取り込み`
+                  : version.source === "manual_chatgpt_rerun"
+                    ? `${version.run_no}回目 ChatGPT手動rerun`
                   : `${version.run_no}回目`,
               meta: `${version.status} / ${version.model}`,
             }))}

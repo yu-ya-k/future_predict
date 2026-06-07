@@ -87,6 +87,7 @@ const LLM_STEP_LABELS: Record<string, string> = {
 
 function attemptSourceLabel(source?: string | null): string {
   if (source === "manual_upload") return "手動取り込み";
+  if (source === "manual_chatgpt_rerun") return "ChatGPT手動rerun";
   return "API";
 }
 
