@@ -1260,8 +1260,19 @@ describe("Forecast UI", () => {
 
     render(<App />);
 
+    expect(
+      await screen.findByRole("heading", {
+        name: "公開情報はまだ収集されていません",
+        level: 2,
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "公開情報の収集を開始" }),
+    ).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "公開情報パック投入" })).toBeNull();
+
     const flow = await screen.findByRole("region", {
-      name: "PhaseA実行フロー",
+      name: "全体フロー",
     });
     expect(flow).toHaveClass("forecast-flow-progress--wrapped");
     const flowList = within(flow).getByRole("list", {
@@ -1277,21 +1288,129 @@ describe("Forecast UI", () => {
       ),
     ).toEqual([
       "フレーミング承認",
-      "公開情報パック投入",
-      "証拠抽出",
-      "シナリオ生成",
-      "Claim link承認",
-      "確率計算",
-      "PhaseA承認",
-      "コミット",
-      "解決",
+      "公開情報の収集",
+      "証拠を抽出",
+      "シナリオを生成",
+      "主張と結果の対応を承認",
+      "確率を計算",
+      "推定結果を承認",
+      "予測版を確定",
+      "実績結果で解決",
     ]);
     expect(within(flowItems[0]).getByText("完了")).toBeInTheDocument();
     expect(within(flowItems[1]).getByText("次に実行")).toBeInTheDocument();
     expect(within(flowItems[2]).getByText("待機")).toBeInTheDocument();
     expect(within(flow).getByText("1/9 完了")).toBeInTheDocument();
-    expect(within(flow).getByText("公開情報パックを投入")).toBeInTheDocument();
+    expect(within(flow).getByText("未収集")).toBeInTheDocument();
     expect(flow.querySelectorAll(".forecast-flow-edge--wrap-break")).toHaveLength(2);
+    expect(screen.queryByText("次にやること")).not.toBeInTheDocument();
+    expect(screen.queryByText("実行できます")).not.toBeInTheDocument();
+  });
+
+  it("separates pack submission from a backend-running research pack", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const packRequest = deferred<Response>();
+    let submitted = false;
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: submitted ? "pack_running" : "framing_approved",
+              approved_framing_version: 1,
+              current_research_pack: submitted
+                ? {
+                    pack_id: "pack-1",
+                    research_run_id: "run-1",
+                    pack_status: "running",
+                    effective_status: "running",
+                    research_run_status: "waiting_deep_research",
+                    pack_created_at: "2026-06-08T00:00:00Z",
+                    pack_updated_at: "2026-06-08T00:00:00Z",
+                    research_run_created_at: "2026-06-08T00:02:00Z",
+                    research_run_updated_at: "2026-06-08T00:02:00Z",
+                    deep_research_started_at: "2026-06-08T00:05:00Z",
+                    total_tool_calls: 1,
+                    estimated_cost_usd: 0,
+                    done_reason: null,
+                    needs_human_review: false,
+                  }
+                : null,
+              current_research_pack_status: submitted ? "running" : null,
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/research-packs" &&
+          init?.method === "POST"
+        ) {
+          return packRequest.promise;
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    const packButton = await screen.findByRole("button", {
+      name: "公開情報の収集を開始",
+    });
+    await userEvent.click(packButton);
+
+    const flow = await screen.findByRole("region", {
+      name: "全体フロー",
+    });
+    const flowList = within(flow).getByRole("list", {
+      name: "Forecast実行フロー",
+    });
+    const flowItems = within(flowList)
+      .getAllByRole("listitem")
+      .filter((item) => item.parentElement === flowList);
+    const packItem = flowItems[1];
+    expect(within(packItem).getByText("登録中")).toBeInTheDocument();
+    expect(within(packItem).getByText("サーバーに登録中")).toBeInTheDocument();
+    expect(within(packItem).queryByText("実行中")).not.toBeInTheDocument();
+    expect(screen.getAllByText("登録中").length).toBeGreaterThanOrEqual(2);
+    expect(
+      screen.getByRole("heading", { name: "公開情報をサーバーに登録中" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Research Packを作成するリクエストを送っています。登録されるとResearch run IDと開始時刻が表示されます。",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("経過時間")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "状態を再確認" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("公開情報を収集中です"),
+    ).not.toBeInTheDocument();
+
+    submitted = true;
+    packRequest.resolve(
+      jsonResponse({
+        pack_id: "pack-1",
+        forecast_id: "forecast-1",
+        research_run_id: "run-1",
+        pack_role: "current_state",
+        tool_profile: "public",
+        status: "running",
+        policy_decision_id: "policy-1",
+      }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "公開情報を収集中です" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "Research runを開く" }),
+    ).toHaveAttribute("href", "#/runs/run-1");
   });
 
   it("keeps pack_running on the research pack node without enabling evidence extraction", async () => {
@@ -1338,24 +1457,26 @@ describe("Forecast UI", () => {
     render(<App />);
 
     const flow = await screen.findByRole("region", {
-      name: "PhaseA実行フロー",
+      name: "全体フロー",
     });
     expect(within(flow).getByText("1/9 完了")).toBeInTheDocument();
-    expect(within(flow).getByText("公開情報パックを実行中")).toBeInTheDocument();
+    expect(within(flow).getByText("公開情報を収集中")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "証拠抽出" }),
-    ).toBeDisabled();
-    expect(
-      await screen.findByText("公開情報パックを実行中です。"),
+      await screen.findByRole("heading", { name: "公開情報を収集中です" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/開始時刻: 09:05 ・ 経過: 70分 ・ 処理ステップ: 12件/),
+      screen.getByText(/開始時刻/),
     ).toBeInTheDocument();
+    expect(
+      screen.getByText("70分"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("12件")).toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: "Research runを開く" }),
     ).toHaveAttribute("href", "#/runs/run-1");
-    expect(screen.getByText("次にやること")).toBeInTheDocument();
-    expect(screen.getByText("公開情報パックの完了待ちです。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "証拠抽出" })).toBeNull();
+    expect(screen.queryByText("次にやること")).not.toBeInTheDocument();
+    expect(screen.queryByText("実行できます")).not.toBeInTheDocument();
     expect(screen.queryByText("Next action")).not.toBeInTheDocument();
     expect(
       screen.queryByText(/waiting for current_state pack completion/),
@@ -1367,6 +1488,7 @@ describe("Forecast UI", () => {
 
   it("does not show a needs_human_review research pack as running in the flow", async () => {
     window.location.hash = "#/forecasts/forecast-1";
+    let forecastGetCount = 0;
     const fetchMock = vi.fn(
       async (url: string | URL | Request, init?: RequestInit) => {
         const path = String(url).replace("http://localhost:8000", "");
@@ -1374,6 +1496,7 @@ describe("Forecast UI", () => {
           path === "/forecasts/forecast-1" &&
           (!init || init.method === "GET")
         ) {
+          forecastGetCount += 1;
           return jsonResponse(
             forecastDetail({
               status: "pack_running",
@@ -1406,7 +1529,7 @@ describe("Forecast UI", () => {
     render(<App />);
 
     const flow = await screen.findByRole("region", {
-      name: "PhaseA実行フロー",
+      name: "全体フロー",
     });
     const flowList = within(flow).getByRole("list", {
       name: "Forecast実行フロー",
@@ -1415,18 +1538,105 @@ describe("Forecast UI", () => {
       .getAllByRole("listitem")
       .filter((item) => item.parentElement === flowList);
     const packItem = flowItems[1];
-    expect(within(packItem).getByText("待機")).toBeInTheDocument();
-    expect(within(packItem).getByText("公開情報パックは要確認です")).toBeInTheDocument();
+    expect(within(packItem).getByText("要対応")).toBeInTheDocument();
+    expect(within(packItem).getByText("確認が必要")).toBeInTheDocument();
     expect(within(packItem).queryByText("実行中")).not.toBeInTheDocument();
-    expect(screen.queryByText("公開情報パックを実行中です。")).not.toBeInTheDocument();
     expect(
-      screen.getByText(/公開情報パックの実行状態を確認してください。/),
+      within(flowItems[2]).queryByText("次に実行"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "公開情報の収集に確認が必要です" }),
     ).toBeInTheDocument();
+    expect(screen.getAllByText("公開情報フェーズ").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("要確認").length).toBeGreaterThan(0);
     expect(screen.getByText(/human_review_required/)).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "証拠抽出" }),
-    ).toBeDisabled();
+      screen.getByRole("button", { name: "状態を再確認" }),
+    ).toBeEnabled();
+    await userEvent.click(screen.getByRole("button", { name: "状態を再確認" }));
+    await waitFor(() => expect(forecastGetCount).toBeGreaterThan(1));
+    expect(
+      screen.queryByRole("button", { name: "証拠抽出" }),
+    ).toBeNull();
   });
+
+  it.each([
+    {
+      effectiveStatus: "failed",
+      title: "公開情報の収集に失敗しました",
+      flowMeta: "収集に失敗",
+      packStatus: "失敗",
+      doneReason: "deep_research_failed",
+    },
+    {
+      effectiveStatus: "cancelled",
+      title: "公開情報の収集が中断されました",
+      flowMeta: "収集を中断",
+      packStatus: "中断",
+      doneReason: "cancelled_by_operator",
+    },
+  ])(
+    "does not show a $effectiveStatus research pack as running",
+    async ({ effectiveStatus, title, flowMeta, packStatus, doneReason }) => {
+      window.location.hash = "#/forecasts/forecast-1";
+      const fetchMock = vi.fn(
+        async (url: string | URL | Request, init?: RequestInit) => {
+          const path = String(url).replace("http://localhost:8000", "");
+          if (
+            path === "/forecasts/forecast-1" &&
+            (!init || init.method === "GET")
+          ) {
+            return jsonResponse(
+              forecastDetail({
+                status: "pack_running",
+                approved_framing_version: 1,
+                current_research_pack: {
+                  pack_id: "pack-1",
+                  research_run_id: "run-1",
+                  pack_status: "running",
+                  effective_status: effectiveStatus,
+                  research_run_status: effectiveStatus,
+                  pack_created_at: "2026-06-08T00:00:00Z",
+                  pack_updated_at: "2026-06-08T00:00:00Z",
+                  research_run_created_at: "2026-06-08T00:00:00Z",
+                  research_run_updated_at: "2026-06-08T00:30:00Z",
+                  deep_research_started_at: "2026-06-08T00:05:00Z",
+                  total_tool_calls: 9,
+                  estimated_cost_usd: 1.1,
+                  done_reason: doneReason,
+                  needs_human_review: false,
+                },
+                current_research_pack_status: effectiveStatus,
+              }),
+            );
+          }
+          return jsonResponse({ detail: "unexpected request" }, 500);
+        },
+      );
+      globalThis.fetch = fetchMock;
+
+      render(<App />);
+
+      const flow = await screen.findByRole("region", {
+        name: "全体フロー",
+      });
+      const flowList = within(flow).getByRole("list", {
+        name: "Forecast実行フロー",
+      });
+      const flowItems = within(flowList)
+        .getAllByRole("listitem")
+        .filter((item) => item.parentElement === flowList);
+      const packItem = flowItems[1];
+      expect(within(packItem).getByText("要対応")).toBeInTheDocument();
+      expect(within(packItem).getByText(flowMeta)).toBeInTheDocument();
+      expect(within(packItem).queryByText("実行中")).not.toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: title })).toBeInTheDocument();
+      expect(screen.getAllByText("公開情報フェーズ").length).toBeGreaterThan(0);
+      expect(screen.getAllByText(packStatus).length).toBeGreaterThan(0);
+      expect(screen.getByText(doneReason)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "状態を再確認" })).toBeEnabled();
+    },
+  );
 
   it("links to the research run from the forecast detail header", async () => {
     window.location.hash = "#/forecasts/forecast-1";
@@ -1514,10 +1724,14 @@ describe("Forecast UI", () => {
     render(<App />);
 
     expect(
-      await screen.findByText("公開情報パックは完了しました。"),
+      await screen.findByRole("heading", { name: "公開情報の収集が完了しました" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("次に証拠抽出を実行できます。")).toBeInTheDocument();
-    expect(screen.queryByText("公開情報パックを実行中です。")).not.toBeInTheDocument();
+    expect(screen.getAllByText("公開情報フェーズ").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("完了").length).toBeGreaterThan(0);
+    expect(
+      screen.getByRole("button", { name: "証拠を抽出" }),
+    ).toBeEnabled();
+    expect(screen.queryByText("公開情報を収集中です")).not.toBeInTheDocument();
   });
 
   it("stops polling after a running current research pack completes", async () => {
@@ -1572,7 +1786,7 @@ describe("Forecast UI", () => {
       await Promise.resolve();
     });
     expect(
-      screen.getByText("公開情報パックを実行中です。"),
+      screen.getByText("公開情報を収集中です"),
     ).toBeInTheDocument();
     expect(forecastGetCount).toBe(1);
 
@@ -1582,7 +1796,7 @@ describe("Forecast UI", () => {
     });
 
     expect(
-      screen.getByText("公開情報パックは完了しました。"),
+      screen.getByText("公開情報の収集が完了しました"),
     ).toBeInTheDocument();
     const countAfterCompletion = forecastGetCount;
 
@@ -1627,6 +1841,12 @@ describe("Forecast UI", () => {
             }),
           );
         }
+        if (
+          path === "/forecasts/forecast-1/evidence/extract" &&
+          init?.method === "POST"
+        ) {
+          return jsonResponse(forecastDetail({ status: "evidence_ready" }));
+        }
         return jsonResponse({ detail: "unexpected request" }, 500);
       },
     );
@@ -1635,7 +1855,7 @@ describe("Forecast UI", () => {
     render(<App />);
 
     const flow = await screen.findByRole("region", {
-      name: "PhaseA実行フロー",
+      name: "全体フロー",
     });
     const flowList = within(flow).getByRole("list", {
       name: "Forecast実行フロー",
@@ -1645,10 +1865,65 @@ describe("Forecast UI", () => {
       .filter((item) => item.parentElement === flowList);
     expect(within(flowItems[1]).getByText("完了")).toBeInTheDocument();
     expect(within(flowItems[2]).getByText("次に実行")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "証拠抽出" })).toBeEnabled();
     expect(
-      screen.getByText("次に証拠抽出を実行できます。"),
+      screen.getByRole("button", { name: "証拠を抽出" }),
+    ).toBeEnabled();
+    expect(
+      screen.getByRole("heading", { name: "公開情報の収集が完了しました" }),
     ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "証拠を抽出" }));
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([url, init]) =>
+            String(url).endsWith("/forecasts/forecast-1/evidence/extract") &&
+            init?.method === "POST",
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("generates scenarios from the current-step CTA after evidence extraction", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(forecastDetail({ status: "evidence_ready" }));
+        }
+        if (
+          path === "/forecasts/forecast-1/scenarios/generate" &&
+          init?.method === "POST"
+        ) {
+          return jsonResponse(forecastDetail({ status: "scenarios_ready" }));
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "証拠抽出が完了しました" }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "シナリオを生成" }));
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([url, init]) =>
+            String(url).endsWith("/forecasts/forecast-1/scenarios/generate") &&
+            init?.method === "POST",
+        ),
+      ).toBe(true),
+    );
   });
 
   it("shows committed forecast detail flow as ready to resolve", async () => {
@@ -1681,7 +1956,7 @@ describe("Forecast UI", () => {
     render(<App />);
 
     const flow = await screen.findByRole("region", {
-      name: "PhaseA実行フロー",
+      name: "全体フロー",
     });
     const flowList = within(flow).getByRole("list", {
       name: "Forecast実行フロー",
@@ -1696,14 +1971,14 @@ describe("Forecast UI", () => {
       ),
     ).toEqual([
       "フレーミング承認",
-      "公開情報パック投入",
-      "証拠抽出",
-      "シナリオ生成",
-      "Claim link承認",
-      "確率計算",
-      "PhaseA承認",
-      "コミット",
-      "解決",
+      "公開情報の収集",
+      "証拠を抽出",
+      "シナリオを生成",
+      "主張と結果の対応を承認",
+      "確率を計算",
+      "推定結果を承認",
+      "予測版を確定",
+      "実績結果で解決",
     ]);
     expect(within(flowItems[7]).getByText("完了")).toBeInTheDocument();
     expect(within(flowItems[8]).getByText("次に実行")).toBeInTheDocument();
@@ -1750,10 +2025,10 @@ describe("Forecast UI", () => {
 
     expect(await screen.findAllByText("フレーミング承認済み")).not.toHaveLength(0);
     expect(
-      screen.getByRole("button", { name: "証拠抽出" }),
-    ).toBeDisabled();
+      screen.queryByRole("button", { name: "証拠抽出" }),
+    ).toBeNull();
     await userEvent.click(
-      screen.getByRole("button", { name: "公開情報パック投入" }),
+      screen.getByRole("button", { name: "公開情報の収集を開始" }),
     );
 
     const alert = await screen.findByRole("alert");
@@ -1804,7 +2079,7 @@ describe("Forecast UI", () => {
 
     expect(await screen.findAllByText("フレーミング承認済み")).not.toHaveLength(0);
     await userEvent.click(
-      screen.getByRole("button", { name: "公開情報パック投入" }),
+      screen.getByRole("button", { name: "公開情報の収集を開始" }),
     );
 
     const alert = await screen.findByRole("alert");
@@ -1840,11 +2115,11 @@ describe("Forecast UI", () => {
 
     expect(await screen.findAllByText("phase_a_v1")).toHaveLength(2);
     expect(screen.getByText("snapshot-hash-1")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "確率計算" })).toBeDisabled();
     expect(
-      screen.getByRole("button", { name: "PhaseA承認" }),
+      screen.getByRole("button", { name: "推定結果を承認" }),
     ).toBeEnabled();
-    expect(screen.getByRole("button", { name: "コミット" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "予測版を確定" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "確率計算" })).toBeNull();
     expect(
       fetchMock.mock.calls.some(([url]) =>
         String(url).endsWith("/estimate-set"),
@@ -1916,17 +2191,19 @@ describe("Forecast UI", () => {
 
     expect(await screen.findByText("snapshot-hash-1")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "PhaseA承認" }),
+      screen.getByRole("button", { name: "推定結果を承認" }),
     ).toBeEnabled();
-    expect(screen.getByRole("button", { name: "コミット" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "予測版を確定" })).toBeNull();
 
-    await userEvent.click(screen.getByRole("button", { name: "PhaseA承認" }));
-
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "コミット" })).toBeEnabled(),
+    await userEvent.click(
+      screen.getByRole("button", { name: "推定結果を承認" }),
     );
 
-    await userEvent.click(screen.getByRole("button", { name: "コミット" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "予測版を確定" })).toBeEnabled(),
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "予測版を確定" }));
 
     await waitFor(() =>
       expect(
@@ -1965,9 +2242,9 @@ describe("Forecast UI", () => {
 
     expect(await screen.findAllByText("シナリオ生成済み")).not.toHaveLength(0);
     expect(
-      screen.getByRole("button", { name: "Claim link承認" }),
-    ).toBeDisabled();
-    expect(screen.getByRole("button", { name: "確率計算" })).toBeEnabled();
+      screen.queryByRole("button", { name: "主張と結果の対応を承認" }),
+    ).toBeNull();
+    expect(screen.getByRole("button", { name: "確率を計算" })).toBeEnabled();
   });
 
   it("requires claim-target link approval before compute", async () => {
@@ -2014,16 +2291,16 @@ describe("Forecast UI", () => {
 
     expect(await screen.findAllByText("シナリオ生成済み")).not.toHaveLength(0);
     expect(
-      screen.getByRole("button", { name: "Claim link承認" }),
+      screen.getByRole("button", { name: "主張と結果の対応を承認" }),
     ).toBeEnabled();
-    expect(screen.getByRole("button", { name: "確率計算" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "確率を計算" })).toBeNull();
 
     await userEvent.click(
-      screen.getByRole("button", { name: "Claim link承認" }),
+      screen.getByRole("button", { name: "主張と結果の対応を承認" }),
     );
 
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "確率計算" })).toBeEnabled(),
+      expect(screen.getByRole("button", { name: "確率を計算" })).toBeEnabled(),
     );
     const reviewCall = fetchMock.mock.calls.find(
       ([url, init]) =>
@@ -2041,7 +2318,7 @@ describe("Forecast UI", () => {
       }),
     );
 
-    await userEvent.click(screen.getByRole("button", { name: "確率計算" }));
+    await userEvent.click(screen.getByRole("button", { name: "確率を計算" }));
 
     expect(await screen.findByText("snapshot-hash-1")).toBeInTheDocument();
     const computeCall = fetchMock.mock.calls.find(
@@ -2106,13 +2383,15 @@ describe("Forecast UI", () => {
 
     expect(await screen.findByText("snapshot-hash-1")).toBeInTheDocument();
     const resolvePanel = await screen.findByRole("heading", {
-      name: "解決",
+      name: "実績結果で解決",
       level: 2,
     });
     const panel = resolvePanel.closest(".form-panel");
     expect(panel).not.toBeNull();
     await userEvent.click(
-      within(panel as HTMLElement).getByRole("button", { name: "解決" }),
+      within(panel as HTMLElement).getByRole("button", {
+        name: "実績結果で解決",
+      }),
     );
 
     expect(await screen.findByText("Brier 0.1200")).toBeInTheDocument();

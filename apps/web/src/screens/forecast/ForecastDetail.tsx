@@ -12,7 +12,7 @@ import {
   reviewForecast,
 } from "../../api/forecast";
 import { Link, routes } from "../../router";
-import { useElapsed } from "../../hooks/useElapsed";
+import { formatElapsed, useElapsed } from "../../hooks/useElapsed";
 import type {
   EstimateSetResponse,
   ForecastDetail as ForecastDetailType,
@@ -36,18 +36,24 @@ type Command =
   | "commit"
   | "resolve";
 
+type CurrentStepAction =
+  | Command
+  | "refresh"
+  | "researchRun"
+  | "resolvePanel"
+  | null;
+
+interface CurrentStepModel {
+  title: string;
+  description: string;
+  stateLabel: string;
+  tone: "ready" | "running" | "blocked" | "done" | "neutral";
+  action: CurrentStepAction;
+  actionLabel?: string;
+}
+
 function stableKey(forecastId: string, action: Command): string {
   return `forecast-${forecastId}-${action}-${crypto.randomUUID()}`;
-}
-
-function isMutatingClosed(status: ForecastStatus | undefined): boolean {
-  return status === "resolved";
-}
-
-function statusReason(status: ForecastStatus | undefined, needed: string): string {
-  if (!status) return "Forecast状態を読み込み中です。";
-  if (status === "resolved") return "このForecastは解決済みです。";
-  return needed;
 }
 
 function hasEstimateSet(status: ForecastStatus): boolean {
@@ -76,14 +82,20 @@ function statusAtLeast(
 function flowStatus({
   done,
   active,
+  submitting,
+  blocked,
   available,
 }: {
   done: boolean;
   active: boolean;
+  submitting?: boolean;
+  blocked?: boolean;
   available?: boolean;
 }): ForecastFlowStatus {
   if (done) return "done";
   if (active) return "active";
+  if (submitting) return "submitting";
+  if (blocked) return "blocked";
   if (available) return "available";
   return "pending";
 }
@@ -95,7 +107,7 @@ function forecastStatusLabel(status: ForecastStatus | undefined): string {
     case "framing_approved":
       return "フレーミング承認済み";
     case "pack_running":
-      return "公開情報パック実行中";
+      return "公開情報フェーズ";
     case "evidence_ready":
       return "証拠抽出済み";
     case "scenarios_ready":
@@ -103,7 +115,7 @@ function forecastStatusLabel(status: ForecastStatus | undefined): string {
     case "draft_ready":
       return "確率計算済み";
     case "committed":
-      return "コミット済み";
+      return "予測版確定済み";
     case "resolved":
       return "解決済み";
     default:
@@ -114,9 +126,9 @@ function forecastStatusLabel(status: ForecastStatus | undefined): string {
 function packStatusLabel(status: string | null | undefined): string {
   switch (status) {
     case "running":
-      return "公開情報パック実行中";
+      return "実行中";
     case "completed":
-      return "公開情報パック完了";
+      return "完了";
     case "needs_human_review":
       return "要確認";
     case "failed":
@@ -125,7 +137,7 @@ function packStatusLabel(status: string | null | undefined): string {
       return "中断";
     case null:
     case undefined:
-      return "未投入";
+      return "未収集";
     default:
       return status;
   }
@@ -135,25 +147,28 @@ function packFlowMeta({
   currentResearchPackStatus,
   researchPackCompleted,
   researchPackRunning,
+  packSubmissionPending,
 }: {
   currentResearchPackStatus: string | null | undefined;
   researchPackCompleted: boolean;
   researchPackRunning: boolean;
+  packSubmissionPending: boolean;
 }): string {
-  if (researchPackRunning) return "公開情報パックを実行中";
-  if (researchPackCompleted) return "公開情報パック完了";
+  if (researchPackRunning) return "公開情報を収集中";
+  if (packSubmissionPending) return "サーバーに登録中";
+  if (researchPackCompleted) return "収集完了";
   switch (currentResearchPackStatus) {
     case "needs_human_review":
-      return "公開情報パックは要確認です";
+      return "確認が必要";
     case "failed":
-      return "公開情報パックは失敗しました";
+      return "収集に失敗";
     case "cancelled":
-      return "公開情報パックは中断されました";
+      return "収集を中断";
     case null:
     case undefined:
-      return "公開情報パックを投入";
+      return "未収集";
     default:
-      return "公開情報パックの状態を確認中";
+      return "状態を確認中";
   }
 }
 
@@ -167,25 +182,256 @@ function formatStartedAt(value: string | null | undefined): string | null {
   }).format(date);
 }
 
+function deriveCurrentStep({
+  status,
+  currentResearchPackStatus,
+  currentResearchPackPresent,
+  packSubmissionPending,
+  packSubmissionIsSlow,
+  researchPackRunning,
+  researchPackCompleted,
+  researchPackBlocked,
+  canDispatch,
+  canExtract,
+  canGenerate,
+  canApproveClaimTargets,
+  canCompute,
+  canRestoreDraft,
+  canApproveEstimate,
+  canCommit,
+  canResolve,
+  estimatePresent,
+}: {
+  status: ForecastStatus | undefined;
+  currentResearchPackStatus: string | null | undefined;
+  currentResearchPackPresent: boolean;
+  packSubmissionPending: boolean;
+  packSubmissionIsSlow: boolean;
+  researchPackRunning: boolean;
+  researchPackCompleted: boolean;
+  researchPackBlocked: boolean;
+  canDispatch: boolean;
+  canExtract: boolean;
+  canGenerate: boolean;
+  canApproveClaimTargets: boolean;
+  canCompute: boolean;
+  canRestoreDraft: boolean;
+  canApproveEstimate: boolean;
+  canCommit: boolean;
+  canResolve: boolean;
+  estimatePresent: boolean;
+}): CurrentStepModel {
+  if (!status) {
+    return {
+      title: "Forecastを読み込んでいます",
+      description: "現在の状態を取得しています。",
+      stateLabel: "読み込み中",
+      tone: "neutral",
+      action: null,
+    };
+  }
+
+  if (packSubmissionPending) {
+    return {
+      title: packSubmissionIsSlow
+        ? "登録結果をまだ確認できません"
+        : "公開情報をサーバーに登録中",
+      description: packSubmissionIsSlow
+        ? "Research Packの作成リクエストは継続中の可能性があります。状態を再確認し、Research run IDが発行されているか確認してください。"
+        : "Research Packを作成するリクエストを送っています。登録されるとResearch run IDと開始時刻が表示されます。",
+      stateLabel: "サーバーに登録中",
+      tone: packSubmissionIsSlow ? "blocked" : "running",
+      action: "refresh",
+      actionLabel: "状態を再確認",
+    };
+  }
+
+  if (status === "pack_running" && !currentResearchPackPresent) {
+    return {
+      title: "公開情報の状態確認が必要です",
+      description:
+        "Forecast本体は公開情報フェーズですが、Research Packがまだ取得できていません。最新状態を再取得してください。",
+      stateLabel: "状態確認が必要",
+      tone: "blocked",
+      action: "refresh",
+      actionLabel: "状態を再確認",
+    };
+  }
+
+  if (researchPackBlocked) {
+    const title =
+      currentResearchPackStatus === "needs_human_review"
+        ? "公開情報の収集に確認が必要です"
+        : currentResearchPackStatus === "cancelled"
+          ? "公開情報の収集が中断されました"
+          : "公開情報の収集に失敗しました";
+    return {
+      title,
+      description:
+        "Research runの詳細で原因や人手確認の要否を確認し、必要な対応後にこの画面で状態を再確認してください。",
+      stateLabel: packStatusLabel(currentResearchPackStatus),
+      tone: "blocked",
+      action: "refresh",
+      actionLabel: "状態を再確認",
+    };
+  }
+
+  if (researchPackRunning) {
+    return {
+      title: "公開情報を収集中です",
+      description:
+        "Deep Researchが公開情報を収集しています。完了すると次に証拠抽出へ進めます。",
+      stateLabel: "実行中",
+      tone: "running",
+      action: "researchRun",
+      actionLabel: "Research runを開く",
+    };
+  }
+
+  if (status === "pack_running" && researchPackCompleted && canExtract) {
+    return {
+      title: "公開情報の収集が完了しました",
+      description: "収集済みの公開情報から、Forecastに使う主張とソースを抽出できます。",
+      stateLabel: "完了",
+      tone: "ready",
+      action: "evidence",
+      actionLabel: "証拠を抽出",
+    };
+  }
+
+  if (canDispatch) {
+    return {
+      title: "公開情報はまだ収集されていません",
+      description:
+        "承認済みフレーミングをもとに、まず公開情報の収集を開始します。",
+      stateLabel: "未収集",
+      tone: "ready",
+      action: "pack",
+      actionLabel: "公開情報の収集を開始",
+    };
+  }
+
+  if (canGenerate) {
+    return {
+      title: "証拠抽出が完了しました",
+      description: "抽出済みの主張とソースから、解決状態ごとのシナリオを生成できます。",
+      stateLabel: "次はシナリオ生成",
+      tone: "ready",
+      action: "scenarios",
+      actionLabel: "シナリオを生成",
+    };
+  }
+
+  if (canApproveClaimTargets) {
+    return {
+      title: "主張と結果の対応確認が必要です",
+      description: "生成されたシナリオと、確率計算に使う主張の対応を確認します。",
+      stateLabel: "確認待ち",
+      tone: "ready",
+      action: "claimTargets",
+      actionLabel: "主張と結果の対応を承認",
+    };
+  }
+
+  if (canCompute || canRestoreDraft) {
+    return {
+      title: canRestoreDraft ? "推定値を復元できます" : "確率計算の準備ができました",
+      description: canRestoreDraft
+        ? "保存済みの下書き推定値を読み込みます。"
+        : "承認済みの対応関係をもとに、PhaseAエンジンで確率を計算します。",
+      stateLabel: canRestoreDraft ? "復元可能" : "計算可能",
+      tone: "ready",
+      action: "compute",
+      actionLabel: canRestoreDraft ? "推定値を復元" : "確率を計算",
+    };
+  }
+
+  if (canApproveEstimate) {
+    return {
+      title: "推定結果の承認待ちです",
+      description: "下の推定結果を確認し、問題なければこのまま承認できます。",
+      stateLabel: "承認待ち",
+      tone: "ready",
+      action: estimatePresent ? "approve" : null,
+      actionLabel: estimatePresent ? "推定結果を承認" : undefined,
+    };
+  }
+
+  if (canCommit) {
+    return {
+      title: "予測版を確定できます",
+      description: "承認済みの推定結果を、Forecastの確定版として保存します。",
+      stateLabel: "確定待ち",
+      tone: "ready",
+      action: estimatePresent ? "commit" : null,
+      actionLabel: estimatePresent ? "予測版を確定" : undefined,
+    };
+  }
+
+  if (canResolve) {
+    return {
+      title: "実績結果で解決できます",
+      description:
+        "下の解決フォームで公開情報から確認した実績結果を選び、このForecastを採点します。",
+      stateLabel: "解決待ち",
+      tone: "ready",
+      action: "resolvePanel",
+      actionLabel: "実績結果を選ぶ",
+    };
+  }
+
+  if (status === "resolved") {
+    return {
+      title: "Forecastは解決済みです",
+      description: "実績結果による採点まで完了しています。",
+      stateLabel: "完了",
+      tone: "done",
+      action: null,
+    };
+  }
+
+  if (status === "framing_pending") {
+    return {
+      title: "フレーミング承認待ちです",
+      description: "保存済みフレーミングを承認すると、公開情報の収集を開始できます。",
+      stateLabel: "承認待ち",
+      tone: "neutral",
+      action: null,
+    };
+  }
+
+  return {
+    title: "次の操作を待っています",
+    description: "現在のForecast状態を確認してください。",
+    stateLabel: forecastStatusLabel(status),
+    tone: "neutral",
+    action: null,
+  };
+}
+
 function forecastExecutionNodes({
   status,
   approvedFraming,
   researchPackCompleted,
   researchPackRunning,
+  researchPackBlocked,
   currentResearchPackStatus,
   claimTargetsApproved,
   hasEstimate,
   phaseAApproved,
+  packSubmissionPending,
   busy,
 }: {
   status: ForecastStatus | undefined;
   approvedFraming: boolean;
   researchPackCompleted: boolean;
   researchPackRunning: boolean;
+  researchPackBlocked: boolean;
   currentResearchPackStatus: string | null | undefined;
   claimTargetsApproved: boolean;
   hasEstimate: boolean;
   phaseAApproved: boolean;
+  packSubmissionPending: boolean;
   busy: Command | null;
 }): ForecastFlowNode[] {
   const isResolved = status === "resolved";
@@ -203,22 +449,25 @@ function forecastExecutionNodes({
     },
     {
       id: "pack",
-      title: "公開情報パック投入",
+      title: "公開情報の収集",
       meta: packFlowMeta({
         currentResearchPackStatus,
         researchPackCompleted,
         researchPackRunning,
+        packSubmissionPending,
       }),
       status: flowStatus({
         done: researchPackCompleted || statusAtLeast(status, "evidence_ready"),
-        active: busy === "pack" || researchPackRunning,
+        active: researchPackRunning,
+        submitting: packSubmissionPending,
+        blocked: researchPackBlocked,
         available: status === "framing_approved",
       }),
       tone: "research",
     },
     {
       id: "evidence",
-      title: "証拠抽出",
+      title: "証拠を抽出",
       meta: "公開情報から主張とソースを抽出",
       status: flowStatus({
         done: statusAtLeast(status, "evidence_ready"),
@@ -229,7 +478,7 @@ function forecastExecutionNodes({
     },
     {
       id: "scenarios",
-      title: "シナリオ生成",
+      title: "シナリオを生成",
       meta: "結果別のPhaseAシナリオを生成",
       status: flowStatus({
         done: statusAtLeast(status, "scenarios_ready"),
@@ -240,7 +489,7 @@ function forecastExecutionNodes({
     },
     {
       id: "claim-links",
-      title: "Claim link承認",
+      title: "主張と結果の対応を承認",
       meta: claimTargetsApproved ? "リンク承認済み" : "シナリオと主張の対応を確認",
       status: flowStatus({
         done: claimTargetsApproved || statusAtLeast(status, "draft_ready"),
@@ -251,7 +500,7 @@ function forecastExecutionNodes({
     },
     {
       id: "compute",
-      title: "確率計算",
+      title: "確率を計算",
       meta: estimateReady ? "下書き推定値あり" : "PhaseAエンジンで計算",
       status: flowStatus({
         done: estimateReady,
@@ -262,7 +511,7 @@ function forecastExecutionNodes({
     },
     {
       id: "approve-phase-a",
-      title: "PhaseA承認",
+      title: "推定結果を承認",
       meta: phaseAApproved ? "PhaseA下書き承認済み" : "下書き推定値の承認待ち",
       status: flowStatus({
         done: phaseAApproved || statusAtLeast(status, "committed"),
@@ -273,7 +522,7 @@ function forecastExecutionNodes({
     },
     {
       id: "commit",
-      title: "コミット",
+      title: "予測版を確定",
       meta: statusAtLeast(status, "committed")
         ? "バージョン固定済み"
         : "承認済み推定値をバージョン化",
@@ -286,7 +535,7 @@ function forecastExecutionNodes({
     },
     {
       id: "resolve",
-      title: "解決",
+      title: "実績結果で解決",
       meta: isResolved ? "実績結果で解決済み" : "実績結果を選んで採点",
       status: flowStatus({
         done: isResolved,
@@ -307,6 +556,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   const [selectedOutcomeId, setSelectedOutcomeId] = useState("");
   const [resolutionNotes, setResolutionNotes] = useState("");
   const [busy, setBusy] = useState<Command | null>(null);
+  const [busyStartedAt, setBusyStartedAt] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
   const idempotencyKeys = useRef<Record<Command, string>>({
     pack: stableKey(forecastId, "pack"),
@@ -345,6 +595,13 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     currentResearchPackStatus === "needs_human_review";
   const researchPackRunning =
     status === "pack_running" && currentResearchPackStatus === "running";
+  const packSubmissionPending =
+    busy === "pack" && !currentResearchPack && status === "framing_approved";
+  const packSubmissionElapsed = useElapsed(
+    packSubmissionPending ? (busyStartedAt ?? undefined) : undefined,
+    packSubmissionPending,
+  );
+  const packSubmissionIsSlow = packSubmissionElapsed >= 0.5;
   const researchPackStartedAt =
     currentResearchPack?.deep_research_started_at ??
     currentResearchPack?.research_run_created_at ??
@@ -377,6 +634,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   }, [forecast?.status]);
 
   async function runStep(step: Command, fn: () => Promise<unknown>) {
+    setBusyStartedAt(new Date(Date.now()));
     setBusy(step);
     setError(null);
     try {
@@ -392,6 +650,79 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       setError(formatForecastError(err));
     } finally {
       setBusy(null);
+      setBusyStartedAt(null);
+    }
+  }
+
+  function runCommand(command: Command) {
+    switch (command) {
+      case "pack":
+        return runStep("pack", () =>
+          dispatchCurrentStatePack(forecastId, {
+            idempotencyKey: idempotencyKeys.current.pack,
+          }),
+        );
+      case "evidence":
+        return runStep("evidence", () =>
+          extractEvidence(forecastId, {
+            idempotencyKey: idempotencyKeys.current.evidence,
+          }),
+        );
+      case "scenarios":
+        return runStep("scenarios", () =>
+          generateScenarios(forecastId, {
+            idempotencyKey: idempotencyKeys.current.scenarios,
+          }),
+        );
+      case "claimTargets":
+        return runStep("claimTargets", () =>
+          reviewForecast(
+            forecastId,
+            { action: "approve_claim_target_links" },
+            { idempotencyKey: idempotencyKeys.current.claimTargets },
+          ),
+        );
+      case "compute":
+        return runStep("compute", () =>
+          computeProbabilities(forecastId, {
+            idempotencyKey: idempotencyKeys.current.compute,
+          }),
+        );
+      case "approve":
+        if (!estimate) return Promise.resolve();
+        return runStep("approve", () =>
+          reviewForecast(
+            forecastId,
+            {
+              action: "approve_phase_a_version",
+              estimate_set_id: estimate.estimate_set_id,
+            },
+            { idempotencyKey: idempotencyKeys.current.approve },
+          ),
+        );
+      case "commit":
+        if (!estimate) return Promise.resolve();
+        return runStep("commit", () =>
+          commitForecastVersion(
+            forecastId,
+            {
+              estimate_set_id: estimate.estimate_set_id,
+              expected_input_snapshot_hash: estimate.input_snapshot_hash,
+            },
+            { idempotencyKey: idempotencyKeys.current.commit },
+          ),
+        );
+      case "resolve":
+        return runStep("resolve", () =>
+          resolveForecast(
+            forecastId,
+            {
+              outcome_id: selectedOutcomeId,
+              resolution_notes: resolutionNotes.trim() || null,
+            },
+            { idempotencyKey: idempotencyKeys.current.resolve },
+          ),
+        );
     }
   }
 
@@ -415,82 +746,100 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   const canApproveEstimate = status === "draft_ready" && Boolean(estimate) && !phaseAApproved;
   const canCommit = status === "draft_ready" && Boolean(estimate) && phaseAApproved;
   const canResolve = status === "committed" && Boolean(selectedOutcomeId);
-  const closed = isMutatingClosed(status);
   const flowNodes = forecastExecutionNodes({
     status,
     approvedFraming,
     researchPackCompleted,
     researchPackRunning,
+    researchPackBlocked,
     currentResearchPackStatus,
     claimTargetsApproved: effectiveClaimTargetsApproved,
     hasEstimate: Boolean(estimate),
     phaseAApproved,
+    packSubmissionPending,
     busy,
   });
-  const nextActions = [
+  const currentStep = deriveCurrentStep({
+    status,
+    currentResearchPackStatus,
+    currentResearchPackPresent: Boolean(currentResearchPack),
+    packSubmissionPending,
+    packSubmissionIsSlow,
+    researchPackRunning,
+    researchPackCompleted,
+    researchPackBlocked,
+    canDispatch,
+    canExtract,
+    canGenerate,
+    canApproveClaimTargets,
+    canCompute,
+    canRestoreDraft,
+    canApproveEstimate,
+    canCommit,
+    canResolve,
+    estimatePresent: Boolean(estimate),
+  });
+  const researchPackUpdatedLabel = formatStartedAt(
+    currentResearchPack?.research_run_updated_at ??
+      currentResearchPack?.pack_updated_at ??
+      undefined,
+  );
+  const forecastDisplayStatus = forecastStatusLabel(status);
+  const currentStepDetails = [
+    { label: "Forecast本体状態", value: forecastDisplayStatus },
     {
-      label: "公開情報パック投入",
-      status: canDispatch
-        ? "実行できます"
-        : statusReason(status, "フレーミング承認後に実行できます。"),
+      label: "公開情報パック状態",
+      value: packSubmissionPending ? "登録中" : packStatusLabel(currentResearchPackStatus),
     },
-    {
-      label: "証拠抽出",
-      status: canExtract
-        ? "実行できます"
-        : status === "pack_running"
-          ? researchPackBlocked
-            ? "Research runの状態確認が必要です。"
-            : "公開情報パックの完了待ちです。"
-          : statusReason(status, "公開情報パック投入後に実行できます。"),
-    },
-    {
-      label: "シナリオ生成",
-      status: canGenerate
-        ? "実行できます"
-        : statusReason(status, "証拠抽出後に実行できます。"),
-    },
-    {
-      label: "Claim link承認",
-      status: canApproveClaimTargets
-        ? "実行できます"
-        : effectiveClaimTargetsApproved
-          ? "承認済みです。"
-          : statusReason(status, "シナリオ生成後に実行できます。"),
-    },
-    {
-      label: "確率計算",
-      status: canCompute
-        ? "実行できます"
-        : canRestoreDraft
-          ? "作成済みの下書き推定値を読み込めます。"
-          : statusReason(status, "Claim link承認後に実行できます。"),
-    },
-    {
-      label: "PhaseA承認",
-      status: phaseAApproved
-        ? "承認済みです。"
-        : canApproveEstimate
-          ? "実行できます"
-          : statusReason(status, "確率計算後に実行できます。"),
-    },
-    {
-      label: "コミット",
-      status: canCommit
-        ? "実行できます"
-        : statusAtLeast(status, "committed")
-          ? "コミット済みです。"
-          : statusReason(status, "PhaseA承認後に実行できます。"),
-    },
-    {
-      label: "解決",
-      status: canResolve
-        ? "実行できます"
-        : status === "resolved"
-          ? "解決済みです。"
-          : statusReason(status, "PhaseAバージョンのコミット後に実行できます。"),
-    },
-  ];
+    currentResearchPack?.research_run_id
+      ? { label: "Research run ID", value: currentResearchPack.research_run_id }
+      : null,
+    currentResearchPack?.research_run_status
+      ? { label: "Research run状態", value: currentResearchPack.research_run_status }
+      : null,
+    researchPackStartedLabel
+      ? { label: "開始時刻", value: researchPackStartedLabel }
+      : null,
+    packSubmissionPending
+      ? { label: "経過時間", value: formatElapsed(packSubmissionElapsed) }
+      : researchPackRunning
+        ? { label: "経過時間", value: `${Math.round(researchPackElapsed)}分` }
+        : null,
+    researchPackUpdatedLabel
+      ? { label: "最終更新", value: researchPackUpdatedLabel }
+      : null,
+    currentResearchPack
+      ? {
+          label: "処理ステップ",
+          value: `${currentResearchPack.total_tool_calls ?? 0}件`,
+        }
+      : null,
+    currentResearchPack?.done_reason
+      ? { label: "完了理由", value: currentResearchPack.done_reason }
+      : null,
+    currentResearchPack?.needs_human_review
+      ? { label: "人による確認", value: "必要" }
+      : null,
+  ].filter(
+    (item): item is { label: string; value: string } =>
+      Boolean(item && item.value),
+  );
+
+  function handleCurrentStepAction(action: CurrentStepAction) {
+    if (!action) return;
+    if (action === "refresh") {
+      void load().catch((err) => setError(formatForecastError(err)));
+      return;
+    }
+    if (action === "resolvePanel") {
+      document
+        .getElementById("forecast-resolve-panel")
+        ?.scrollIntoView({ block: "start", behavior: "smooth" });
+      return;
+    }
+    if (action === "researchRun") return;
+    void runCommand(action);
+  }
 
   return (
     <section className="screen">
@@ -504,7 +853,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
         </div>
         <div className="forecast-detail-actions">
           <span className="forecast-status-pill">
-            {forecastStatusLabel(forecast?.status)}
+            {forecastDisplayStatus}
           </span>
           {researchRunPath && (
             <Link to={researchRunPath} className="btn-secondary">
@@ -525,8 +874,8 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
 
       <div className="metric-grid">
         <div className="metric-card">
-          <span className="metric-label">ステータス</span>
-          <strong>{forecastStatusLabel(forecast?.status)}</strong>
+          <span className="metric-label">Forecast本体</span>
+          <strong>{forecastDisplayStatus}</strong>
         </div>
         <div className="metric-card">
           <span className="metric-label">フレーミング</span>
@@ -534,7 +883,9 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
         </div>
         <div className="metric-card">
           <span className="metric-label">公開情報パック</span>
-          <strong>{packStatusLabel(currentResearchPackStatus)}</strong>
+          <strong>
+            {packSubmissionPending ? "登録中" : packStatusLabel(currentResearchPackStatus)}
+          </strong>
         </div>
         <div className="metric-card">
           <span className="metric-label">確率エンジン</span>
@@ -542,188 +893,75 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
         </div>
       </div>
 
-      {researchPackRunning && (
-        <div
-          className="forecast-wait-banner"
-          aria-live="polite"
-          aria-atomic="false"
-          role="status"
-        >
-          <span className="forecast-wait-banner__pulse" aria-hidden="true" />
-          <div className="forecast-wait-banner__body">
-            <p className="forecast-wait-banner__main">
-              公開情報パックを実行中です。
-            </p>
-            <p className="forecast-wait-banner__sub">
-              {researchPackStartedLabel && (
-                <>開始時刻: {researchPackStartedLabel} ・ </>
-              )}
-              経過: {Math.round(researchPackElapsed)}分 ・ 処理ステップ:{" "}
-              {currentResearchPack?.total_tool_calls ?? 0}件
-            </p>
-            {researchRunPath && (
-              <Link to={researchRunPath} className="forecast-inline-link">
-                Research runを開く
+      <section
+        className={`forecast-current-step forecast-current-step--${currentStep.tone}`}
+        aria-labelledby="forecast-current-step-heading"
+      >
+        <div className="forecast-current-step__header">
+          <div>
+            <span className="metric-label">現在のステップ</span>
+            <h2 id="forecast-current-step-heading">{currentStep.title}</h2>
+          </div>
+          <span className="forecast-current-step__state">
+            {currentStep.stateLabel}
+          </span>
+        </div>
+        <p className="forecast-current-step__description">
+          {currentStep.description}
+        </p>
+        {currentStep.action && currentStep.actionLabel && (
+          <div className="forecast-current-step__action">
+            {currentStep.action === "researchRun" && researchRunPath ? (
+              <Link to={researchRunPath} className="btn-primary">
+                {currentStep.actionLabel}
               </Link>
+            ) : (
+              <button
+                type="button"
+                className="btn-primary"
+                disabled={!!busy && currentStep.action !== "refresh"}
+                onClick={() =>
+                  handleCurrentStepAction(
+                    currentStep.action === "researchRun" ? "refresh" : currentStep.action,
+                  )
+                }
+              >
+                {currentStep.action === "researchRun"
+                  ? "状態を再確認"
+                  : currentStep.actionLabel}
+              </button>
             )}
           </div>
-        </div>
-      )}
-
-      {status === "pack_running" && researchPackCompleted && (
-        <div className="forecast-pack-notice" role="status">
-          <strong>公開情報パックは完了しました。</strong>
-          <span>次に証拠抽出を実行できます。</span>
-          {currentResearchPack?.research_run_updated_at && (
-            <span>
-              最終更新: {formatStartedAt(currentResearchPack.research_run_updated_at)}
-            </span>
-          )}
-        </div>
-      )}
-
-      {status === "pack_running" && researchPackBlocked && (
-        <div className="alert alert-error" role="status">
-          公開情報パックの実行状態を確認してください。
-          {currentResearchPack?.done_reason && (
-            <> 理由: {currentResearchPack.done_reason}</>
-          )}
-          {researchRunPath && (
-            <>
-              {" "}
-              <Link to={researchRunPath} className="forecast-inline-link">
-                Research runを開く
-              </Link>
-            </>
-          )}
-        </div>
-      )}
+        )}
+        <dl className="forecast-current-step__details">
+          {currentStepDetails.map((item) => (
+            <div key={item.label} className="forecast-current-step__detail">
+              <dt>{item.label}</dt>
+              <dd>
+                {item.label === "Research run ID" && researchRunPath ? (
+                  <Link to={researchRunPath} className="forecast-inline-link">
+                    {item.value}
+                  </Link>
+                ) : (
+                  item.value
+                )}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      </section>
 
       <ForecastFlowProgress
-        heading="PhaseA実行フロー"
-        summary="現在のForecastが、公開情報パックから確率計算・コミット・解決までのどこにいるかを示します。"
+        heading="全体フロー"
+        summary="Forecastが解決までのどこにいるかを確認できます。操作は上の現在ステップから行います。"
         nodes={flowNodes}
         label="Forecast実行フロー"
         layout="wrapped"
         columns={4}
       />
 
-      <div className="button-row">
-        <button
-          type="button"
-          className="btn-secondary"
-          disabled={!!busy || !canDispatch || closed}
-          title={
-            canDispatch
-              ? undefined
-              : statusReason(status, "承認済みフレーミングが必要です。")
-          }
-          onClick={() =>
-            runStep("pack", () =>
-              dispatchCurrentStatePack(forecastId, {
-                idempotencyKey: idempotencyKeys.current.pack,
-              }),
-            )
-          }
-        >
-          公開情報パック投入
-        </button>
-        <button
-          type="button"
-          className="btn-secondary"
-          disabled={!!busy || !canExtract || closed}
-          title={
-            canExtract
-              ? undefined
-              : status === "pack_running"
-                ? "公開情報パックの完了待ちです。"
-                : statusReason(status, "完了済みの公開情報パックが必要です。")
-          }
-          onClick={() =>
-            runStep("evidence", () =>
-              extractEvidence(forecastId, {
-                idempotencyKey: idempotencyKeys.current.evidence,
-              }),
-            )
-          }
-        >
-          証拠抽出
-        </button>
-        <button
-          type="button"
-          className="btn-secondary"
-          disabled={!!busy || !canGenerate || closed}
-          title={
-            canGenerate ? undefined : statusReason(status, "抽出済み証拠が必要です。")
-          }
-          onClick={() =>
-            runStep("scenarios", () =>
-              generateScenarios(forecastId, {
-                idempotencyKey: idempotencyKeys.current.scenarios,
-              }),
-            )
-          }
-        >
-          シナリオ生成
-        </button>
-        <button
-          type="button"
-          className="btn-secondary"
-          disabled={!!busy || !canApproveClaimTargets || closed}
-          title={
-            canApproveClaimTargets
-              ? undefined
-              : effectiveClaimTargetsApproved
-                ? "Claim-target linkは承認済みです。"
-                : statusReason(status, "生成済みシナリオが必要です。")
-          }
-          onClick={() =>
-            runStep("claimTargets", () =>
-              reviewForecast(
-                forecastId,
-                { action: "approve_claim_target_links" },
-                { idempotencyKey: idempotencyKeys.current.claimTargets },
-              ),
-            )
-          }
-        >
-          Claim link承認
-        </button>
-        <button
-          type="button"
-          className="btn-primary"
-          disabled={!!busy || (!canCompute && !canRestoreDraft) || closed}
-          title={
-            canCompute || canRestoreDraft
-              ? undefined
-              : statusReason(status, "承認済みClaim linkが必要です。")
-          }
-          onClick={() =>
-            runStep("compute", () =>
-              computeProbabilities(forecastId, {
-                idempotencyKey: idempotencyKeys.current.compute,
-              }),
-            )
-          }
-        >
-          {canRestoreDraft ? "推定値を復元" : "確率計算"}
-        </button>
-      </div>
-
-      <div className="form-panel">
-        <h2>次にやること</h2>
-        <div className="forecast-next-action-list">
-          {nextActions.map((item) => (
-            <div key={item.label} className="forecast-next-action-item">
-              <span>{item.label}</span>
-              <strong>{item.status}</strong>
-            </div>
-          ))}
-        </div>
-      </div>
-
       {estimate && (
-        <div className="form-panel">
+        <div className="form-panel" id="forecast-estimate-panel">
           <div className="run-card-meta">
             <span>{estimate.engine_version}</span>
             <span>{estimate.input_snapshot_hash}</span>
@@ -740,52 +978,12 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
               </article>
             ))}
           </div>
-          <div className="button-row">
-            <button
-              type="button"
-              className="btn-secondary"
-              disabled={!!busy || !canApproveEstimate}
-              onClick={() =>
-                runStep("approve", () =>
-                  reviewForecast(
-                    forecastId,
-                    {
-                      action: "approve_phase_a_version",
-                      estimate_set_id: estimate.estimate_set_id,
-                    },
-                    { idempotencyKey: idempotencyKeys.current.approve },
-                  ),
-                )
-              }
-            >
-              PhaseA承認
-            </button>
-            <button
-              type="button"
-              className="btn-primary"
-              disabled={!!busy || !canCommit}
-              onClick={() =>
-                runStep("commit", () =>
-                  commitForecastVersion(
-                    forecastId,
-                    {
-                      estimate_set_id: estimate.estimate_set_id,
-                      expected_input_snapshot_hash: estimate.input_snapshot_hash,
-                    },
-                    { idempotencyKey: idempotencyKeys.current.commit },
-                  ),
-                )
-              }
-            >
-              コミット
-            </button>
-          </div>
         </div>
       )}
 
       {(forecast?.status === "committed" || forecast?.status === "resolved") && (
-        <div className="form-panel">
-          <h2>解決</h2>
+        <div className="form-panel" id="forecast-resolve-panel">
+          <h2>実績結果で解決</h2>
           {forecast.status === "resolved" ? (
             <p>このForecastは解決済みです。</p>
           ) : (
@@ -815,20 +1013,9 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
                 type="button"
                 className="btn-primary"
                 disabled={!!busy || !canResolve}
-                onClick={() =>
-                  runStep("resolve", () =>
-                    resolveForecast(
-                      forecastId,
-                      {
-                        outcome_id: selectedOutcomeId,
-                        resolution_notes: resolutionNotes.trim() || null,
-                      },
-                      { idempotencyKey: idempotencyKeys.current.resolve },
-                    ),
-                  )
-                }
+                onClick={() => void runCommand("resolve")}
               >
-                解決
+                実績結果で解決
               </button>
             </>
           )}

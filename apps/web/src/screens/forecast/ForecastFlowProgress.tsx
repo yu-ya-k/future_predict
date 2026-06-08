@@ -1,6 +1,12 @@
 import type { CSSProperties } from "react";
 
-export type ForecastFlowStatus = "done" | "active" | "available" | "pending";
+export type ForecastFlowStatus =
+  | "done"
+  | "active"
+  | "submitting"
+  | "blocked"
+  | "available"
+  | "pending";
 
 export type ForecastFlowTone =
   | "brief"
@@ -20,6 +26,8 @@ export interface ForecastFlowNode {
 const FORECAST_FLOW_STATUS_LABEL: Record<ForecastFlowStatus, string> = {
   done: "完了",
   active: "実行中",
+  submitting: "登録中",
+  blocked: "要対応",
   available: "次に実行",
   pending: "待機",
 };
@@ -41,10 +49,16 @@ export function ForecastFlowProgress({
 }) {
   const doneCount = nodes.filter((node) => node.status === "done").length;
   const currentNode = nodes.find((node) => node.status === "active");
+  const submittingNode = nodes.find((node) => node.status === "submitting");
+  const blockedNode = nodes.find((node) => node.status === "blocked");
   const availableNode = nodes.find((node) => node.status === "available");
   const statusText = `${heading}。${doneCount}/${nodes.length}完了。${
     currentNode
       ? `現在実行中: ${currentNode.title}。`
+      : submittingNode
+        ? `登録中: ${submittingNode.title}。`
+        : blockedNode
+          ? `対応が必要: ${blockedNode.title}。`
       : availableNode
         ? `次に実行: ${availableNode.title}。`
         : ""
