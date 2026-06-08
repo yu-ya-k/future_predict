@@ -339,6 +339,10 @@ Run a WAL smoke check after deployment by creating a forecast, approving
 framing, dispatching one public `current_state` pack, collecting it through the
 Research poller, and reading `/forecasts/{id}/audit`.
 
+For a repeatable local smoke that avoids live Azure/OpenAI calls, use the
+manual verification runbook in
+[`docs/forecast-phase-a-manual-verification.md`](forecast-phase-a-manual-verification.md).
+
 Rollback is feature-level first: set `FORECAST_ENABLED=false` and restart the
 API. Research remains available because Forecast uses additive tables in the
 shared Research SQLite DB. After rollback, run a Research smoke:
