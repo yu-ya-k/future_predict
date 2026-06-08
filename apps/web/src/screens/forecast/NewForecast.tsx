@@ -75,10 +75,13 @@ function finalFieldsFromDraft(response: ForecastFramingDraftResponse): FinalFiel
 function finalPayloadFromFields(
   fields: FinalFields,
   basePayload: ForecastCreateRequest | null | undefined,
+  originalExecutionPrompt: string,
 ): ForecastCreateRequest {
   return {
     ...basePayload,
     question: fields.question.trim(),
+    original_execution_prompt:
+      optionalValue(originalExecutionPrompt) ?? basePayload?.original_execution_prompt ?? null,
     resolution_criteria: fields.resolutionCriteria.trim(),
     resolution_sources: splitLines(fields.resolutionSources),
     outcomes: splitLines(fields.outcomes),
@@ -99,6 +102,39 @@ function warningItems(response: ForecastFramingDraftResponse | null): string[] {
   return response?.warnings.filter((warning) => warning.trim()) ?? [];
 }
 
+function aiChangeSummaryItems(
+  response: ForecastFramingDraftResponse | null,
+  fields: FinalFields,
+  originalExecutionPrompt: string,
+): string[] {
+  if (!response) return [];
+  const original = originalExecutionPrompt.trim();
+  const items: string[] = [];
+  if (fields.question.trim() && fields.question.trim() !== original) {
+    items.push("元の依頼からForecast用の短い問いを抽出しました。");
+  }
+  if (fields.resolutionCriteria.trim()) {
+    items.push("判定条件を確認対象として整理しました。");
+  }
+  if (splitLines(fields.resolutionSources).length > 0) {
+    items.push("公開情報で確認する判定ソースを整理しました。");
+  }
+  if (splitLines(fields.outcomes).length > 0) {
+    items.push("結果候補を確認対象として整理しました。");
+  }
+  if (
+    fields.targetPopulation.trim() ||
+    fields.unitOfAnalysis.trim() ||
+    fields.decisionContext.trim()
+  ) {
+    items.push("対象、分析単位、意思決定文脈を確認対象として抽出しました。");
+  }
+  if (items.length === 0) {
+    return ["元の依頼から大きな変更はありません。不足メタデータだけ確認します。"];
+  }
+  return items.slice(0, 4);
+}
+
 function answerPayload(
   questions: ForecastFramingDraftClarifyingQuestion[],
   answers: Record<string, string>,
@@ -114,6 +150,7 @@ function answerPayload(
 export function NewForecast() {
   const [roughQuestion, setRoughQuestion] = useState("");
   const [draftResponse, setDraftResponse] = useState<ForecastFramingDraftResponse | null>(null);
+  const [originalExecutionPrompt, setOriginalExecutionPrompt] = useState("");
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [finalFields, setFinalFields] = useState<FinalFields>({
     question: "",
@@ -148,8 +185,17 @@ export function NewForecast() {
   const hasNoQuestion = finalFields.question.trim().length === 0;
   const isCreatingForecast = state === "creating";
   const finalPayload = useMemo(
-    () => finalPayloadFromFields(finalFields, draftResponse?.create_payload),
-    [draftResponse?.create_payload, finalFields],
+    () =>
+      finalPayloadFromFields(
+        finalFields,
+        draftResponse?.create_payload,
+        originalExecutionPrompt,
+      ),
+    [draftResponse?.create_payload, finalFields, originalExecutionPrompt],
+  );
+  const aiChangeSummary = useMemo(
+    () => aiChangeSummaryItems(draftResponse, finalFields, originalExecutionPrompt),
+    [draftResponse, finalFields, originalExecutionPrompt],
   );
   const roughQuestionLength = roughQuestion.length;
   const hasTooLongRoughQuestion = roughQuestionLength > FRAMING_ROUGH_QUESTION_MAX_LENGTH;
@@ -172,6 +218,8 @@ export function NewForecast() {
   }
 
   async function onGenerateDraft() {
+    const requestRoughQuestion = roughQuestion;
+    const shouldCaptureOriginalPrompt = !draftResponse && !originalExecutionPrompt.trim();
     setError(null);
     setState("drafting");
     setDraftResponse(null);
@@ -181,11 +229,14 @@ export function NewForecast() {
     idempotencyKeys.current.draft = stableKey("framing-draft");
     try {
       const response = await createForecastFramingDraft({
-        rough_question: roughQuestion,
+        rough_question: requestRoughQuestion,
         locale: "ja",
       }, {
         idempotencyKey: idempotencyKeys.current.draft,
       });
+      if (shouldCaptureOriginalPrompt) {
+        setOriginalExecutionPrompt(requestRoughQuestion);
+      }
       applyDraftResponse(response);
     } catch (err) {
       setError(formatForecastError(err));
@@ -255,7 +306,7 @@ export function NewForecast() {
         <div>
           <h1>新規Forecast</h1>
           <p className="screen-subtitle">
-            AIで問いを整え、公開情報で判定できる形にしてから作成します。
+            元の依頼を保持したまま、公開情報で判定するためのメタデータを確認します。
           </p>
         </div>
         <div className="forecast-mode-pills" aria-label="Forecast実行条件">
@@ -286,7 +337,7 @@ export function NewForecast() {
                   <span className="forecast-required">必須</span>
                 </span>
                 <span className="forecast-field-help">
-                  期限や判定条件が曖昧でも大丈夫です。AIがForecast用に整理します。
+                  元の依頼はそのまま保存し、AIは不足しているForecastメタデータだけ確認します。
                 </span>
                 <textarea
                   id="forecast-rough-question"
@@ -328,9 +379,13 @@ export function NewForecast() {
               <div className="forecast-panel-heading">
                 <p className="forecast-step-label">Step 2</p>
                 <h2 id="questions-title">確認したいこと</h2>
-                <p>回答するとAIがForecast案を更新します。</p>
+                <p>
+                  元の依頼は保持したまま、不足しているForecastメタデータだけ確認します。
+                </p>
               </div>
 
+              <OriginalPromptDisclosure prompt={originalExecutionPrompt} />
+              <AiChangeSummary items={aiChangeSummary} />
               <WarningsList warnings={warnings} />
 
               <div className="forecast-question-grid">
@@ -393,9 +448,14 @@ export function NewForecast() {
               <div className="forecast-panel-heading">
                 <p className="forecast-step-label">Step 2</p>
                 <h2 id="retry-title">大枠を調整</h2>
-                <p>AIから追加質問が返らなかったため、大枠を編集して再試行できます。</p>
+                <p>
+                  元の依頼は保持されます。作成に足りないForecastメタデータを補うため、
+                  大枠を編集して再試行できます。
+                </p>
               </div>
 
+              <OriginalPromptDisclosure prompt={originalExecutionPrompt} />
+              <AiChangeSummary items={aiChangeSummary} />
               <WarningsList warnings={warnings} />
 
               <label className="forecast-field" htmlFor="forecast-rough-retry">
@@ -448,7 +508,9 @@ export function NewForecast() {
                 <div className="forecast-panel-heading">
                   <p className="forecast-step-label">Step 3</p>
                   <h2 id="final-title">最終確認</h2>
-                  <p>作成前に内容を編集できます。承認はForecast保存後に別操作で行います。</p>
+                  <p>
+                    元の依頼は保存時に保持されます。ここでは作成に必要なForecastメタデータだけ編集します。
+                  </p>
                   <div className="forecast-draft-meta">
                     <span>{draftResponse.model}</span>
                     <span>confidence {draftResponse.draft.confidence.toFixed(2)}</span>
@@ -456,8 +518,15 @@ export function NewForecast() {
                 </div>
 
                 <WarningsList warnings={warnings} />
+                <OriginalPromptDisclosure prompt={originalExecutionPrompt} />
+                <AiChangeSummary items={aiChangeSummary} />
 
                 <div className="forecast-field-stack">
+                  <div className="forecast-metadata-heading">
+                    <h3>Forecastメタデータ</h3>
+                    <p>AIが整えた項目です。必要な範囲だけ編集できます。</p>
+                  </div>
+
                   <label className="forecast-field" htmlFor="forecast-final-question">
                     <span className="forecast-field-header">
                       <span className="forecast-field-label">問い</span>
@@ -691,6 +760,32 @@ function WarningsList({ warnings }: { warnings: string[] }) {
   );
 }
 
+function OriginalPromptDisclosure({ prompt }: { prompt: string }) {
+  const preservedPrompt = prompt.trim();
+  if (!preservedPrompt) return null;
+  return (
+    <details className="forecast-original-prompt" open>
+      <summary>Step 1の元の依頼</summary>
+      <p>元の依頼は保存時にそのまま保持します。ここでは不足しているForecastメタデータだけを確認します。</p>
+      <pre>{preservedPrompt}</pre>
+    </details>
+  );
+}
+
+function AiChangeSummary({ items }: { items: string[] }) {
+  if (items.length === 0) return null;
+  return (
+    <section className="forecast-ai-summary" aria-labelledby="forecast-ai-summary-title">
+      <h3 id="forecast-ai-summary-title">AIが抽出・整理した点</h3>
+      <ul>
+        {items.map((item) => (
+          <li key={item}>{item}</li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 function GuidePanel() {
   return (
     <aside className="forecast-guidance-panel" aria-label="入力ガイド">
@@ -701,12 +796,12 @@ function GuidePanel() {
           <span>期限、対象、判定条件が曖昧でも、まずは一文で始められます。</span>
         </div>
         <div>
-          <strong>AIが下書き化</strong>
-          <span>問い、判定条件、公開ソース、結果候補をForecast用に整えます。</span>
+          <strong>AIがメタデータ抽出</strong>
+          <span>問い、判定条件、公開ソース、結果候補を元の依頼から拾います。</span>
         </div>
         <div>
           <strong>不足点だけ確認</strong>
-          <span>追加質問に答えると、作成前の最終確認で自由に編集できます。</span>
+          <span>元の依頼は保持し、足りないForecastメタデータだけ確認します。</span>
         </div>
         <div>
           <strong>保存後に承認</strong>

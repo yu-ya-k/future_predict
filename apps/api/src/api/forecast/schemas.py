@@ -16,6 +16,12 @@ def _strip(value: Any) -> Any:
     return value
 
 
+def _reject_blank_string(value: Any) -> Any:
+    if isinstance(value, str) and not value.strip():
+        raise ValueError("String should not be blank")
+    return value
+
+
 class ForecastStatus(StrEnum):
     FRAMING_PENDING = "framing_pending"
     FRAMING_APPROVED = "framing_approved"
@@ -47,6 +53,15 @@ class ForecastCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     question: str = Field(min_length=1, max_length=5000)
+    original_execution_prompt: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=FRAMING_ROUGH_QUESTION_MAX_LENGTH,
+        description=(
+            "User's original execution prompt, preserved separately from extracted "
+            "Forecast metadata and used as the primary research-pack task."
+        ),
+    )
     resolution_date: date | None = None
     target_population: str | None = Field(default=None, max_length=1000)
     unit_of_analysis: str | None = Field(default=None, max_length=1000)
@@ -60,6 +75,9 @@ class ForecastCreateRequest(BaseModel):
     _strip_resolution_criteria = field_validator("resolution_criteria", mode="before")(
         _strip
     )
+    _reject_blank_original_execution_prompt = field_validator(
+        "original_execution_prompt", mode="after"
+    )(_reject_blank_string)
 
 
 class ForecastCreateResponse(BaseModel):
@@ -100,14 +118,58 @@ def _default_clarifying_questions() -> list[ForecastFramingDraftClarifyingQuesti
 class ForecastFramingDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    forecast_prompt: str = Field(min_length=1, max_length=8000)
-    question: str = Field(min_length=1, max_length=5000)
-    resolution_criteria: str = Field(min_length=1, max_length=5000)
-    resolution_sources: list[str] = Field(default_factory=list, max_length=20)
-    target_population: str | None = Field(default=None, max_length=1000)
-    unit_of_analysis: str | None = Field(default=None, max_length=1000)
-    decision_context: str | None = Field(default=None, max_length=5000)
-    outcomes: list[str] = Field(default_factory=lambda: ["Yes", "No"], max_length=8)
+    forecast_prompt: str = Field(
+        min_length=1,
+        max_length=8000,
+        description=(
+            "UI helper text only. It must not replace, rewrite, summarize, or "
+            "normalize the user's original prompt."
+        ),
+    )
+    question: str = Field(
+        min_length=1,
+        max_length=5000,
+        description=(
+            "Short resolvable forecast question metadata. The user's original "
+            "execution prompt is stored separately and remains the primary task."
+        ),
+    )
+    resolution_criteria: str = Field(
+        default="",
+        max_length=5000,
+        description=(
+            "Extracted resolution metadata based only on explicit user input, "
+            "answers, or previous draft context; leave empty when not provided."
+        ),
+    )
+    resolution_sources: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description="Extracted public source metadata; leave empty when not provided.",
+    )
+    target_population: str | None = Field(
+        default=None,
+        max_length=1000,
+        description="Extracted metadata; null when the user has not provided it.",
+    )
+    unit_of_analysis: str | None = Field(
+        default=None,
+        max_length=1000,
+        description="Extracted metadata; null when the user has not provided it.",
+    )
+    decision_context: str | None = Field(
+        default=None,
+        max_length=5000,
+        description="Extracted metadata; null when the user has not provided it.",
+    )
+    outcomes: list[str] = Field(
+        default_factory=lambda: ["Yes", "No"],
+        max_length=8,
+        description=(
+            "Outcome labels extracted from explicit user input; otherwise keep "
+            "the default Yes/No labels."
+        ),
+    )
     clarifying_questions: list[ForecastFramingDraftClarifyingQuestion] = Field(
         default_factory=_default_clarifying_questions,
         max_length=5,
@@ -152,7 +214,9 @@ class ForecastFramingDraftRequest(BaseModel):
     previous_draft: ForecastFramingDraft | None = None
     locale: Literal["ja", "en"] = "ja"
 
-    _strip_rough_question = field_validator("rough_question", mode="before")(_strip)
+    _reject_blank_rough_question = field_validator("rough_question", mode="after")(
+        _reject_blank_string
+    )
 
 
 class ForecastFramingDraftResponse(BaseModel):
@@ -187,6 +251,7 @@ class ForecastSummary(BaseModel):
 
 
 class ForecastDetail(ForecastSummary):
+    original_execution_prompt: str | None
     target_population: str | None
     unit_of_analysis: str | None
     resolution_criteria: str

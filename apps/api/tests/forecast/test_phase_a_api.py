@@ -5,17 +5,24 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Any, cast
+from uuid import UUID
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
 
 from api.config import Settings
+from api.forecast import router as forecast_router
+from api.forecast import service as forecast_service
 from api.forecast.artifacts import ForecastArtifactStore
 from api.forecast.dependencies import get_forecast_orchestrator
 from api.forecast.probability.phase_a_v1 import compute_phase_a_estimates
 from api.forecast.repository import ForecastRepository
 from api.forecast.schemas import (
     FRAMING_ROUGH_QUESTION_MAX_LENGTH,
+    ForecastCreateRequest,
+    ForecastFramingDraft,
+    ForecastFramingDraftAnswer,
     ForecastFramingDraftRequest,
 )
 from api.forecast.service import ForecastOrchestrator
@@ -94,6 +101,107 @@ def _framing_draft_payload(
     }
 
 
+def test_framing_draft_prompt_extracts_metadata_without_rewriting() -> None:
+    rough_question = "By 2030, will public EV charging uptime exceed 99% in Japan?"
+    request = ForecastFramingDraftRequest(
+        rough_question=rough_question,
+        answers=[
+            ForecastFramingDraftAnswer(
+                question_id="source",
+                answer="Use public regulator reports and operator disclosures.",
+            )
+        ],
+        locale="en",
+    )
+
+    prompt = forecast_service._build_framing_draft_prompt(request)  # pyright: ignore[reportPrivateUsage]
+
+    assert "extract metadata" in prompt
+    assert "primary execution prompt" in prompt
+    assert "question is short Forecast metadata" in prompt
+    assert "forecast_prompt is only a short UI helper" in prompt
+    assert "Do not invent missing metadata." in prompt
+    assert "string fields empty, nullable fields null, and list fields empty" in prompt
+    assert "clarifying_questions instead of filling fields with assumptions" in prompt
+    assert "ask only for missing metadata" in prompt
+    assert "replace, rewrite, refine, summarize, normalize, translate" in prompt
+    assert "You help refine" not in prompt
+    assert "clear, resolvable forecast question" not in prompt
+
+    _, request_json = prompt.split("Request JSON:\n", maxsplit=1)
+    payload = json.loads(request_json)
+    assert payload["rough_question"] == rough_question
+    assert payload["answers"] == [
+        {
+            "question_id": "source",
+            "answer": "Use public regulator reports and operator disclosures.",
+        }
+    ]
+
+
+def test_original_prompt_fields_reject_blank_without_trimming_text() -> None:
+    original_prompt = "  Forecast the execution task exactly.\nKeep spacing.  "
+    rough_question = "  Draft this exact forecast prompt.\n"
+
+    create_request = ForecastCreateRequest(
+        question="Will exact prompt preservation work?",
+        original_execution_prompt=original_prompt,
+        resolution_criteria="Resolve from public evidence.",
+    )
+    draft_request = ForecastFramingDraftRequest(rough_question=rough_question)
+
+    assert create_request.original_execution_prompt == original_prompt
+    assert draft_request.rough_question == rough_question
+    with pytest.raises(ValidationError):
+        ForecastCreateRequest(
+            question="Will blank prompts be rejected?",
+            original_execution_prompt=" \n\t ",
+            resolution_criteria="Resolve from public evidence.",
+        )
+    with pytest.raises(ValidationError):
+        ForecastFramingDraftRequest(rough_question=" \n\t ")
+
+
+def test_framing_draft_schema_marks_question_metadata_and_prompt_ui_only() -> None:
+    properties = ForecastFramingDraft.model_json_schema()["properties"]
+
+    question_description = properties["question"]["description"]
+    forecast_prompt_description = properties["forecast_prompt"]["description"]
+
+    assert "Short resolvable forecast question metadata" in question_description
+    assert "primary task" in question_description
+    assert "UI helper text only" in forecast_prompt_description
+    assert "must not replace, rewrite, summarize" in forecast_prompt_description
+
+    resolution_criteria_schema = properties["resolution_criteria"]
+    assert resolution_criteria_schema["default"] == ""
+    assert "minLength" not in resolution_criteria_schema
+    assert "leave empty when not provided" in resolution_criteria_schema["description"]
+
+
+def test_forecast_create_idempotency_payload_omits_absent_original_prompt() -> None:
+    request = ForecastCreateRequest(
+        question="Will the market adopt AI agents?",
+        resolution_criteria="Resolve from public sources.",
+        outcomes=["Yes", "No"],
+    )
+
+    payload = forecast_router._forecast_create_idempotency_payload(request)  # pyright: ignore[reportPrivateUsage]
+
+    assert "original_execution_prompt" not in payload
+    assert payload == {
+        "question": "Will the market adopt AI agents?",
+        "resolution_date": None,
+        "target_population": None,
+        "unit_of_analysis": None,
+        "resolution_criteria": "Resolve from public sources.",
+        "resolution_sources": [],
+        "decision_context": None,
+        "confidentiality_class": "public",
+        "outcomes": ["Yes", "No"],
+    }
+
+
 @pytest.mark.anyio
 async def test_framing_draft_route_order_and_happy_draft(tmp_path: Path) -> None:
     fake = IntegrationFakeAzure(structured_parse_results=[_framing_draft_payload()])
@@ -126,6 +234,52 @@ async def test_framing_draft_route_order_and_happy_draft(tmp_path: Path) -> None
     assert fake.structured_parse_calls[0]["tool_profile"] == "synthesis"
     assert fake.structured_parse_calls[0]["policy_decision_id"] is None
     assert fake.structured_parse_calls[0]["vector_store_ids"] is None
+
+
+@pytest.mark.anyio
+async def test_framing_draft_empty_resolution_criteria_needs_clarification(
+    tmp_path: Path,
+) -> None:
+    payload = _framing_draft_payload(
+        clarifying_questions=[
+            {
+                "question_id": "resolution_criteria",
+                "label": "Resolution criteria",
+                "prompt": "How should this forecast be resolved from public evidence?",
+                "why_needed": "The forecast cannot be created without resolution criteria.",
+                "answer_type": "text",
+                "required": True,
+                "options": [],
+            }
+        ],
+        confidence=0.51,
+    )
+    payload["resolution_criteria"] = ""
+    fake = IntegrationFakeAzure(structured_parse_results=[payload])
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/forecasts/framing-drafts",
+            json={"rough_question": "Will AI agents handle many support tickets?"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["draft"]["resolution_criteria"] == ""
+    assert body["draft"]["clarifying_questions"][0]["question_id"] == (
+        "resolution_criteria"
+    )
+    assert body["draft"]["clarifying_questions"][0]["required"] is True
+    assert body["ready_to_create"] is False
+    assert body["create_payload"] is None
+    assert body["warnings"] == ["required_clarifying_answers_missing"]
 
 
 @pytest.mark.anyio
@@ -374,6 +528,276 @@ async def test_framing_draft_runtime_failure_returns_unavailable(
 
     assert response.status_code == 503
     assert _typed_code(response.json()) == "framing_draft_unavailable"
+
+
+@pytest.mark.anyio
+async def test_forecast_preserves_original_execution_prompt_for_research_pack(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+    original_prompt = (
+        "  Forecast the exact execution task without rewriting.\n"
+        "Include the user's scenario framing verbatim.  "
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will AI agents handle 30% of support tickets by 2029?",
+                "original_execution_prompt": original_prompt,
+                "resolution_criteria": "Resolve from public vendor and benchmark reports.",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+        assert create.status_code == 202
+        forecast_id = create.json()["forecast_id"]
+
+        detail = await client.get(f"/forecasts/{forecast_id}")
+        assert detail.status_code == 200
+        assert detail.json()["original_execution_prompt"] == original_prompt
+
+        approve = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={"action": "approve_framing"},
+        )
+        assert approve.status_code == 200
+
+        pack = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={"pack_role": "current_state", "tool_profile": "public"},
+        )
+        assert pack.status_code == 200
+
+    submitted_prompt = str(fake.submit_calls[-1]["prompt"])
+    assert f"Primary execution prompt:\n{original_prompt}" in submitted_prompt
+    assert "- Forecast question: Will AI agents handle 30% of support tickets by 2029?" in (
+        submitted_prompt
+    )
+
+
+@pytest.mark.anyio
+async def test_forecast_create_rejects_blank_original_execution_prompt(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will blank execution prompts be rejected?",
+                "original_execution_prompt": " \n\t ",
+                "resolution_criteria": "Resolve from public evidence.",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_research_pack_accepts_max_length_original_prompt_with_metadata(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+    prompt_unit = (
+        "Use public sources to assess whether the product launch milestone happens. "
+    )
+    original_prompt = (prompt_unit * FRAMING_ROUGH_QUESTION_MAX_LENGTH)[
+        :FRAMING_ROUGH_QUESTION_MAX_LENGTH
+    ]
+    assert len(original_prompt) == FRAMING_ROUGH_QUESTION_MAX_LENGTH
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will long Forecast prompts dispatch research packs?",
+                "original_execution_prompt": original_prompt,
+                "resolution_criteria": "Resolve from public evidence.",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+        assert create.status_code == 202
+        forecast_id = create.json()["forecast_id"]
+
+        approve = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={"action": "approve_framing"},
+        )
+        assert approve.status_code == 200
+
+        pack = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={"pack_role": "current_state", "tool_profile": "public"},
+        )
+        assert pack.status_code == 200
+
+    research_run = research.repository.get_run(UUID(pack.json()["research_run_id"]))
+    assert original_prompt in research_run.user_prompt
+    assert len(fake.submit_calls) == 1
+
+
+@pytest.mark.anyio
+async def test_research_pack_prompt_falls_back_to_metadata_for_old_forecasts(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will robotics firms ship one million humanoids by 2030?",
+                "resolution_criteria": "Resolve from public company and industry reports.",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+        assert create.status_code == 202
+        forecast_id = create.json()["forecast_id"]
+
+        detail = await client.get(f"/forecasts/{forecast_id}")
+        assert detail.status_code == 200
+        assert detail.json()["original_execution_prompt"] is None
+
+        approve = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={"action": "approve_framing"},
+        )
+        assert approve.status_code == 200
+
+        pack = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={"pack_role": "current_state", "tool_profile": "public"},
+        )
+        assert pack.status_code == 200
+
+    submitted_prompt = str(fake.submit_calls[-1]["prompt"])
+    assert (
+        "Primary execution prompt:\n"
+        "Will robotics firms ship one million humanoids by 2030?"
+        in submitted_prompt
+    )
+    assert "Original execution prompt was not stored for this forecast" in submitted_prompt
+    assert (
+        "- Forecast question: Will robotics firms ship one million humanoids by 2030?"
+        in submitted_prompt
+    )
+
+
+@pytest.mark.anyio
+async def test_repository_migrates_old_forecast_rows_without_original_prompt(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "phase-a.sqlite3"
+    forecast_id = "11111111-1111-1111-1111-111111111111"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE forecast_forecasts (
+                id TEXT PRIMARY KEY,
+                question TEXT NOT NULL,
+                resolution_date TEXT,
+                target_population TEXT,
+                unit_of_analysis TEXT,
+                resolution_criteria TEXT NOT NULL DEFAULT '',
+                resolution_sources_json TEXT NOT NULL DEFAULT '[]',
+                decision_context TEXT,
+                confidentiality_class TEXT NOT NULL DEFAULT 'public',
+                status TEXT NOT NULL,
+                current_framing_version INTEGER NOT NULL DEFAULT 1,
+                approved_framing_version INTEGER,
+                committed_version_id TEXT,
+                resolved_outcome_id TEXT,
+                resolved_at TEXT,
+                resolution_notes TEXT,
+                idempotency_key TEXT UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO forecast_forecasts (
+                id, question, resolution_criteria, status,
+                current_framing_version, approved_framing_version,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, 1, 1, ?, ?)
+            """,
+            (
+                forecast_id,
+                "Will old forecasts keep working after migration?",
+                "Resolve from public sources.",
+                "framing_approved",
+                "2026-06-08T00:00:00+00:00",
+                "2026-06-08T00:00:00+00:00",
+            ),
+        )
+
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(forecast_forecasts)")
+        }
+    assert "original_execution_prompt" in columns
+
+    row = forecast.repository.get_forecast(UUID(forecast_id))
+    base = ForecastRepository.forecast_row_to_dict(row)
+    assert base["original_execution_prompt"] is None
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        detail = await client.get(f"/forecasts/{forecast_id}")
+        assert detail.status_code == 200
+        assert detail.json()["original_execution_prompt"] is None
+
+        pack = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={"pack_role": "current_state", "tool_profile": "public"},
+        )
+        assert pack.status_code == 200
+
+    submitted_prompt = str(fake.submit_calls[-1]["prompt"])
+    assert "Original execution prompt was not stored for this forecast" in submitted_prompt
+    assert "Will old forecasts keep working after migration?" in submitted_prompt
 
 
 @pytest.mark.anyio

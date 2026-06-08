@@ -58,6 +58,7 @@ class ForecastRepository:
                 CREATE TABLE IF NOT EXISTS forecast_forecasts (
                     id TEXT PRIMARY KEY,
                     question TEXT NOT NULL,
+                    original_execution_prompt TEXT,
                     resolution_date TEXT,
                     target_population TEXT,
                     unit_of_analysis TEXT,
@@ -355,6 +356,14 @@ class ForecastRepository:
                 END;
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(forecast_forecasts)")
+            }
+            if "original_execution_prompt" not in columns:
+                connection.execute(
+                    "ALTER TABLE forecast_forecasts ADD COLUMN original_execution_prompt TEXT"
+                )
 
     def append_audit(
         self,
@@ -489,6 +498,7 @@ class ForecastRepository:
         self,
         *,
         question: str,
+        original_execution_prompt: str | None,
         resolution_date: date | None,
         target_population: str | None,
         unit_of_analysis: str | None,
@@ -513,16 +523,18 @@ class ForecastRepository:
             connection.execute(
                 """
                 INSERT INTO forecast_forecasts (
-                    id, question, resolution_date, target_population, unit_of_analysis,
+                    id, question, original_execution_prompt, resolution_date,
+                    target_population, unit_of_analysis,
                     resolution_criteria, resolution_sources_json, decision_context,
                     confidentiality_class, status, current_framing_version,
                     idempotency_key, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                 """,
                 (
                     str(forecast_id),
                     question,
+                    original_execution_prompt,
                     resolution_date.isoformat() if resolution_date else None,
                     target_population,
                     unit_of_analysis,
@@ -1488,6 +1500,7 @@ class ForecastRepository:
         return {
             "forecast_id": UUID(row["id"]),
             "question": row["question"],
+            "original_execution_prompt": row["original_execution_prompt"],
             "status": ForecastStatus(row["status"]),
             "resolution_date": _parse_date(row["resolution_date"]),
             "target_population": row["target_population"],

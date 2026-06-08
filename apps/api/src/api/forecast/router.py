@@ -69,7 +69,7 @@ def create_forecast(
             scope="forecast:create",
             resource_id="",
             idempotency_key=normalized_key,
-            payload=request.model_dump(mode="json"),
+            payload=_forecast_create_idempotency_payload(request),
             action=lambda: orchestrator.create_forecast(
                 request,
                 idempotency_key=normalized_key,
@@ -369,6 +369,13 @@ def _request_hash(payload: object) -> str:
             default=str,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _forecast_create_idempotency_payload(request: ForecastCreateRequest) -> dict[str, object]:
+    payload = request.model_dump(mode="json")
+    if payload.get("original_execution_prompt") is None:
+        payload.pop("original_execution_prompt", None)
+    return payload
 
 
 def _run_idempotent[T](

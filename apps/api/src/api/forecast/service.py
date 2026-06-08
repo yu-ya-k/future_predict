@@ -111,6 +111,7 @@ class ForecastOrchestrator:
         self._ensure_enabled()
         row = self.repository.create_forecast(
             question=request.question,
+            original_execution_prompt=request.original_execution_prompt,
             resolution_date=request.resolution_date,
             target_population=request.target_population,
             unit_of_analysis=request.unit_of_analysis,
@@ -169,7 +170,11 @@ class ForecastOrchestrator:
         warnings: list[str] = []
         if not ready_to_create:
             warnings.append("required_clarifying_answers_missing")
-        create_payload = _framing_create_payload(draft) if ready_to_create else None
+        create_payload = (
+            _framing_create_payload(draft, original_execution_prompt=request.rough_question)
+            if ready_to_create
+            else None
+        )
         return ForecastFramingDraftResponse(
             draft=draft,
             create_payload=create_payload,
@@ -918,9 +923,9 @@ def _ensure_framing_inputs_are_public(request: ForecastFramingDraftRequest) -> N
 
 def _build_framing_draft_prompt(request: ForecastFramingDraftRequest) -> str:
     locale_instruction = (
-        "Write user-facing draft text in Japanese."
+        "Write extracted metadata and clarifying questions in Japanese."
         if request.locale == "ja"
-        else "Write user-facing draft text in English."
+        else "Write extracted metadata and clarifying questions in English."
     )
     payload = {
         "rough_question": request.rough_question,
@@ -933,22 +938,29 @@ def _build_framing_draft_prompt(request: ForecastFramingDraftRequest) -> str:
         "locale": request.locale,
     }
     return (
-        "You help refine an early forecasting idea into a public Forecast PhaseA "
-        "framing draft. Use only the information in the request; do not browse, "
-        "search, retrieve files, or ask tools. Return exactly one structured "
-        "ForecastFramingDraft.\n\n"
+        "You extract metadata from a user's public Forecast PhaseA prompt. "
+        "Use only the information in the request; do not browse, search, retrieve "
+        "files, or ask tools. Return exactly one structured ForecastFramingDraft.\n\n"
         f"{locale_instruction}\n\n"
-        "Drafting rules:\n"
-        "- forecast_prompt should be a concise internal prompt that captures the "
-        "forecasting task.\n"
-        "- question must be a clear, resolvable forecast question.\n"
-        "- resolution_criteria must explain how the outcome will be judged.\n"
-        "- resolution_sources should list public source types or named public "
-        "sources when the user provided them.\n"
-        "- outcomes should usually stay binary Yes/No unless the user's framing "
-        "clearly needs mutually exclusive alternatives.\n"
-        "- Ask at most five clarifying questions, only for information needed to "
-        "create a high-quality forecast. Mark essential questions required.\n"
+        "Extraction rules:\n"
+        "- Preserve rough_question conceptually as the user's primary execution "
+        "prompt. Do not replace, rewrite, refine, summarize, normalize, translate, "
+        "or improve it.\n"
+        "- question is short Forecast metadata: extract a concise, resolvable "
+        "forecast question without changing the user's research intent.\n"
+        "- forecast_prompt is only a short UI helper. It is not the primary execution "
+        "prompt and must not replace, rewrite, or compress rough_question.\n"
+        "- Extract resolution_criteria, resolution_sources, target_population, "
+        "unit_of_analysis, decision_context, and outcomes only from explicit "
+        "request information, answers, or previous_draft context.\n"
+        "- Do not invent missing metadata. If required metadata is missing, leave "
+        "string fields empty, nullable fields null, and list fields empty; ask for "
+        "the missing metadata in clarifying_questions instead of filling fields "
+        "with assumptions.\n"
+        "- Ask at most five clarifying questions and ask only for missing metadata "
+        "needed to create the forecast. Mark essential questions required.\n"
+        "- Keep default binary outcomes Yes/No unless the user explicitly provides "
+        "mutually exclusive alternatives.\n"
         "- Do not include private, confidential, or sensitive material.\n\n"
         "Request JSON:\n"
         f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
@@ -997,14 +1009,20 @@ def _framing_draft_ready_to_create(
         for question in draft.clarifying_questions
         if question.required
     }
-    return bool(draft.question and draft.resolution_criteria) and required_ids.issubset(
-        answered_ids
+    has_required_metadata = bool(
+        draft.question.strip() and draft.resolution_criteria.strip()
     )
+    return has_required_metadata and required_ids.issubset(answered_ids)
 
 
-def _framing_create_payload(draft: ForecastFramingDraft) -> ForecastCreateRequest:
+def _framing_create_payload(
+    draft: ForecastFramingDraft,
+    *,
+    original_execution_prompt: str | None = None,
+) -> ForecastCreateRequest:
     return ForecastCreateRequest(
         question=draft.question,
+        original_execution_prompt=original_execution_prompt,
         target_population=draft.target_population,
         unit_of_analysis=draft.unit_of_analysis,
         resolution_criteria=draft.resolution_criteria,

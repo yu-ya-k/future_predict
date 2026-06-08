@@ -596,6 +596,7 @@ export interface ForecastSummary {
 }
 
 export interface ForecastDetail extends ForecastSummary {
+  original_execution_prompt: string | null;
   target_population?: string | null;
   unit_of_analysis?: string | null;
   resolution_criteria: string;
@@ -607,6 +608,7 @@ export interface ForecastDetail extends ForecastSummary {
 
 export interface ForecastCreateRequest {
   question: string;
+  original_execution_prompt?: string | null;
   resolution_date?: string | null;
   target_population?: string | null;
   unit_of_analysis?: string | null;

@@ -34,6 +34,7 @@ function forecastDetail(overrides: Partial<ForecastDetail> = {}): ForecastDetail
     resolved_at: null,
     created_at: "2026-06-08T00:00:00Z",
     updated_at: "2026-06-08T00:00:00Z",
+    original_execution_prompt: null,
     target_population: null,
     unit_of_analysis: null,
     resolution_criteria: "Official launch announcement.",
@@ -181,7 +182,7 @@ describe("Forecast UI", () => {
     expect(screen.queryByLabelText("判定条件")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("結果候補")).not.toBeInTheDocument();
     expect(screen.getByText("大枠だけ入力")).toBeInTheDocument();
-    expect(screen.getByText("AIが下書き化")).toBeInTheDocument();
+    expect(screen.getByText("AIがメタデータ抽出")).toBeInTheDocument();
     expect(screen.getByText("不足点だけ確認")).toBeInTheDocument();
     expect(screen.getByText("保存後に承認")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "AIでForecast案を作成" })).toBeDisabled();
@@ -229,6 +230,7 @@ describe("Forecast UI", () => {
       if (path === "/forecasts" && init?.method === "POST") {
         expect(JSON.parse(String(init.body))).toMatchObject({
           question: "Will the Forecast app launch by 2026 Q4?",
+          original_execution_prompt: "Will the product launch?",
           resolution_criteria: "Official launch announcement.",
           resolution_sources: ["Official site", "Status page"],
           target_population: "Product users",
@@ -270,6 +272,13 @@ describe("Forecast UI", () => {
     await userEvent.click(screen.getByRole("button", { name: "AIでForecast案を作成" }));
 
     expect(await screen.findByRole("heading", { name: "確認したいこと" })).toBeInTheDocument();
+    expect(screen.getByText("Step 1の元の依頼")).toBeInTheDocument();
+    expect(screen.getByText("Will the product launch?")).toBeInTheDocument();
+    expect(screen.getByText("AIが抽出・整理した点")).toBeInTheDocument();
+    expect(screen.getByText("元の依頼からForecast用の短い問いを抽出しました。")).toBeInTheDocument();
+    expect(
+      screen.getByText(/不足しているForecastメタデータだけ確認します/),
+    ).toBeInTheDocument();
     expect(screen.getByText("期限を確認してください。")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Forecastを作成" })).not.toBeInTheDocument();
 
@@ -278,6 +287,9 @@ describe("Forecast UI", () => {
     await userEvent.click(screen.getByRole("button", { name: "回答をAIに反映" }));
 
     expect(await screen.findByRole("heading", { name: "最終確認" })).toBeInTheDocument();
+    expect(screen.getByText("Step 1の元の依頼")).toBeInTheDocument();
+    expect(screen.getByText("Will the product launch?")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Forecastメタデータ" })).toBeInTheDocument();
     const questionInput = screen.getByRole("textbox", { name: /問い/ });
     await userEvent.clear(questionInput);
     await userEvent.type(questionInput, "Will the Forecast app launch by 2026 Q4?");
@@ -388,6 +400,89 @@ describe("Forecast UI", () => {
     expect(await screen.findByRole("heading", { name: "最終確認" })).toBeInTheDocument();
     expect(screen.getByText(/まだ作成準備が完了していません/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Forecastを作成" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the first rough input as original prompt across retry and create payload conflicts", async () => {
+    window.location.hash = "#/forecasts/new";
+    let draftCalls = 0;
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const path = String(url).replace("http://localhost:8000", "");
+      if (path === "/forecasts/framing-drafts" && init?.method === "POST") {
+        draftCalls += 1;
+        const body = JSON.parse(String(init.body));
+        if (draftCalls === 1) {
+          expect(body).toMatchObject({
+            rough_question: "Initial launch prompt",
+            locale: "ja",
+          });
+          return jsonResponse(
+            framingDraft({
+              ready_to_create: false,
+              warnings: ["判定期限を確認してください。"],
+              draft: { clarifying_questions: [] },
+              create_payload: null,
+            }),
+          );
+        }
+        expect(body).toMatchObject({
+          rough_question: "Retry prompt with deadline",
+          locale: "ja",
+        });
+        expect(body).not.toHaveProperty("previous_draft");
+        return jsonResponse(
+          framingDraft({
+            create_payload: {
+              original_execution_prompt: "API-provided conflicting prompt",
+            },
+          }),
+        );
+      }
+      if (path === "/forecasts" && init?.method === "POST") {
+        expect(JSON.parse(String(init.body))).toMatchObject({
+          question: "Will the product launch by Q4?",
+          original_execution_prompt: "Initial launch prompt",
+        });
+        return jsonResponse({
+          forecast_id: "forecast-1",
+          status: "framing_pending",
+          framing_version: 1,
+          created_at: "2026-06-08T00:00:00Z",
+        });
+      }
+      if (path === "/forecasts/forecast-1" && (!init || init.method === "GET")) {
+        return jsonResponse(
+          forecastDetail({
+            original_execution_prompt: "Initial launch prompt",
+          }),
+        );
+      }
+      return jsonResponse({ detail: "unexpected request" }, 500);
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.type(
+      screen.getByRole("textbox", { name: /予測したいこと/ }),
+      "Initial launch prompt",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "AIでForecast案を作成" }));
+
+    expect(await screen.findByRole("heading", { name: "大枠を調整" })).toBeInTheDocument();
+    expect(screen.getAllByText("Initial launch prompt").length).toBeGreaterThanOrEqual(1);
+
+    const retryInput = screen.getByRole("textbox", { name: /予測したいこと/ });
+    await userEvent.clear(retryInput);
+    await userEvent.type(retryInput, "Retry prompt with deadline");
+    await userEvent.click(screen.getByRole("button", { name: "AIでForecast案を再作成" }));
+
+    expect(await screen.findByRole("heading", { name: "最終確認" })).toBeInTheDocument();
+    expect(screen.getByText("Initial launch prompt")).toBeInTheDocument();
+    expect(screen.queryByText("API-provided conflicting prompt")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Forecastを作成" }));
+
+    expect(await screen.findByRole("heading", { name: "保存済みプレビュー" })).toBeInTheDocument();
   });
 
   it("renders typed 409 code, message and details on forecast commands", async () => {
