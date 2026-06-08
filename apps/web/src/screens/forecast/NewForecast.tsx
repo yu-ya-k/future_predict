@@ -29,6 +29,14 @@ export function NewForecast() {
     create: stableKey("create"),
     approve: stableKey("approve-framing"),
   });
+  const outcomeLabels = outcomes
+    .split("\n")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const isEditable = state === "draft_input";
+  const isCreating = state === "creating" || state === "framing_pending";
+  const hasTooManyOutcomes = outcomeLabels.length > 8;
+  const canCreate = question.trim().length > 0 && !hasTooManyOutcomes && isEditable;
 
   async function onCreate() {
     setError(null);
@@ -37,10 +45,7 @@ export function NewForecast() {
       const response = await createForecast({
         question,
         resolution_criteria: criteria,
-        outcomes: outcomes
-          .split("\n")
-          .map((item) => item.trim())
-          .filter(Boolean),
+        outcomes: outcomeLabels,
       }, {
         idempotencyKey: idempotencyKeys.current.create,
       });
@@ -73,11 +78,18 @@ export function NewForecast() {
   }
 
   return (
-    <section className="screen">
-      <div className="screen-header">
+    <section className="screen screen-forecast-new">
+      <div className="screen-header forecast-new-header">
         <div>
           <h1>新規Forecast</h1>
-          <p className="screen-subtitle">PhaseA public current_state pack</p>
+          <p className="screen-subtitle">
+            公開情報で判定できる予測問いを作り、PhaseAのフレーミングを確認します。
+          </p>
+        </div>
+        <div className="forecast-mode-pills" aria-label="Forecast実行条件">
+          <span className="status-pill">PhaseA</span>
+          <span className="status-pill status-pill--info">public</span>
+          <span className="status-pill">current_state pack</span>
         </div>
       </div>
 
@@ -87,71 +99,144 @@ export function NewForecast() {
         </div>
       )}
 
-      <div className="form-panel">
-        <label className="field">
-          <span>Question</span>
-          <textarea
-            value={question}
-            onChange={(event) => setQuestion(event.target.value)}
-            rows={4}
-            disabled={state !== "draft_input" && state !== "creating"}
-          />
-        </label>
-        <label className="field">
-          <span>Resolution criteria</span>
-          <textarea
-            value={criteria}
-            onChange={(event) => setCriteria(event.target.value)}
-            rows={3}
-            disabled={state !== "draft_input" && state !== "creating"}
-          />
-        </label>
-        <label className="field">
-          <span>Outcomes</span>
-          <textarea
-            value={outcomes}
-            onChange={(event) => setOutcomes(event.target.value)}
-            rows={3}
-            disabled={state !== "draft_input" && state !== "creating"}
-          />
-        </label>
-        {preview && (
-          <section aria-labelledby="framing-preview-title">
-            <h2 id="framing-preview-title">Framing preview</h2>
-            <div className="run-card-meta">
-              <span>Version {preview.current_framing_version}</span>
-              <span>{preview.confidentiality_class}</span>
+      <div className="forecast-create-layout">
+        <div className="forecast-create-main">
+          <div className="form-panel forecast-form-panel">
+            <div className="forecast-panel-heading">
+              <p className="forecast-step-label">Step 1</p>
+              <h2>Forecastの前提を入力</h2>
+              <p>
+                後から公開情報で判定できる形にそろえると、証拠抽出と確率計算が安定します。
+              </p>
             </div>
-            <p className="run-card-title">{preview.question}</p>
-            <p>{preview.resolution_criteria || "No resolution criteria provided."}</p>
-            <div className="result-list">
-              {preview.outcomes.map((outcome) => (
-                <article className="run-card" key={outcome.outcome_id}>
-                  <p className="run-card-title">{outcome.label}</p>
-                  <p>{outcome.definition}</p>
-                  <p className="run-card-meta">{outcome.normalization_group_id}</p>
-                </article>
-              ))}
+
+            <div className="forecast-field-stack">
+              <label className="forecast-field" htmlFor="forecast-question">
+                <span className="forecast-field-header">
+                  <span className="forecast-field-label">予測したい問い</span>
+                  <span className="forecast-required">必須</span>
+                </span>
+                <span className="forecast-field-help" id="forecast-question-help">
+                  期限、対象、判定する事実を1つの問いにします。
+                </span>
+                <textarea
+                  id="forecast-question"
+                  className="forecast-textarea forecast-textarea--large"
+                  value={question}
+                  onChange={(event) => setQuestion(event.target.value)}
+                  rows={5}
+                  disabled={!isEditable}
+                  aria-describedby="forecast-question-help"
+                  placeholder="例: 2027年3月31日までに、対象プロダクトは正式ローンチされるか？"
+                />
+              </label>
+
+              <label className="forecast-field" htmlFor="forecast-resolution-criteria">
+                <span className="forecast-field-header">
+                  <span className="forecast-field-label">判定条件</span>
+                  <span className="forecast-optional">任意</span>
+                </span>
+                <span className="forecast-field-help" id="forecast-criteria-help">
+                  どの公開情報でYes/Noを決めるか、曖昧なケースをどう扱うかを書きます。
+                </span>
+                <textarea
+                  id="forecast-resolution-criteria"
+                  className="forecast-textarea"
+                  value={criteria}
+                  onChange={(event) => setCriteria(event.target.value)}
+                  rows={4}
+                  disabled={!isEditable}
+                  aria-describedby="forecast-criteria-help"
+                  placeholder="例: 公式発表、規制当局の公開資料、主要報道のいずれかで確認する。ベータ版のみの場合はNo。"
+                />
+              </label>
+
+              <label className="forecast-field" htmlFor="forecast-outcomes">
+                <span className="forecast-field-header">
+                  <span className="forecast-field-label">結果候補</span>
+                  <span className="forecast-optional">1行1候補</span>
+                </span>
+                <span className="forecast-field-help" id="forecast-outcomes-help">
+                  最大8件まで。二択なら既定のYes / Noのままで進められます。
+                </span>
+                <textarea
+                  id="forecast-outcomes"
+                  className="forecast-textarea forecast-textarea--compact"
+                  value={outcomes}
+                  onChange={(event) => setOutcomes(event.target.value)}
+                  rows={3}
+                  disabled={!isEditable}
+                  aria-describedby="forecast-outcomes-help forecast-outcome-count"
+                />
+                <span
+                  id="forecast-outcome-count"
+                  className={`forecast-field-meta${hasTooManyOutcomes ? " forecast-field-meta--error" : ""}`}
+                >
+                  {outcomeLabels.length || 0}/8 件
+                  {hasTooManyOutcomes ? "。結果候補を8件以内にしてください。" : ""}
+                </span>
+              </label>
             </div>
-          </section>
-        )}
-        <div className="button-row">
-          <button
-            type="button"
-            className="btn-primary"
-            disabled={!question.trim() || state !== "draft_input"}
-            onClick={onCreate}
-          >
-            Create framing
-          </button>
-          <button
-            type="button"
-            className="btn-secondary"
-            disabled={!forecastId || state !== "preview_ready"}
-            onClick={onApprove}
-          >
-            Approve framing
-          </button>
+
+            <div className="forecast-actions">
+              <button
+                type="button"
+                className="btn-primary"
+                disabled={!canCreate}
+                onClick={onCreate}
+              >
+                {isCreating ? "フレーミング作成中" : "フレーミングを作成"}
+              </button>
+              <button
+                type="button"
+                className="btn-secondary"
+                disabled={!forecastId || state !== "preview_ready"}
+                onClick={onApprove}
+              >
+                {state === "approving" ? "承認中" : "この内容で承認"}
+              </button>
+            </div>
+          </div>
+
+          {preview && (
+            <section className="form-panel forecast-preview-panel" aria-labelledby="framing-preview-title">
+              <div className="forecast-panel-heading">
+                <p className="forecast-step-label">Step 2</p>
+                <h2 id="framing-preview-title">フレーミングプレビュー</h2>
+                <p>承認すると、この問いと結果候補を使ってcurrent_state packへ進みます。</p>
+              </div>
+              <div className="run-card-meta">
+                <span>Version {preview.current_framing_version}</span>
+                <span>{preview.confidentiality_class}</span>
+              </div>
+              <div className="forecast-preview-summary">
+                <p className="run-card-title">{preview.question}</p>
+                <p>{preview.resolution_criteria || "判定条件は未入力です。"}</p>
+              </div>
+              <div className="result-list forecast-outcome-list">
+                {preview.outcomes.map((outcome) => (
+                  <article className="run-card forecast-outcome-card" key={outcome.outcome_id}>
+                    <p className="run-card-title">{outcome.label}</p>
+                    <p>{outcome.definition}</p>
+                    <p className="run-card-meta">{outcome.normalization_group_id}</p>
+                  </article>
+                ))}
+              </div>
+            </section>
+          )}
+        </div>
+
+        <div className="forecast-guidance-panel" aria-label="入力ガイド">
+          <h2>入力の目安</h2>
+          <ul>
+            <li>問いには「いつまでに」「何が」「どうなったら」を入れる。</li>
+            <li>判定条件には、採用する公開ソースと例外扱いを書く。</li>
+            <li>結果候補は互いに重ならない名前にする。</li>
+          </ul>
+          <div className="forecast-guidance-note">
+            <span>現在の設定</span>
+            <strong>public / current_state / PhaseA</strong>
+          </div>
         </div>
       </div>
     </section>

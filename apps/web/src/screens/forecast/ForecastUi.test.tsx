@@ -129,18 +129,21 @@ describe("Forecast UI", () => {
 
     render(<App />);
 
-    await userEvent.type(screen.getByLabelText("Question"), "Will the product launch?");
-    await userEvent.type(screen.getByLabelText("Resolution criteria"), "Official source.");
-    await userEvent.click(screen.getByRole("button", { name: "Create framing" }));
+    expect(screen.getByText("入力の目安")).toBeInTheDocument();
+    expect(screen.getByText(/最大8件まで/)).toBeInTheDocument();
 
-    expect(await screen.findByText("Framing preview")).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText(/予測したい問い/), "Will the product launch?");
+    await userEvent.type(screen.getByLabelText(/判定条件/), "Official source.");
+    await userEvent.click(screen.getByRole("button", { name: "フレーミングを作成" }));
+
+    expect(await screen.findByText("フレーミングプレビュー")).toBeInTheDocument();
     expect(screen.getByText("Will the product launch by Q4?")).toBeInTheDocument();
     expect(screen.getByText("Official launch announcement.")).toBeInTheDocument();
     expect(screen.getByText("Yes")).toBeInTheDocument();
     expect(screen.getByText("No")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Approve framing" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "この内容で承認" })).toBeEnabled();
 
-    await userEvent.click(screen.getByRole("button", { name: "Approve framing" }));
+    await userEvent.click(screen.getByRole("button", { name: "この内容で承認" }));
     await waitFor(() => expect(window.location.hash).toBe("#/forecasts/forecast-1"));
   });
 
