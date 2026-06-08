@@ -13,6 +13,7 @@ import type {
   ForecastFramingDraftClarifyingQuestion,
   ForecastFramingDraftResponse,
 } from "../../types";
+import { FRAMING_ROUGH_QUESTION_MAX_LENGTH } from "./constants";
 import { formatForecastError } from "./errors";
 
 type State =
@@ -150,7 +151,10 @@ export function NewForecast() {
     () => finalPayloadFromFields(finalFields, draftResponse?.create_payload),
     [draftResponse?.create_payload, finalFields],
   );
-  const canSubmitRough = roughQuestion.trim().length > 0 && state !== "drafting";
+  const roughQuestionLength = roughQuestion.length;
+  const hasTooLongRoughQuestion = roughQuestionLength > FRAMING_ROUGH_QUESTION_MAX_LENGTH;
+  const canSubmitRough =
+    roughQuestion.trim().length > 0 && !hasTooLongRoughQuestion && state !== "drafting";
   const areAnswersReady =
     clarifyingQuestions.length > 0 &&
     clarifyingQuestions.every(
@@ -293,6 +297,17 @@ export function NewForecast() {
                   disabled={state === "drafting"}
                   placeholder="例: 来年度中に日本で特定のAI規制が施行されるかを予測したい"
                 />
+                <span
+                  className={`forecast-field-meta${
+                    hasTooLongRoughQuestion ? " forecast-field-meta--error" : ""
+                  }`}
+                >
+                  {roughQuestionLength.toLocaleString("ja-JP")} /{" "}
+                  {FRAMING_ROUGH_QUESTION_MAX_LENGTH.toLocaleString("ja-JP")} 文字
+                  {hasTooLongRoughQuestion
+                    ? "。長すぎるため、Forecastに必要な前提や判定条件に絞ってください。"
+                    : ""}
+                </span>
               </label>
 
               <div className="forecast-actions">
@@ -392,6 +407,17 @@ export function NewForecast() {
                   onChange={(event) => setRoughQuestion(event.target.value)}
                   rows={7}
                 />
+                <span
+                  className={`forecast-field-meta${
+                    hasTooLongRoughQuestion ? " forecast-field-meta--error" : ""
+                  }`}
+                >
+                  {roughQuestionLength.toLocaleString("ja-JP")} /{" "}
+                  {FRAMING_ROUGH_QUESTION_MAX_LENGTH.toLocaleString("ja-JP")} 文字
+                  {hasTooLongRoughQuestion
+                    ? "。長すぎるため、Forecastに必要な前提や判定条件に絞ってください。"
+                    : ""}
+                </span>
               </label>
 
               <div className="forecast-actions">

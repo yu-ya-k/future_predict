@@ -7,6 +7,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+FRAMING_ROUGH_QUESTION_MAX_LENGTH = 50_000
+
 
 def _strip(value: Any) -> Any:
     if isinstance(value, str):
@@ -142,7 +144,7 @@ def _default_framing_draft_answers() -> list[ForecastFramingDraftAnswer]:
 class ForecastFramingDraftRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    rough_question: str = Field(min_length=1, max_length=5000)
+    rough_question: str = Field(min_length=1, max_length=FRAMING_ROUGH_QUESTION_MAX_LENGTH)
     answers: list[ForecastFramingDraftAnswer] = Field(
         default_factory=_default_framing_draft_answers,
         max_length=5,

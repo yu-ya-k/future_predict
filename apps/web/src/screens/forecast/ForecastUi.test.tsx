@@ -317,6 +317,42 @@ describe("Forecast UI", () => {
     );
   });
 
+  it("formats rough question length validation errors", async () => {
+    window.location.hash = "#/forecasts/new";
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const path = String(url).replace("http://localhost:8000", "");
+      if (path === "/forecasts/framing-drafts" && init?.method === "POST") {
+        return jsonResponse(
+          {
+            detail: [
+              {
+                type: "string_too_long",
+                loc: ["body", "rough_question"],
+                msg: "String should have at most 50000 characters",
+                input: "hidden-user-prompt",
+                ctx: { max_length: 50000 },
+              },
+            ],
+          },
+          422,
+        );
+      }
+      return jsonResponse({ detail: "unexpected request" }, 500);
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.type(screen.getByRole("textbox", { name: /予測したいこと/ }), "Long idea");
+    await userEvent.click(screen.getByRole("button", { name: "AIでForecast案を作成" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("入力が長すぎます");
+    expect(alert).toHaveTextContent("50,000文字以内");
+    expect(alert).not.toHaveTextContent("hidden-user-prompt");
+    expect(alert).not.toHaveTextContent("string_too_long");
+  });
+
   it("offers retry and manual final edit when a draft is not ready without questions", async () => {
     window.location.hash = "#/forecasts/new";
     const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {

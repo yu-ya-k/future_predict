@@ -14,7 +14,10 @@ from api.forecast.artifacts import ForecastArtifactStore
 from api.forecast.dependencies import get_forecast_orchestrator
 from api.forecast.probability.phase_a_v1 import compute_phase_a_estimates
 from api.forecast.repository import ForecastRepository
-from api.forecast.schemas import ForecastFramingDraftRequest
+from api.forecast.schemas import (
+    FRAMING_ROUGH_QUESTION_MAX_LENGTH,
+    ForecastFramingDraftRequest,
+)
 from api.forecast.service import ForecastOrchestrator
 from api.main import create_app
 from api.research.artifacts import ArtifactStore
@@ -123,6 +126,31 @@ async def test_framing_draft_route_order_and_happy_draft(tmp_path: Path) -> None
     assert fake.structured_parse_calls[0]["tool_profile"] == "synthesis"
     assert fake.structured_parse_calls[0]["policy_decision_id"] is None
     assert fake.structured_parse_calls[0]["vector_store_ids"] is None
+
+
+@pytest.mark.anyio
+async def test_framing_draft_accepts_long_rough_question(tmp_path: Path) -> None:
+    fake = IntegrationFakeAzure(structured_parse_results=[_framing_draft_payload()])
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+    long_question = "Forecast planning premise. " * 240
+    assert 5000 < len(long_question) < FRAMING_ROUGH_QUESTION_MAX_LENGTH
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/forecasts/framing-drafts",
+            json={"rough_question": long_question},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready_to_create"] is True
+    assert fake.structured_parse_calls[0]["model"] == fake.reviewer_deployment
 
 
 @pytest.mark.anyio
