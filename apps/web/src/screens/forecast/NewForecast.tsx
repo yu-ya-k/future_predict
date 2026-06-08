@@ -15,6 +15,7 @@ import type {
 } from "../../types";
 import { FRAMING_ROUGH_QUESTION_MAX_LENGTH } from "./constants";
 import { formatForecastError } from "./errors";
+import { ForecastFlowProgress } from "./ForecastFlowProgress";
 
 type State =
   | "rough_input"
@@ -28,9 +29,6 @@ type State =
   | "approving"
   | "detail";
 
-type ForecastFlowStatus = "done" | "active" | "pending";
-type ForecastFlowTone = "brief" | "research" | "review" | "finalize";
-
 interface FinalFields {
   question: string;
   resolutionCriteria: string;
@@ -40,6 +38,19 @@ interface FinalFields {
   unitOfAnalysis: string;
   decisionContext: string;
 }
+
+interface AnswerHistoryEntry {
+  questionId: string;
+  questionKey: string;
+  answer: string;
+}
+
+const FRAMING_ANSWER_API_LIMIT = 5;
+
+const FRAMING_WARNING_LABELS: Record<string, string> = {
+  required_clarifying_answers_missing:
+    "Forecast作成に必要なメタデータがまだ不足しています。追加質問に回答するか、最終編集で必須項目を補ってください。",
+};
 
 function stableKey(action: string): string {
   return `forecast-new-${action}-${crypto.randomUUID()}`;
@@ -110,7 +121,17 @@ function nextStateForDraft(response: ForecastFramingDraftResponse): State {
 }
 
 function warningItems(response: ForecastFramingDraftResponse | null): string[] {
-  return response?.warnings.filter((warning) => warning.trim()) ?? [];
+  const seen = new Set<string>();
+  const items: string[] = [];
+  for (const rawWarning of response?.warnings ?? []) {
+    const warning = rawWarning.trim();
+    if (!warning) continue;
+    const localized = FRAMING_WARNING_LABELS[warning] ?? warning;
+    if (seen.has(localized)) continue;
+    seen.add(localized);
+    items.push(localized);
+  }
+  return items;
 }
 
 function aiChangeSummaryItems(
@@ -148,23 +169,96 @@ function aiChangeSummaryItems(
   return items.slice(0, 4);
 }
 
+function answerKey(question: ForecastFramingDraftClarifyingQuestion): string {
+  return `${question.question_id}::${question.prompt}`;
+}
+
+function answerValue(
+  question: ForecastFramingDraftClarifyingQuestion,
+  answers: Record<string, string>,
+  answerHistory: AnswerHistoryEntry[],
+): string {
+  const key = answerKey(question);
+  const typedAnswer = answers[key];
+  if (typedAnswer !== undefined) return typedAnswer;
+  return (
+    answerHistory.find((entry) => entry.questionKey === key)?.answer ?? ""
+  );
+}
+
+function upsertAnswerHistory(
+  history: AnswerHistoryEntry[],
+  question: ForecastFramingDraftClarifyingQuestion,
+  answer: string,
+): AnswerHistoryEntry[] {
+  const questionKey = answerKey(question);
+  const next = history.filter((entry) => entry.questionKey !== questionKey);
+  const trimmed = answer.trim();
+  if (!trimmed) return next;
+  return [
+    {
+      questionId: question.question_id,
+      questionKey,
+      answer,
+    },
+    ...next,
+  ];
+}
+
 function answerPayload(
   questions: ForecastFramingDraftClarifyingQuestion[],
   answers: Record<string, string>,
+  answerHistory: AnswerHistoryEntry[],
 ) {
-  return questions
+  const currentQuestionKeys = new Set(questions.map(answerKey));
+  const currentQuestionIds = new Set(
+    questions.map((question) => question.question_id),
+  );
+  const candidates = [
+    ...questions.map((question) => ({
+      question_id: question.question_id,
+      questionKey: answerKey(question),
+      answer: (answers[answerKey(question)] ?? "").trim(),
+    })),
+    ...answerHistory
+      .filter(
+        (entry) =>
+          !currentQuestionIds.has(entry.questionId) ||
+          currentQuestionKeys.has(entry.questionKey),
+      )
+      .map((entry) => ({
+        question_id: entry.questionId,
+        questionKey: entry.questionKey,
+        answer: entry.answer.trim(),
+      })),
+  ];
+  const seenQuestionIds = new Set<string>();
+  return candidates
+    .filter((answer) => answer.answer.length > 0)
+    .filter((answer) => {
+      if (seenQuestionIds.has(answer.question_id)) return false;
+      seenQuestionIds.add(answer.question_id);
+      return true;
+    })
+    .slice(0, FRAMING_ANSWER_API_LIMIT)
     .map((question) => ({
       question_id: question.question_id,
-      answer: (answers[question.question_id] ?? "").trim(),
-    }))
-    .filter((answer) => answer.answer.length > 0);
+      answer: question.answer,
+    }));
 }
 
-const FORECAST_FLOW_STATUS_LABEL: Record<ForecastFlowStatus, string> = {
-  done: "完了",
-  active: "実行中",
-  pending: "待機",
-};
+function currentAnswerProgress(
+  questions: ForecastFramingDraftClarifyingQuestion[],
+  answers: Record<string, string>,
+  answerHistory: AnswerHistoryEntry[],
+) {
+  return {
+    answered: questions.filter((question) =>
+      answerValue(question, answers, answerHistory).trim(),
+    ).length,
+    total: questions.length,
+  };
+}
 
 export function NewForecast() {
   const [roughQuestion, setRoughQuestion] = useState("");
@@ -172,6 +266,7 @@ export function NewForecast() {
     useState<ForecastFramingDraftResponse | null>(null);
   const [originalExecutionPrompt, setOriginalExecutionPrompt] = useState("");
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [answerHistory, setAnswerHistory] = useState<AnswerHistoryEntry[]>([]);
   const [finalFields, setFinalFields] = useState<FinalFields>({
     question: "",
     resolutionCriteria: "",
@@ -194,6 +289,11 @@ export function NewForecast() {
 
   const warnings = warningItems(draftResponse);
   const clarifyingQuestions = draftResponse?.draft.clarifying_questions ?? [];
+  const answerProgress = currentAnswerProgress(
+    clarifyingQuestions,
+    answers,
+    answerHistory,
+  );
   const sourceLines = useMemo(
     () => splitLines(finalFields.resolutionSources),
     [finalFields.resolutionSources],
@@ -233,7 +333,9 @@ export function NewForecast() {
   const areAnswersReady =
     clarifyingQuestions.length > 0 &&
     clarifyingQuestions.every(
-      (question) => !question.required || answers[question.question_id]?.trim(),
+      (question) =>
+        !question.required ||
+        answerValue(question, answers, answerHistory).trim(),
     );
   const isFinalValid =
     !hasNoQuestion &&
@@ -243,9 +345,8 @@ export function NewForecast() {
     !hasTooManySources;
   const canCreate =
     state === "final_edit" &&
-    Boolean(draftResponse?.ready_to_create) &&
     isFinalValid;
-  const canOpenManualEdit = Boolean(draftResponse) && isFinalValid;
+  const canOpenManualEdit = Boolean(draftResponse);
 
   function applyDraftResponse(response: ForecastFramingDraftResponse) {
     setDraftResponse(response);
@@ -263,6 +364,7 @@ export function NewForecast() {
     setPreview(null);
     setForecastId(null);
     setAnswers({});
+    setAnswerHistory([]);
     idempotencyKeys.current.draft = stableKey("framing-draft");
     try {
       const response = await createForecastFramingDraft(
@@ -293,7 +395,7 @@ export function NewForecast() {
       const response = await createForecastFramingDraft(
         {
           rough_question: roughQuestion,
-          answers: answerPayload(clarifyingQuestions, answers),
+          answers: answerPayload(clarifyingQuestions, answers, answerHistory),
           previous_draft: draftResponse.draft,
           locale: "ja",
         },
@@ -495,7 +597,7 @@ export function NewForecast() {
                     {
                       id: "answers",
                       title: "追加回答",
-                      meta: `${answerPayload(clarifyingQuestions, answers).length}/${clarifyingQuestions.length}件`,
+                      meta: `${answerProgress.answered}/${answerProgress.total}件`,
                       status: "done",
                       tone: "review",
                     },
@@ -522,49 +624,66 @@ export function NewForecast() {
               <WarningsList warnings={warnings} />
 
               <div className="forecast-question-grid">
-                {clarifyingQuestions.map((question, index) => (
-                  <article
-                    className="forecast-question-card"
-                    key={question.question_id}
-                  >
-                    <label
-                      className="forecast-field"
-                      htmlFor={`forecast-answer-${index}`}
+                {clarifyingQuestions.map((question, index) => {
+                  const answerId = `forecast-answer-${index}`;
+                  const promptId = `forecast-answer-${index}-prompt`;
+                  const whyNeededId = `forecast-answer-${index}-why`;
+                  return (
+                    <article
+                      className="forecast-question-card"
+                      key={answerKey(question)}
                     >
-                      <span className="forecast-field-header">
-                        <span className="forecast-field-label">
-                          {question.label}
+                      <label className="forecast-field" htmlFor={answerId}>
+                        <span className="forecast-field-header">
+                          <span className="forecast-field-label">
+                            {question.label}
+                          </span>
+                          {question.required ? (
+                            <span className="forecast-required">必須</span>
+                          ) : (
+                            <span className="forecast-optional">任意</span>
+                          )}
                         </span>
-                        {question.required ? (
-                          <span className="forecast-required">必須</span>
-                        ) : (
-                          <span className="forecast-optional">任意</span>
-                        )}
-                      </span>
-                      <span className="forecast-field-help">
-                        {question.prompt}
-                      </span>
-                      <span className="forecast-field-meta">
-                        {question.why_needed}
-                      </span>
-                      <textarea
-                        id={`forecast-answer-${index}`}
-                        className="forecast-textarea forecast-textarea--answer"
-                        aria-label={question.label}
-                        value={answers[question.question_id] ?? ""}
-                        onChange={(event) =>
-                          setAnswers((current) => ({
-                            ...current,
-                            [question.question_id]: event.target.value,
-                          }))
-                        }
-                        rows={3}
-                        disabled={state === "refining"}
-                        placeholder="回答を入力"
-                      />
-                    </label>
-                  </article>
-                ))}
+                        <span
+                          id={promptId}
+                          className="forecast-field-help"
+                        >
+                          {question.prompt}
+                        </span>
+                        <span
+                          id={whyNeededId}
+                          className="forecast-field-meta"
+                        >
+                          {question.why_needed}
+                        </span>
+                        <textarea
+                          id={answerId}
+                          className="forecast-textarea forecast-textarea--answer"
+                          aria-label={question.label}
+                          aria-describedby={`${promptId} ${whyNeededId}`}
+                          value={answerValue(question, answers, answerHistory)}
+                          onChange={(event) => {
+                            const nextAnswer = event.target.value;
+                            setAnswers((current) => ({
+                              ...current,
+                              [answerKey(question)]: nextAnswer,
+                            }));
+                            setAnswerHistory((current) =>
+                              upsertAnswerHistory(
+                                current,
+                                question,
+                                nextAnswer,
+                              ),
+                            );
+                          }}
+                          rows={3}
+                          disabled={state === "refining"}
+                          placeholder="回答を入力"
+                        />
+                      </label>
+                    </article>
+                  );
+                })}
               </div>
 
               <div className="forecast-actions">
@@ -939,7 +1058,7 @@ export function NewForecast() {
 
                 {state === "final_edit" && !draftResponse.ready_to_create && (
                   <div className="forecast-ready-note" role="status">
-                    メタデータ抽出ではまだ作成に必要な項目がそろっていません。大枠を編集して再作成してください。
+                    メタデータ抽出ではまだ作成に必要な項目がそろっていません。必須メタデータが入力済みなら、この画面の編集内容で作成できます。
                   </div>
                 )}
 
@@ -959,19 +1078,18 @@ export function NewForecast() {
                       前のステップへ
                     </button>
                   )}
-                  {draftResponse.ready_to_create &&
-                    (state === "final_edit" || isCreatingForecast) && (
-                      <button
-                        type="button"
-                        className="btn-primary"
-                        disabled={!canCreate || isCreatingForecast}
-                        onClick={onCreate}
-                      >
-                        {isCreatingForecast
-                          ? "Forecastを作成中"
-                          : "Forecastを作成"}
-                      </button>
-                    )}
+                  {(state === "final_edit" || isCreatingForecast) && (
+                    <button
+                      type="button"
+                      className="btn-primary"
+                      disabled={!canCreate || isCreatingForecast}
+                      onClick={onCreate}
+                    >
+                      {isCreatingForecast
+                        ? "Forecastを作成中"
+                        : "Forecastを作成"}
+                    </button>
+                  )}
                   {state === "preview_ready" && (
                     <button
                       type="button"
@@ -1049,77 +1167,6 @@ function WarningsList({ warnings }: { warnings: string[] }) {
         <p key={warning}>{warning}</p>
       ))}
     </div>
-  );
-}
-
-interface ForecastFlowNode {
-  id: string;
-  title: string;
-  meta: string;
-  status: ForecastFlowStatus;
-  tone: ForecastFlowTone;
-}
-
-function ForecastFlowProgress({
-  heading,
-  summary,
-  nodes,
-}: {
-  heading: string;
-  summary: string;
-  nodes: ForecastFlowNode[];
-}) {
-  const doneCount = nodes.filter((node) => node.status === "done").length;
-  const activeNode = nodes.find((node) => node.status === "active");
-  const statusText = `${heading}。${doneCount}/${nodes.length}完了。${
-    activeNode ? `現在: ${activeNode.title}。` : ""
-  }`;
-  const headingId = `forecast-flow-${nodes.map((node) => node.id).join("-")}-heading`;
-
-  return (
-    <section className="forecast-flow-progress" aria-labelledby={headingId}>
-      <p className="sr-only" aria-live="polite" role="status">
-        {statusText}
-      </p>
-      <div className="forecast-flow-header">
-        <div>
-          <h3 id={headingId}>{heading}</h3>
-          <p>{summary}</p>
-        </div>
-        <span className="forecast-flow-summary">
-          {doneCount}/{nodes.length} 完了
-        </span>
-      </div>
-      <ol className="forecast-flow-track" aria-label="Forecast作成フロー">
-        {nodes.map((node, index) => (
-          <li className="forecast-flow-item" key={node.id}>
-            <article
-              className={[
-                "execution-dag-node",
-                "forecast-flow-node",
-                `execution-dag-node--${node.status}`,
-                `execution-dag-node--${node.tone}`,
-              ].join(" ")}
-            >
-              <div className="execution-dag-node-topline">
-                <span className="execution-dag-dot" aria-hidden="true" />
-                <span className="execution-dag-state">
-                  {FORECAST_FLOW_STATUS_LABEL[node.status]}
-                </span>
-              </div>
-              <h4 className="execution-dag-title">{node.title}</h4>
-              <p className="execution-dag-meta">{node.meta}</p>
-            </article>
-            {index < nodes.length - 1 && (
-              <span
-                className={`forecast-flow-edge forecast-flow-edge--${nodes[index + 1].status}`}
-                aria-hidden="true"
-              />
-            )}
-          </li>
-        ))}
-      </ol>
-    </section>
   );
 }
 

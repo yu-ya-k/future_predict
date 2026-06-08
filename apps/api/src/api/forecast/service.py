@@ -36,6 +36,7 @@ from api.forecast.schemas import (
     ForecastAuditResponse,
     ForecastCreateRequest,
     ForecastCreateResponse,
+    ForecastCurrentResearchPack,
     ForecastDetail,
     ForecastFramingDraft,
     ForecastFramingDraftRequest,
@@ -162,10 +163,14 @@ class ForecastOrchestrator:
                 "framing_draft_invalid_response",
                 "Forecast framing draft generation returned an invalid response.",
             ) from error
+        draft = _framing_draft_without_answered_questions(
+            draft,
+            answers=request.answers,
+            previous_draft=request.previous_draft,
+        )
 
         ready_to_create = _framing_draft_ready_to_create(
             draft,
-            answers=request.answers,
         )
         warnings: list[str] = []
         if not ready_to_create:
@@ -200,7 +205,61 @@ class ForecastOrchestrator:
                 framing_version=row["current_framing_version"],
             )
         ]
-        return ForecastDetail(**base, outcomes=outcomes)
+        packs = self.repository.list_packs(forecast_id)
+        current_pack = self._current_research_pack_summary(packs[-1]) if packs else None
+        return ForecastDetail(
+            **base,
+            outcomes=outcomes,
+            current_research_pack=current_pack,
+            current_research_pack_status=(
+                current_pack.effective_status if current_pack is not None else None
+            ),
+            approved_claim_target_link_count=len(
+                self.repository.get_approved_target_links(forecast_id)
+            ),
+        )
+
+    def _current_research_pack_status(self, pack: Any) -> str | None:
+        return self._current_research_pack_summary(pack).effective_status
+
+    def _current_research_pack_summary(self, pack: Any) -> ForecastCurrentResearchPack:
+        pack_status = pack["status"]
+        run_id = UUID(pack["research_run_id"])
+        run = self.research.repository.get_run(run_id)
+        if pack_status == "completed":
+            effective_status = "completed"
+        elif run.status == RunStatus.COMPLETED:
+            effective_status = "completed"
+        elif run.status in {
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.NEEDS_HUMAN_REVIEW,
+        }:
+            effective_status = run.status.value
+        else:
+            effective_status = pack_status
+
+        return ForecastCurrentResearchPack(
+            pack_id=UUID(pack["pack_id"]),
+            research_run_id=run_id,
+            pack_status=pack_status,
+            effective_status=effective_status,
+            research_run_status=run.status.value,
+            pack_created_at=_parse_dt_required(pack["created_at"]),
+            pack_updated_at=_parse_dt_required(pack["updated_at"]),
+            research_run_created_at=getattr(run, "created_at", None),
+            research_run_updated_at=getattr(run, "updated_at", None),
+            deep_research_started_at=(
+                self.research.repository.get_deep_research_submitted_at(run_id)
+            ),
+            total_tool_calls=run.total_tool_calls,
+            estimated_cost_usd=self.research.estimate_run_cost_usd(
+                run_id,
+                fallback=run.estimated_cost_usd,
+            ),
+            done_reason=run.done_reason,
+            needs_human_review=run.needs_human_review,
+        )
 
     def approve_framing(self, forecast_id: UUID, *, comment: str | None) -> ForecastDetail:
         forecast = self.get_forecast(forecast_id)
@@ -546,6 +605,10 @@ class ForecastOrchestrator:
             "estimate_set_id": UUID(estimate_set["estimate_set_id"]),
             "forecast_id": UUID(estimate_set["forecast_id"]),
             "status": estimate_set["status"],
+            "approved": self.repository.estimate_set_has_approval(
+                UUID(estimate_set["forecast_id"]),
+                UUID(estimate_set["estimate_set_id"]),
+            ),
             "engine_version": estimate_set["engine_version"],
             "input_snapshot_hash": estimate_set["input_snapshot_hash"],
             "engine_code_hash": estimate_set["engine_code_hash"],
@@ -912,12 +975,19 @@ def _scenario_response(row: Any) -> ScenarioRecord:
 
 
 def _ensure_framing_inputs_are_public(request: ForecastFramingDraftRequest) -> None:
-    candidate_text = "\n".join(
-        [
-            request.rough_question,
-            *[answer.answer for answer in request.answers],
-        ]
-    )
+    candidate_inputs: list[str] = [
+        request.rough_question,
+        *[answer.answer for answer in request.answers],
+    ]
+    if request.previous_draft is not None:
+        candidate_inputs.append(
+            json.dumps(
+                request.previous_draft.model_dump(mode="json"),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    candidate_text = "\n".join(candidate_inputs)
     if contains_sensitive_terms(candidate_text):
         raise ForecastConflict(
             "policy_requires_revision",
@@ -970,6 +1040,15 @@ def _build_framing_draft_prompt(request: ForecastFramingDraftRequest) -> str:
         "string fields empty, nullable fields null, and list fields empty; ask for "
         "the missing metadata in clarifying_questions instead of filling fields "
         "with assumptions.\n"
+        "- Core metadata required to create a Forecast is question, "
+        "resolution_criteria, and outcomes. If any of those are missing, ask a "
+        "required clarifying question for the missing field.\n"
+        "- Treat answers as already supplied by the user. Do not repeat answered "
+        "clarifying questions; keep only unanswered clarifying questions in "
+        "clarifying_questions.\n"
+        "- When question, resolution_criteria, and outcomes are all non-empty, "
+        "return clarifying_questions as an empty list. Additional useful context "
+        "can be reflected in decision_context instead of blocking creation.\n"
         "- Ask at most five clarifying questions and ask only for missing metadata "
         "needed to create the forecast. Mark essential questions required.\n"
         "- Do not include private, confidential, or sensitive material.\n\n"
@@ -1007,23 +1086,75 @@ def _extract_json_object(value: str) -> str:
 
 def _framing_draft_ready_to_create(
     draft: ForecastFramingDraft,
+) -> bool:
+    has_required_metadata = bool(
+        draft.question.strip() and draft.resolution_criteria.strip() and draft.outcomes
+    )
+    return has_required_metadata
+
+
+def _framing_draft_without_answered_questions(
+    draft: ForecastFramingDraft,
     *,
     answers: list[Any],
-) -> bool:
-    answered_ids = {
+    previous_draft: ForecastFramingDraft | None,
+) -> ForecastFramingDraft:
+    answered_ids = _answered_framing_question_ids(answers)
+    if not answered_ids:
+        return draft
+    answered_prompts_by_id = _answered_framing_question_prompts_by_id(
+        answered_ids,
+        previous_draft,
+    )
+    clarifying_questions = [
+        question
+        for question in draft.clarifying_questions
+        if not _is_answered_framing_question(
+            question,
+            answered_ids=answered_ids,
+            answered_prompts_by_id=answered_prompts_by_id,
+        )
+    ]
+    if len(clarifying_questions) == len(draft.clarifying_questions):
+        return draft
+    return draft.model_copy(update={"clarifying_questions": clarifying_questions})
+
+
+def _answered_framing_question_ids(answers: list[Any]) -> set[str]:
+    return {
         answer.question_id
         for answer in answers
         if getattr(answer, "answer", "").strip()
     }
-    required_ids = {
-        question.question_id
-        for question in draft.clarifying_questions
-        if question.required
-    }
-    has_required_metadata = bool(
-        draft.question.strip() and draft.resolution_criteria.strip() and draft.outcomes
-    )
-    return has_required_metadata and required_ids.issubset(answered_ids)
+
+
+def _answered_framing_question_prompts_by_id(
+    answered_ids: set[str],
+    previous_draft: ForecastFramingDraft | None,
+) -> dict[str, set[str]] | None:
+    if previous_draft is None:
+        return None
+    prompts_by_id: dict[str, set[str]] = {}
+    for question in previous_draft.clarifying_questions:
+        if question.question_id in answered_ids:
+            prompts_by_id.setdefault(question.question_id, set()).add(question.prompt)
+    return prompts_by_id
+
+
+def _is_answered_framing_question(
+    question: Any,
+    *,
+    answered_ids: set[str],
+    answered_prompts_by_id: dict[str, set[str]] | None,
+) -> bool:
+    if question.question_id not in answered_ids:
+        return False
+    if answered_prompts_by_id is None:
+        return True
+    answered_prompts = answered_prompts_by_id.get(question.question_id)
+    if not answered_prompts:
+        return True
+    return question.prompt in answered_prompts
 
 
 def _ensure_forecast_has_outcomes(forecast: ForecastDetail) -> None:

@@ -127,12 +127,17 @@ def test_framing_draft_prompt_extracts_metadata_without_rewriting() -> None:
     assert "Do not invent missing metadata." in prompt
     assert "string fields empty, nullable fields null, and list fields empty" in prompt
     assert "clarifying_questions instead of filling fields with assumptions" in prompt
+    assert "Core metadata required to create a Forecast is question" in prompt
+    assert "Do not repeat answered clarifying questions" in prompt
+    assert "keep only unanswered clarifying questions" in prompt
     assert "ask only for missing metadata" in prompt
     assert "outcomes are resolution outcome labels / 解決時の結果状態" in prompt
     assert "not the model's final Yes/No judgment" in prompt
     assert "Do not convert the original prompt into a binary Yes/No forecast" in prompt
     assert "do not ask the user for a final Yes/No answer" in prompt
     assert "leave outcomes empty and ask a required clarifying question" in prompt
+    assert "question, resolution_criteria, and outcomes are all non-empty" in prompt
+    assert "return clarifying_questions as an empty list" in prompt
     assert "replace, rewrite, refine, summarize, normalize, translate" in prompt
     assert "Keep default binary outcomes Yes/No" not in prompt
     assert "You help refine" not in prompt
@@ -453,11 +458,200 @@ async def test_framing_draft_answers_can_make_required_questions_ready(
     assert response.status_code == 200
     body = response.json()
     assert body["ready_to_create"] is True
+    assert body["draft"]["clarifying_questions"] == []
     assert body["warnings"] == []
     assert body["create_payload"]["outcomes"] == [
         "Milestone reached",
         "Milestone not reached",
     ]
+
+
+@pytest.mark.anyio
+async def test_framing_draft_core_metadata_ready_even_with_new_required_question(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure(
+        structured_parse_results=[
+            _framing_draft_payload(
+                clarifying_questions=[
+                    {
+                        "question_id": "deadline",
+                        "label": "Resolution deadline",
+                        "prompt": "What date should the forecast resolve against?",
+                        "why_needed": "The forecast needs a concrete horizon.",
+                        "answer_type": "date",
+                        "required": True,
+                        "options": [],
+                    },
+                    {
+                        "question_id": "priority",
+                        "label": "Metric priority",
+                        "prompt": "Which metric priority should be used?",
+                        "why_needed": "This can improve metadata quality.",
+                        "answer_type": "text",
+                        "required": True,
+                        "options": [],
+                    },
+                ],
+                confidence=0.64,
+            )
+        ]
+    )
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/forecasts/framing-drafts",
+            json={
+                "rough_question": "Will AI agents handle many support tickets?",
+                "answers": [
+                    {
+                        "question_id": "deadline",
+                        "answer": "Resolve against public data available by 2029-12-31.",
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready_to_create"] is True
+    assert body["warnings"] == []
+    assert body["create_payload"]["question"]
+    assert body["create_payload"]["resolution_criteria"]
+    assert body["create_payload"]["outcomes"] == [
+        "Milestone reached",
+        "Milestone not reached",
+    ]
+    assert [
+        question["question_id"] for question in body["draft"]["clarifying_questions"]
+    ] == ["priority"]
+
+
+@pytest.mark.anyio
+async def test_framing_draft_keeps_unanswered_core_metadata_required(
+    tmp_path: Path,
+) -> None:
+    payload = _framing_draft_payload(
+        clarifying_questions=[
+            {
+                "question_id": "outcomes",
+                "label": "Resolution outcome labels",
+                "prompt": "What outcome labels should be selected at resolution time?",
+                "why_needed": "The forecast cannot be created without outcomes.",
+                "answer_type": "text",
+                "required": True,
+                "options": [],
+            }
+        ],
+        outcomes=[],
+    )
+    fake = IntegrationFakeAzure(structured_parse_results=[payload])
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/forecasts/framing-drafts",
+            json={
+                "rough_question": "Forecast support automation adoption by 2029.",
+                "answers": [
+                    {
+                        "question_id": "outcomes",
+                        "answer": "Use milestone reached and milestone missed.",
+                    }
+                ],
+                "locale": "en",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["draft"]["outcomes"] == []
+    assert body["draft"]["clarifying_questions"] == []
+    assert body["ready_to_create"] is False
+    assert body["create_payload"] is None
+    assert body["warnings"] == ["required_clarifying_answers_missing"]
+
+
+@pytest.mark.anyio
+async def test_framing_draft_keeps_changed_prompt_for_answered_question_id(
+    tmp_path: Path,
+) -> None:
+    previous_draft = _framing_draft_payload(
+        clarifying_questions=[
+            {
+                "question_id": "outcomes",
+                "label": "Resolution outcome labels",
+                "prompt": "What outcome labels should be selected at resolution time?",
+                "why_needed": "The forecast cannot be created without outcomes.",
+                "answer_type": "text",
+                "required": True,
+                "options": [],
+            }
+        ],
+        outcomes=[],
+    )
+    payload = _framing_draft_payload(
+        clarifying_questions=[
+            {
+                "question_id": "outcomes",
+                "label": "Resolution outcome labels",
+                "prompt": "Which mutually exclusive resolution states should be used?",
+                "why_needed": "The prior answer did not define selectable outcome labels.",
+                "answer_type": "text",
+                "required": True,
+                "options": [],
+            }
+        ],
+        outcomes=[],
+    )
+    fake = IntegrationFakeAzure(structured_parse_results=[payload])
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/forecasts/framing-drafts",
+            json={
+                "rough_question": "Forecast support automation adoption by 2029.",
+                "answers": [
+                    {
+                        "question_id": "outcomes",
+                        "answer": "Use the most important resolution axis.",
+                    }
+                ],
+                "previous_draft": previous_draft,
+                "locale": "en",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready_to_create"] is False
+    assert body["create_payload"] is None
+    assert body["draft"]["outcomes"] == []
+    assert body["draft"]["clarifying_questions"] != []
+    assert [
+        question["prompt"] for question in body["draft"]["clarifying_questions"]
+    ] == ["Which mutually exclusive resolution states should be used?"]
+    assert body["warnings"] == ["required_clarifying_answers_missing"]
 
 
 @pytest.mark.anyio
@@ -479,6 +673,37 @@ async def test_framing_draft_blocks_sensitive_inputs_before_llm(
             json={
                 "rough_question": "Will internal project codename Phoenix launch?",
                 "answers": [{"question_id": "scope", "answer": "Public customers"}],
+            },
+        )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert _typed_code(body) == "policy_requires_revision"
+    assert "Phoenix" not in json.dumps(body)
+    assert fake.structured_parse_calls == []
+
+
+@pytest.mark.anyio
+async def test_framing_draft_blocks_sensitive_previous_draft_before_llm(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+    previous_draft = _framing_draft_payload()
+    previous_draft["decision_context"] = "Internal project codename Phoenix."
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/forecasts/framing-drafts",
+            json={
+                "rough_question": "Will the public launch happen?",
+                "previous_draft": previous_draft,
             },
         )
 
@@ -665,6 +890,7 @@ async def test_forecast_preserves_original_execution_prompt_for_research_pack(
         detail = await client.get(f"/forecasts/{forecast_id}")
         assert detail.status_code == 200
         assert detail.json()["original_execution_prompt"] == original_prompt
+        assert detail.json()["current_research_pack"] is None
 
         approve = await client.post(
             f"/forecasts/{forecast_id}/review",
@@ -1007,6 +1233,79 @@ async def test_repository_migrates_old_forecast_rows_without_original_prompt(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("research_status", "done_reason", "needs_human_review"),
+    [
+        ("failed", "deep_research_failed", False),
+        ("needs_human_review", "review_schema_or_request_failed", True),
+    ],
+)
+async def test_current_research_pack_effective_status_uses_terminal_research_run(
+    tmp_path: Path,
+    research_status: str,
+    done_reason: str,
+    needs_human_review: bool,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will AI agents handle 30% of support tickets by 2029?",
+                "resolution_criteria": "Resolve from public vendor and benchmark reports.",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+        assert create.status_code == 202
+        forecast_id = create.json()["forecast_id"]
+
+        approve = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={"action": "approve_framing"},
+        )
+        assert approve.status_code == 200
+
+        pack = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={"pack_role": "current_state", "tool_profile": "public"},
+        )
+        assert pack.status_code == 200
+        run_id = pack.json()["research_run_id"]
+
+        updated_run = research.repository.update_run(
+            UUID(run_id),
+            status=research_status,
+            done_reason=done_reason,
+            needs_human_review=needs_human_review,
+        )
+        assert updated_run.status.value == research_status
+        assert updated_run.done_reason == done_reason
+        assert updated_run.needs_human_review is needs_human_review
+
+        detail = await client.get(f"/forecasts/{forecast_id}")
+
+    assert detail.status_code == 200
+    detail_json = detail.json()
+    assert detail_json["current_research_pack_status"] == research_status
+    pack_detail = detail_json["current_research_pack"]
+    assert pack_detail["research_run_id"] == run_id
+    assert pack_detail["pack_status"] == "running"
+    assert pack_detail["effective_status"] == research_status
+    assert pack_detail["research_run_status"] == research_status
+    assert pack_detail["done_reason"] == done_reason
+    assert pack_detail["needs_human_review"] is needs_human_review
+    assert pack_detail["deep_research_started_at"]
+
+
+@pytest.mark.anyio
 async def test_phase_a_forecast_lifecycle_and_forecast_research_mode(
     tmp_path: Path,
 ) -> None:
@@ -1055,11 +1354,36 @@ async def test_phase_a_forecast_lifecycle_and_forecast_research_mode(
         assert fake.submit_calls[-1]["tool_profile"] == "public"
         assert fake.submit_calls[-1]["background"] is False
         assert fake.submit_calls[-1]["policy_decision_id"] == pack_json["policy_decision_id"]
+        detail_after_pack = await client.get(f"/forecasts/{forecast_id}")
+        assert detail_after_pack.status_code == 200
+        pack_detail = detail_after_pack.json()["current_research_pack"]
+        assert detail_after_pack.json()["current_research_pack_status"] == "running"
+        assert pack_detail["research_run_id"] == run_id
+        assert pack_detail["pack_status"] == "running"
+        assert pack_detail["effective_status"] == "running"
+        assert pack_detail["research_run_status"] == "waiting_deep_research"
+        assert pack_detail["deep_research_started_at"]
+        assert pack_detail["total_tool_calls"] == 0
+        assert pack_detail["estimated_cost_usd"] == 0.0
+        assert pack_detail["done_reason"] is None
+        assert pack_detail["needs_human_review"] is False
 
         completed_run = research.collect_deep_research(run_id)
         assert completed_run.status == "completed"
         assert completed_run.done_reason == "forecast_raw_report_collected"
         assert fake.review_calls == []
+        detail_after_collect = await client.get(f"/forecasts/{forecast_id}")
+        assert detail_after_collect.status_code == 200
+        assert (
+            detail_after_collect.json()["current_research_pack_status"] == "completed"
+        )
+        collected_pack_detail = detail_after_collect.json()["current_research_pack"]
+        assert collected_pack_detail["research_run_id"] == run_id
+        assert collected_pack_detail["pack_status"] == "running"
+        assert collected_pack_detail["effective_status"] == "completed"
+        assert collected_pack_detail["research_run_status"] == "completed"
+        assert collected_pack_detail["done_reason"] == "forecast_raw_report_collected"
+        assert collected_pack_detail["needs_human_review"] is False
 
         delete_response = await client.delete(f"/research-runs/{run_id}")
         assert delete_response.status_code == 409
@@ -1087,6 +1411,11 @@ async def test_phase_a_forecast_lifecycle_and_forecast_research_mode(
             json={"action": "approve_claim_target_links"},
         )
         assert link_approval.status_code == 200
+        detail_after_link_approval = await client.get(f"/forecasts/{forecast_id}")
+        assert detail_after_link_approval.status_code == 200
+        assert (
+            detail_after_link_approval.json()["approved_claim_target_link_count"] > 0
+        )
 
         estimate = await client.post(f"/forecasts/{forecast_id}/probabilities/compute")
         assert estimate.status_code == 200
@@ -1123,6 +1452,11 @@ async def test_phase_a_forecast_lifecycle_and_forecast_research_mode(
             },
         )
         assert version_approval.status_code == 200
+        current_estimate_after_approval = await client.get(
+            f"/forecasts/{forecast_id}/estimate-set"
+        )
+        assert current_estimate_after_approval.status_code == 200
+        assert current_estimate_after_approval.json()["approved"] is True
 
         commit = await client.post(
             f"/forecasts/{forecast_id}/versions/commit",

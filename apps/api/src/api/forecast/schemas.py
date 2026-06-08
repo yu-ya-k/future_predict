@@ -256,6 +256,23 @@ class ForecastSummary(BaseModel):
     updated_at: datetime
 
 
+class ForecastCurrentResearchPack(BaseModel):
+    pack_id: UUID
+    research_run_id: UUID
+    pack_status: str
+    effective_status: str
+    research_run_status: str
+    pack_created_at: datetime
+    pack_updated_at: datetime
+    research_run_created_at: datetime | None = None
+    research_run_updated_at: datetime | None = None
+    deep_research_started_at: datetime | None = None
+    total_tool_calls: int = 0
+    estimated_cost_usd: float = 0.0
+    done_reason: str | None = None
+    needs_human_review: bool = False
+
+
 class ForecastDetail(ForecastSummary):
     original_execution_prompt: str | None
     target_population: str | None
@@ -265,6 +282,9 @@ class ForecastDetail(ForecastSummary):
     decision_context: str | None
     confidentiality_class: str
     outcomes: list[ForecastOutcome]
+    current_research_pack: ForecastCurrentResearchPack | None = None
+    current_research_pack_status: str | None = None
+    approved_claim_target_link_count: int = 0
 
 
 class ForecastReviewRequest(BaseModel):
@@ -366,6 +386,7 @@ class EstimateSetResponse(BaseModel):
     estimate_set_id: UUID
     forecast_id: UUID
     status: str
+    approved: bool = False
     engine_version: str
     input_snapshot_hash: str
     engine_code_hash: str

@@ -595,6 +595,23 @@ export interface ForecastSummary {
   updated_at: string;
 }
 
+export interface ForecastCurrentResearchPack {
+  pack_id: string;
+  research_run_id: string;
+  pack_status: string;
+  effective_status: string;
+  research_run_status: string;
+  pack_created_at: string;
+  pack_updated_at: string;
+  research_run_created_at?: string | null;
+  research_run_updated_at?: string | null;
+  deep_research_started_at?: string | null;
+  total_tool_calls: number;
+  estimated_cost_usd: number;
+  done_reason?: string | null;
+  needs_human_review: boolean;
+}
+
 export interface ForecastDetail extends ForecastSummary {
   original_execution_prompt: string | null;
   target_population?: string | null;
@@ -604,6 +621,9 @@ export interface ForecastDetail extends ForecastSummary {
   decision_context?: string | null;
   confidentiality_class: string;
   outcomes: ForecastOutcome[];
+  current_research_pack?: ForecastCurrentResearchPack | null;
+  current_research_pack_status?: string | null;
+  approved_claim_target_link_count: number;
 }
 
 export interface ForecastCreateRequest {
@@ -759,6 +779,7 @@ export interface EstimateSetResponse {
   estimate_set_id: string;
   forecast_id: string;
   status: string;
+  approved: boolean;
   engine_version: string;
   input_snapshot_hash: string;
   engine_code_hash: string;

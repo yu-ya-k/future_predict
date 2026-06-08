@@ -64,6 +64,9 @@ function forecastDetail(
     resolution_sources: [],
     decision_context: null,
     confidentiality_class: "public",
+    current_research_pack: null,
+    current_research_pack_status: null,
+    approved_claim_target_link_count: 0,
     outcomes: [
       {
         outcome_id: "outcome-yes",
@@ -101,6 +104,7 @@ function estimateSet(
     estimate_set_id: "estimate-set-1",
     forecast_id: "forecast-1",
     status: "draft",
+    approved: false,
     engine_version: "phase_a_v1",
     input_snapshot_hash: "snapshot-hash-1",
     engine_code_hash: "engine-hash-1",
@@ -232,6 +236,144 @@ describe("Forecast UI", () => {
     expect(
       screen.getByRole("button", { name: "AIでForecast案を作成" }),
     ).toBeDisabled();
+  });
+
+  it("localizes framing warning codes without repeating duplicate messages", async () => {
+    window.location.hash = "#/forecasts/new";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (path === "/forecasts/framing-drafts" && init?.method === "POST") {
+          return jsonResponse(
+            framingDraft({
+              ready_to_create: false,
+              warnings: [
+                "required_clarifying_answers_missing",
+                " required_clarifying_answers_missing ",
+              ],
+              draft: { clarifying_questions: [clarifyingQuestion()] },
+              create_payload: null,
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.type(
+      screen.getByRole("textbox", { name: /予測したいこと/ }),
+      "Will the product launch?",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "AIでForecast案を作成" }),
+    );
+
+    const localizedWarning =
+      "Forecast作成に必要なメタデータがまだ不足しています。追加質問に回答するか、最終編集で必須項目を補ってください。";
+    expect(await screen.findByText(localizedWarning)).toBeInTheDocument();
+    expect(screen.getAllByText(localizedWarning)).toHaveLength(1);
+    expect(
+      screen.queryByText("required_clarifying_answers_missing"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("opens Step 3 before clarifying questions when the API says the draft is ready", async () => {
+    window.location.hash = "#/forecasts/new";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (path === "/forecasts/framing-drafts" && init?.method === "POST") {
+          return jsonResponse(
+            framingDraft({
+              ready_to_create: true,
+              draft: { clarifying_questions: [clarifyingQuestion()] },
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.type(
+      screen.getByRole("textbox", { name: /予測したいこと/ }),
+      "Will the product launch?",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "AIでForecast案を作成" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "保存前のフレーミング確認" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", {
+        name: "Forecastメタデータの不足確認",
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("describes same-label clarifying answer fields with their prompt and rationale", async () => {
+    window.location.hash = "#/forecasts/new";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (path === "/forecasts/framing-drafts" && init?.method === "POST") {
+          return jsonResponse(
+            framingDraft({
+              ready_to_create: false,
+              draft: {
+                clarifying_questions: [
+                  clarifyingQuestion({
+                    question_id: "deadline",
+                    label: "確認",
+                    prompt: "期限はいつですか？",
+                    why_needed:
+                      "Forecastを公開情報で判定できる期限が必要です。",
+                  }),
+                  clarifyingQuestion({
+                    question_id: "source",
+                    label: "確認",
+                    prompt: "確認に使う公開ソースは何ですか？",
+                    why_needed:
+                      "解決時に参照する公開情報を固定するために必要です。",
+                  }),
+                ],
+              },
+              create_payload: null,
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.type(
+      screen.getByRole("textbox", { name: /予測したいこと/ }),
+      "Will the product launch?",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "AIでForecast案を作成" }),
+    );
+
+    const answerInputs = await screen.findAllByRole("textbox", {
+      name: "確認",
+    });
+    expect(answerInputs).toHaveLength(2);
+    expect(answerInputs[0]).toHaveAccessibleDescription(
+      "期限はいつですか？ Forecastを公開情報で判定できる期限が必要です。",
+    );
+    expect(answerInputs[1]).toHaveAccessibleDescription(
+      "確認に使う公開ソースは何ですか？ 解決時に参照する公開情報を固定するために必要です。",
+    );
   });
 
   it("asks draft clarifying questions before final create and separate approval", async () => {
@@ -445,6 +587,193 @@ describe("Forecast UI", () => {
     );
   });
 
+  it("does not reuse an answer when the same question id returns with a changed prompt", async () => {
+    window.location.hash = "#/forecasts/new";
+    let draftCalls = 0;
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (path === "/forecasts/framing-drafts" && init?.method === "POST") {
+          draftCalls += 1;
+          const body = JSON.parse(String(init.body));
+          if (draftCalls === 1) {
+            return jsonResponse(
+              framingDraft({
+                ready_to_create: false,
+                draft: {
+                  clarifying_questions: [
+                    clarifyingQuestion({ prompt: "期限はいつですか？" }),
+                  ],
+                },
+                create_payload: null,
+              }),
+            );
+          }
+          if (draftCalls === 2) {
+            expect(body.answers).toEqual([
+              { question_id: "deadline", answer: "2026 Q4" },
+            ]);
+            return jsonResponse(
+              framingDraft({
+                ready_to_create: false,
+                draft: {
+                  clarifying_questions: [
+                    clarifyingQuestion({
+                      prompt: "公開情報で確認する具体的な日付はいつですか？",
+                    }),
+                  ],
+                },
+                create_payload: null,
+              }),
+            );
+          }
+          expect(body.answers).toEqual([
+            { question_id: "deadline", answer: "2026-12-31" },
+          ]);
+          return jsonResponse(framingDraft());
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.type(
+      screen.getByRole("textbox", { name: /予測したいこと/ }),
+      "Will the product launch?",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "AIでForecast案を作成" }),
+    );
+    await userEvent.type(await screen.findByLabelText("期限"), "2026 Q4");
+    await userEvent.click(
+      screen.getByRole("button", { name: "回答をメタデータ案に反映" }),
+    );
+
+    const changedPromptAnswer = await screen.findByLabelText("期限");
+    expect(changedPromptAnswer).toHaveValue("");
+    expect(
+      screen.getByText("公開情報で確認する具体的な日付はいつですか？"),
+    ).toBeInTheDocument();
+
+    await userEvent.type(changedPromptAnswer, "2026-12-31");
+    await userEvent.click(
+      screen.getByRole("button", { name: "回答をメタデータ案に反映" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "保存前のフレーミング確認" }),
+    ).toBeInTheDocument();
+  });
+
+  it("dedupes answer history and caps refine requests to the API limit", async () => {
+    window.location.hash = "#/forecasts/new";
+    let draftCalls = 0;
+    const finalRefineResponse = deferred<Response>();
+    const firstQuestions = Array.from({ length: 5 }, (_, index) =>
+      clarifyingQuestion({
+        question_id: `q${index + 1}`,
+        label: `確認${index + 1}`,
+        prompt: `確認${index + 1}を入力してください。`,
+      }),
+    );
+    const followUpQuestion = clarifyingQuestion({
+      question_id: "q6",
+      label: "確認6",
+      prompt: "確認6を入力してください。",
+    });
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (path === "/forecasts/framing-drafts" && init?.method === "POST") {
+          draftCalls += 1;
+          const body = JSON.parse(String(init.body));
+          if (draftCalls === 1) {
+            return jsonResponse(
+              framingDraft({
+                ready_to_create: false,
+                draft: { clarifying_questions: firstQuestions },
+                create_payload: null,
+              }),
+            );
+          }
+          if (draftCalls === 2) {
+            expect(body.answers).toHaveLength(5);
+            expect(
+              new Set(
+                body.answers.map(
+                  (answer: { question_id: string }) => answer.question_id,
+                ),
+              ).size,
+            ).toBe(5);
+            return jsonResponse(
+              framingDraft({
+                ready_to_create: false,
+                draft: { clarifying_questions: [followUpQuestion] },
+                create_payload: null,
+              }),
+            );
+          }
+          expect(body.answers).toHaveLength(5);
+          expect(
+            new Set(
+              body.answers.map(
+                (answer: { question_id: string }) => answer.question_id,
+              ),
+            ).size,
+          ).toBe(5);
+          expect(body.answers).toEqual(
+            expect.arrayContaining([
+              { question_id: "q6", answer: "answer 6" },
+            ]),
+          );
+          return finalRefineResponse.promise;
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.type(
+      screen.getByRole("textbox", { name: /予測したいこと/ }),
+      "Will the product launch?",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "AIでForecast案を作成" }),
+    );
+    for (let index = 1; index <= 5; index += 1) {
+      await userEvent.type(
+        await screen.findByLabelText(`確認${index}`),
+        `answer ${index}`,
+      );
+    }
+    await userEvent.click(
+      screen.getByRole("button", { name: "回答をメタデータ案に反映" }),
+    );
+
+    await userEvent.type(await screen.findByLabelText("確認6"), "answer 6");
+    await userEvent.click(
+      screen.getByRole("button", { name: "回答をメタデータ案に反映" }),
+    );
+
+    const progress = await screen.findByRole("region", {
+      name: "回答を反映中",
+    });
+    expect(within(progress).getByText("1/1件")).toBeInTheDocument();
+    expect(within(progress).queryByText("5/1件")).not.toBeInTheDocument();
+
+    await act(async () => {
+      finalRefineResponse.resolve(jsonResponse(framingDraft()));
+    });
+
+    expect(
+      await screen.findByRole("heading", { name: "保存前のフレーミング確認" }),
+    ).toBeInTheDocument();
+  });
+
   it("shows a concise progress status while creating the initial AI draft", async () => {
     window.location.hash = "#/forecasts/new";
     const draftResponse = deferred<Response>();
@@ -473,7 +802,7 @@ describe("Forecast UI", () => {
 
     expect(await screen.findByText("AI応答待ち")).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent(
-      "AI応答待ち。1/4完了。現在: AIメタデータ抽出。",
+      "AI応答待ち。1/4完了。現在実行中: AIメタデータ抽出。",
     );
     const progress = screen.getByRole("region", { name: "AI応答待ち" });
     const progressList = within(progress).getByRole("list", {
@@ -539,7 +868,7 @@ describe("Forecast UI", () => {
 
     expect(await screen.findByText("回答を反映中")).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent(
-      "回答を反映中。2/4完了。現在: AIメタデータ更新。",
+      "回答を反映中。2/4完了。現在実行中: AIメタデータ更新。",
     );
     const progress = screen.getByRole("region", { name: "回答を反映中" });
     expect(
@@ -606,7 +935,7 @@ describe("Forecast UI", () => {
 
     expect(await screen.findByText("Forecastを保存中")).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent(
-      "Forecastを保存中。2/4完了。現在: Forecast保存。",
+      "Forecastを保存中。2/4完了。現在実行中: Forecast保存。",
     );
     expect(screen.getByText("メタデータ")).toBeInTheDocument();
     expect(screen.getByText("Forecast保存")).toBeInTheDocument();
@@ -702,7 +1031,7 @@ describe("Forecast UI", () => {
     expect(alert).not.toHaveTextContent("string_too_long");
   });
 
-  it("offers retry and manual final edit when a draft is not ready without questions", async () => {
+  it("creates from manual final edit after the user fills missing core metadata", async () => {
     window.location.hash = "#/forecasts/new";
     const fetchMock = vi.fn(
       async (url: string | URL | Request, init?: RequestInit) => {
@@ -712,10 +1041,36 @@ describe("Forecast UI", () => {
             framingDraft({
               ready_to_create: false,
               warnings: ["公開情報で判定できる期限が不足しています。"],
-              draft: { clarifying_questions: [] },
+              draft: { question: "", clarifying_questions: [] },
               create_payload: null,
             }),
           );
+        }
+        if (path === "/forecasts" && init?.method === "POST") {
+          const body = JSON.parse(String(init.body));
+          expect(body).toMatchObject({
+            question: "Will the product launch by Q4?",
+            original_execution_prompt: "Maybe launch?",
+            resolution_criteria: "Official launch announcement.",
+            resolution_sources: ["Official site"],
+            target_population: "Product users",
+            unit_of_analysis: "Product",
+            decision_context: "Roadmap planning",
+            confidentiality_class: "public",
+          });
+          expect(body.outcomes).toEqual(NON_BINARY_OUTCOMES);
+          return jsonResponse({
+            forecast_id: "forecast-1",
+            status: "framing_pending",
+            framing_version: 1,
+            created_at: "2026-06-08T00:00:00Z",
+          });
+        }
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(forecastDetail());
         }
         return jsonResponse({ detail: "unexpected request" }, 500);
       },
@@ -750,11 +1105,32 @@ describe("Forecast UI", () => {
       await screen.findByRole("heading", { name: "保存前のフレーミング確認" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/メタデータ抽出ではまだ作成に必要な項目がそろっていません/),
+      screen.getByText(/必須メタデータが入力済みなら/),
+    ).toBeInTheDocument();
+    const questionInput = screen.getByRole("textbox", {
+      name: /Forecast用の短い問い/,
+    });
+    expect(questionInput).toHaveValue("");
+    expect(
+      screen.getByText(/Forecast用の短い問いを入力してください/),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Forecastを作成" }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: "Forecastを作成" }),
+    ).toBeDisabled();
+
+    await userEvent.type(questionInput, "Will the product launch by Q4?");
+
+    expect(
+      screen.getByRole("button", { name: "Forecastを作成" }),
+    ).toBeEnabled();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Forecastを作成" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "保存済みプレビュー" }),
+    ).toBeInTheDocument();
   });
 
   it("keeps the first rough input as original prompt across retry and create payload conflicts", async () => {
@@ -861,6 +1237,479 @@ describe("Forecast UI", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows the PhaseA execution flow on forecast detail pages", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: "framing_approved",
+              approved_framing_version: 1,
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    const flow = await screen.findByRole("region", {
+      name: "PhaseA実行フロー",
+    });
+    expect(flow).toHaveClass("forecast-flow-progress--wrapped");
+    const flowList = within(flow).getByRole("list", {
+      name: "Forecast実行フロー",
+    });
+    const flowItems = within(flowList)
+      .getAllByRole("listitem")
+      .filter((item) => item.parentElement === flowList);
+    expect(flowItems).toHaveLength(9);
+    expect(
+      flowItems.map(
+        (item) => within(item).getByRole("heading", { level: 4 }).textContent,
+      ),
+    ).toEqual([
+      "フレーミング承認",
+      "公開情報パック投入",
+      "証拠抽出",
+      "シナリオ生成",
+      "Claim link承認",
+      "確率計算",
+      "PhaseA承認",
+      "コミット",
+      "解決",
+    ]);
+    expect(within(flowItems[0]).getByText("完了")).toBeInTheDocument();
+    expect(within(flowItems[1]).getByText("次に実行")).toBeInTheDocument();
+    expect(within(flowItems[2]).getByText("待機")).toBeInTheDocument();
+    expect(within(flow).getByText("1/9 完了")).toBeInTheDocument();
+    expect(within(flow).getByText("公開情報パックを投入")).toBeInTheDocument();
+    expect(flow.querySelectorAll(".forecast-flow-edge--wrap-break")).toHaveLength(2);
+  });
+
+  it("keeps pack_running on the research pack node without enabling evidence extraction", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    vi.spyOn(Date, "now").mockReturnValue(
+      Date.parse("2026-06-08T01:15:00Z"),
+    );
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: "pack_running",
+              approved_framing_version: 1,
+              current_research_pack: {
+                pack_id: "pack-1",
+                research_run_id: "run-1",
+                pack_status: "running",
+                effective_status: "running",
+                research_run_status: "waiting_deep_research",
+                pack_created_at: "2026-06-08T00:00:00Z",
+                pack_updated_at: "2026-06-08T00:00:00Z",
+                research_run_created_at: "2026-06-08T00:02:00Z",
+                research_run_updated_at: "2026-06-08T00:02:00Z",
+                deep_research_started_at: "2026-06-08T00:05:00Z",
+                total_tool_calls: 12,
+                estimated_cost_usd: 1.25,
+                done_reason: null,
+                needs_human_review: false,
+              },
+              current_research_pack_status: "running",
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    const flow = await screen.findByRole("region", {
+      name: "PhaseA実行フロー",
+    });
+    expect(within(flow).getByText("1/9 完了")).toBeInTheDocument();
+    expect(within(flow).getByText("公開情報パックを実行中")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "証拠抽出" }),
+    ).toBeDisabled();
+    expect(
+      await screen.findByText("公開情報パックを実行中です。"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/開始時刻: 09:05 ・ 経過: 70分 ・ 処理ステップ: 12件/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "Research runを開く" }),
+    ).toHaveAttribute("href", "#/runs/run-1");
+    expect(screen.getByText("次にやること")).toBeInTheDocument();
+    expect(screen.getByText("公開情報パックの完了待ちです。")).toBeInTheDocument();
+    expect(screen.queryByText("Next action")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/waiting for current_state pack completion/),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/Evidence extraction will unlock/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not show a needs_human_review research pack as running in the flow", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: "pack_running",
+              approved_framing_version: 1,
+              current_research_pack: {
+                pack_id: "pack-1",
+                research_run_id: "run-1",
+                pack_status: "running",
+                effective_status: "needs_human_review",
+                research_run_status: "needs_human_review",
+                pack_created_at: "2026-06-08T00:00:00Z",
+                pack_updated_at: "2026-06-08T00:00:00Z",
+                research_run_created_at: "2026-06-08T00:00:00Z",
+                research_run_updated_at: "2026-06-08T00:30:00Z",
+                deep_research_started_at: "2026-06-08T00:05:00Z",
+                total_tool_calls: 18,
+                estimated_cost_usd: 1.7,
+                done_reason: "human_review_required",
+                needs_human_review: true,
+              },
+              current_research_pack_status: "needs_human_review",
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    const flow = await screen.findByRole("region", {
+      name: "PhaseA実行フロー",
+    });
+    const flowList = within(flow).getByRole("list", {
+      name: "Forecast実行フロー",
+    });
+    const flowItems = within(flowList)
+      .getAllByRole("listitem")
+      .filter((item) => item.parentElement === flowList);
+    const packItem = flowItems[1];
+    expect(within(packItem).getByText("待機")).toBeInTheDocument();
+    expect(within(packItem).getByText("公開情報パックは要確認です")).toBeInTheDocument();
+    expect(within(packItem).queryByText("実行中")).not.toBeInTheDocument();
+    expect(screen.queryByText("公開情報パックを実行中です。")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/公開情報パックの実行状態を確認してください。/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/human_review_required/)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "証拠抽出" }),
+    ).toBeDisabled();
+  });
+
+  it("links to the research run from the forecast detail header", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: "pack_running",
+              approved_framing_version: 1,
+              current_research_pack: {
+                pack_id: "pack-1",
+                research_run_id: "run-1",
+                pack_status: "running",
+                effective_status: "running",
+                research_run_status: "waiting_deep_research",
+                pack_created_at: "2026-06-08T00:00:00Z",
+                pack_updated_at: "2026-06-08T00:00:00Z",
+                research_run_created_at: "2026-06-08T00:00:00Z",
+                research_run_updated_at: "2026-06-08T00:00:00Z",
+                deep_research_started_at: null,
+                total_tool_calls: 0,
+                estimated_cost_usd: 0,
+                done_reason: null,
+                needs_human_review: false,
+              },
+              current_research_pack_status: "running",
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("link", { name: "Research run詳細" }),
+    ).toHaveAttribute("href", "#/runs/run-1");
+  });
+
+  it("does not show the running wait banner after the current research pack is completed", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: "pack_running",
+              approved_framing_version: 1,
+              current_research_pack: {
+                pack_id: "pack-1",
+                research_run_id: "run-1",
+                pack_status: "running",
+                effective_status: "completed",
+                research_run_status: "completed",
+                pack_created_at: "2026-06-08T00:00:00Z",
+                pack_updated_at: "2026-06-08T00:00:00Z",
+                research_run_created_at: "2026-06-08T00:00:00Z",
+                research_run_updated_at: "2026-06-08T01:00:00Z",
+                deep_research_started_at: "2026-06-08T00:05:00Z",
+                total_tool_calls: 24,
+                estimated_cost_usd: 2.5,
+                done_reason: "forecast_raw_report_collected",
+                needs_human_review: false,
+              },
+              current_research_pack_status: "completed",
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("公開情報パックは完了しました。"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("次に証拠抽出を実行できます。")).toBeInTheDocument();
+    expect(screen.queryByText("公開情報パックを実行中です。")).not.toBeInTheDocument();
+  });
+
+  it("stops polling after a running current research pack completes", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    vi.useFakeTimers();
+    let forecastGetCount = 0;
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          forecastGetCount += 1;
+          return jsonResponse(
+            forecastDetail({
+              status: "pack_running",
+              approved_framing_version: 1,
+              current_research_pack: {
+                pack_id: "pack-1",
+                research_run_id: "run-1",
+                pack_status: "running",
+                effective_status:
+                  forecastGetCount === 1 ? "running" : "completed",
+                research_run_status:
+                  forecastGetCount === 1 ? "waiting_deep_research" : "completed",
+                pack_created_at: "2026-06-08T00:00:00Z",
+                pack_updated_at: "2026-06-08T00:00:00Z",
+                research_run_created_at: "2026-06-08T00:00:00Z",
+                research_run_updated_at: "2026-06-08T01:00:00Z",
+                deep_research_started_at: "2026-06-08T00:05:00Z",
+                total_tool_calls: forecastGetCount === 1 ? 12 : 24,
+                estimated_cost_usd: forecastGetCount === 1 ? 1.25 : 2.5,
+                done_reason:
+                  forecastGetCount === 1 ? null : "forecast_raw_report_collected",
+                needs_human_review: false,
+              },
+              current_research_pack_status:
+                forecastGetCount === 1 ? "running" : "completed",
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(
+      screen.getByText("公開情報パックを実行中です。"),
+    ).toBeInTheDocument();
+    expect(forecastGetCount).toBe(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.getByText("公開情報パックは完了しました。"),
+    ).toBeInTheDocument();
+    const countAfterCompletion = forecastGetCount;
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(12_000);
+      await Promise.resolve();
+    });
+
+    expect(forecastGetCount).toBe(countAfterCompletion);
+  });
+
+  it("unlocks evidence extraction when the current research pack is completed", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: "pack_running",
+              approved_framing_version: 1,
+              current_research_pack: {
+                pack_id: "pack-1",
+                research_run_id: "run-1",
+                pack_status: "running",
+                effective_status: "completed",
+                research_run_status: "completed",
+                pack_created_at: "2026-06-08T00:00:00Z",
+                pack_updated_at: "2026-06-08T00:00:00Z",
+                research_run_created_at: "2026-06-08T00:00:00Z",
+                research_run_updated_at: "2026-06-08T01:00:00Z",
+                deep_research_started_at: "2026-06-08T00:05:00Z",
+                total_tool_calls: 24,
+                estimated_cost_usd: 2.5,
+                done_reason: "forecast_raw_report_collected",
+                needs_human_review: false,
+              },
+              current_research_pack_status: "completed",
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    const flow = await screen.findByRole("region", {
+      name: "PhaseA実行フロー",
+    });
+    const flowList = within(flow).getByRole("list", {
+      name: "Forecast実行フロー",
+    });
+    const flowItems = within(flowList)
+      .getAllByRole("listitem")
+      .filter((item) => item.parentElement === flowList);
+    expect(within(flowItems[1]).getByText("完了")).toBeInTheDocument();
+    expect(within(flowItems[2]).getByText("次に実行")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "証拠抽出" })).toBeEnabled();
+    expect(
+      screen.getByText("次に証拠抽出を実行できます。"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows committed forecast detail flow as ready to resolve", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: "committed",
+              approved_framing_version: 1,
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/estimate-set" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(estimateSet({ status: "frozen" }));
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    const flow = await screen.findByRole("region", {
+      name: "PhaseA実行フロー",
+    });
+    const flowList = within(flow).getByRole("list", {
+      name: "Forecast実行フロー",
+    });
+    const flowItems = within(flowList)
+      .getAllByRole("listitem")
+      .filter((item) => item.parentElement === flowList);
+    expect(flowItems).toHaveLength(9);
+    expect(
+      flowItems.map(
+        (item) => within(item).getByRole("heading", { level: 4 }).textContent,
+      ),
+    ).toEqual([
+      "フレーミング承認",
+      "公開情報パック投入",
+      "証拠抽出",
+      "シナリオ生成",
+      "Claim link承認",
+      "確率計算",
+      "PhaseA承認",
+      "コミット",
+      "解決",
+    ]);
+    expect(within(flowItems[7]).getByText("完了")).toBeInTheDocument();
+    expect(within(flowItems[8]).getByText("次に実行")).toBeInTheDocument();
+    expect(within(flow).getByText("8/9 完了")).toBeInTheDocument();
+  });
+
   it("renders typed 409 code, message and details on forecast commands", async () => {
     window.location.hash = "#/forecasts/forecast-1";
     const fetchMock = vi.fn(
@@ -899,12 +1748,12 @@ describe("Forecast UI", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("framing_approved")).toBeInTheDocument();
+    expect(await screen.findAllByText("フレーミング承認済み")).not.toHaveLength(0);
     expect(
-      screen.getByRole("button", { name: "Extract evidence" }),
+      screen.getByRole("button", { name: "証拠抽出" }),
     ).toBeDisabled();
     await userEvent.click(
-      screen.getByRole("button", { name: "Dispatch pack" }),
+      screen.getByRole("button", { name: "公開情報パック投入" }),
     );
 
     const alert = await screen.findByRole("alert");
@@ -953,9 +1802,9 @@ describe("Forecast UI", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("framing_approved")).toBeInTheDocument();
+    expect(await screen.findAllByText("フレーミング承認済み")).not.toHaveLength(0);
     await userEvent.click(
-      screen.getByRole("button", { name: "Dispatch pack" }),
+      screen.getByRole("button", { name: "公開情報パック投入" }),
     );
 
     const alert = await screen.findByRole("alert");
@@ -991,7 +1840,11 @@ describe("Forecast UI", () => {
 
     expect(await screen.findAllByText("phase_a_v1")).toHaveLength(2);
     expect(screen.getByText("snapshot-hash-1")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Compute" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "確率計算" })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "PhaseA承認" }),
+    ).toBeEnabled();
+    expect(screen.getByRole("button", { name: "コミット" })).toBeDisabled();
     expect(
       fetchMock.mock.calls.some(([url]) =>
         String(url).endsWith("/estimate-set"),
@@ -1002,6 +1855,119 @@ describe("Forecast UI", () => {
         String(url).endsWith("/forecasts/forecast-1/probabilities/compute"),
       ),
     ).toBe(false);
+  });
+
+  it("enables commit only after PhaseA approval", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    let phaseAApproved = false;
+    let status: ForecastDetail["status"] = "draft_ready";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(forecastDetail({ status }));
+        }
+        if (
+          path === "/forecasts/forecast-1/estimate-set" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(estimateSet({ approved: phaseAApproved }));
+        }
+        if (
+          path === "/forecasts/forecast-1/review" &&
+          init?.method === "POST"
+        ) {
+          expect(JSON.parse(String(init.body))).toMatchObject({
+            action: "approve_phase_a_version",
+            estimate_set_id: "estimate-set-1",
+          });
+          phaseAApproved = true;
+          return jsonResponse({
+            forecast_id: "forecast-1",
+            action: "approve_phase_a_version",
+            status: "draft_ready",
+            estimate_set_id: "estimate-set-1",
+          });
+        }
+        if (
+          path === "/forecasts/forecast-1/versions/commit" &&
+          init?.method === "POST"
+        ) {
+          expect(phaseAApproved).toBe(true);
+          status = "committed";
+          return jsonResponse({
+            version_id: "version-1",
+            forecast_id: "forecast-1",
+            estimate_set_id: "estimate-set-1",
+            input_snapshot_hash: "snapshot-hash-1",
+            snapshot_artifact_path: ".data/forecast-runs/version-1.json",
+            committed_at: "2026-06-08T01:00:00Z",
+          });
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    expect(await screen.findByText("snapshot-hash-1")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "PhaseA承認" }),
+    ).toBeEnabled();
+    expect(screen.getByRole("button", { name: "コミット" })).toBeDisabled();
+
+    await userEvent.click(screen.getByRole("button", { name: "PhaseA承認" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "コミット" })).toBeEnabled(),
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "コミット" }));
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([url, init]) =>
+            String(url).endsWith("/forecasts/forecast-1/versions/commit") &&
+            init?.method === "POST",
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("restores claim-target approval from forecast detail after reload", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: "scenarios_ready",
+              approved_framing_version: 1,
+              approved_claim_target_link_count: 2,
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    expect(await screen.findAllByText("シナリオ生成済み")).not.toHaveLength(0);
+    expect(
+      screen.getByRole("button", { name: "Claim link承認" }),
+    ).toBeDisabled();
+    expect(screen.getByRole("button", { name: "確率計算" })).toBeEnabled();
   });
 
   it("requires claim-target link approval before compute", async () => {
@@ -1046,18 +2012,18 @@ describe("Forecast UI", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("scenarios_ready")).toBeInTheDocument();
+    expect(await screen.findAllByText("シナリオ生成済み")).not.toHaveLength(0);
     expect(
-      screen.getByRole("button", { name: "Approve claim links" }),
+      screen.getByRole("button", { name: "Claim link承認" }),
     ).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Compute" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "確率計算" })).toBeDisabled();
 
     await userEvent.click(
-      screen.getByRole("button", { name: "Approve claim links" }),
+      screen.getByRole("button", { name: "Claim link承認" }),
     );
 
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Compute" })).toBeEnabled(),
+      expect(screen.getByRole("button", { name: "確率計算" })).toBeEnabled(),
     );
     const reviewCall = fetchMock.mock.calls.find(
       ([url, init]) =>
@@ -1075,7 +2041,7 @@ describe("Forecast UI", () => {
       }),
     );
 
-    await userEvent.click(screen.getByRole("button", { name: "Compute" }));
+    await userEvent.click(screen.getByRole("button", { name: "確率計算" }));
 
     expect(await screen.findByText("snapshot-hash-1")).toBeInTheDocument();
     const computeCall = fetchMock.mock.calls.find(
@@ -1140,12 +2106,13 @@ describe("Forecast UI", () => {
 
     expect(await screen.findByText("snapshot-hash-1")).toBeInTheDocument();
     const resolvePanel = await screen.findByRole("heading", {
-      name: "Resolve",
+      name: "解決",
+      level: 2,
     });
     const panel = resolvePanel.closest(".form-panel");
     expect(panel).not.toBeNull();
     await userEvent.click(
-      within(panel as HTMLElement).getByRole("button", { name: "Resolve" }),
+      within(panel as HTMLElement).getByRole("button", { name: "解決" }),
     );
 
     expect(await screen.findByText("Brier 0.1200")).toBeInTheDocument();
