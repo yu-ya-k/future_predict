@@ -548,6 +548,15 @@ def delete_research_run(
             status_code=status.HTTP_404_NOT_FOUND, detail="Run not found."
         ) from error
     except RuntimeError as error:
+        if str(error) == "forecast_linked_research_run":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "forecast_linked_research_run",
+                    "message": "Research run is linked to a forecast and cannot be deleted.",
+                    "details": {"run_id": str(run_id)},
+                },
+            ) from error
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(error),

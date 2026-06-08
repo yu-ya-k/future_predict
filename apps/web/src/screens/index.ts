@@ -5,3 +5,7 @@ export { HumanReview } from "./HumanReview";
 export { ReportViewer } from "./ReportViewer";
 export { AuditLog } from "./AuditLog";
 export { Settings } from "./Settings";
+export { ForecastDashboard } from "./forecast/ForecastDashboard";
+export { NewForecast } from "./forecast/NewForecast";
+export { ForecastDetail } from "./forecast/ForecastDetail";
+export { ForecastAudit } from "./forecast/ForecastAudit";

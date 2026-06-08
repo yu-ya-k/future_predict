@@ -140,6 +140,7 @@ class ResearchRepository:
                     total_tool_calls INTEGER NOT NULL DEFAULT 0,
                     estimated_cost_usd REAL NOT NULL DEFAULT 0,
                     rerun_execution_mode TEXT NOT NULL DEFAULT 'api',
+                    run_origin TEXT NOT NULL DEFAULT 'research',
                     terminal_status TEXT,
                     review_claim_token TEXT,
                     review_claim_operation TEXT,
@@ -386,6 +387,7 @@ class ResearchRepository:
             "review_claim_operation": "TEXT",
             "review_claim_expires_at": "TEXT",
             "rerun_execution_mode": "TEXT NOT NULL DEFAULT 'api'",
+            "run_origin": "TEXT NOT NULL DEFAULT 'research'",
         }
         for name, definition in columns.items():
             if name not in existing:
@@ -453,6 +455,7 @@ class ResearchRepository:
         user_prompt: str,
         options: ResearchRunOptions,
         settings: Settings,
+        run_origin: str = "research",
     ) -> ResearchRunRecord:
         now = utc_now()
         run_id = uuid4()
@@ -467,10 +470,10 @@ class ResearchRepository:
                     max_targeted_rerun_runs, max_full_rerun_runs,
                     max_llm_patch_runs, max_verification_runs, max_total_iterations,
                     max_total_tool_calls,
-                    rerun_execution_mode,
+                    rerun_execution_mode, run_origin,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(run_id),
@@ -492,6 +495,7 @@ class ResearchRepository:
                     options.max_total_iterations or settings.default_max_total_iterations,
                     max_tool_calls,
                     RerunExecutionMode.API.value,
+                    run_origin,
                     now.isoformat(),
                     now.isoformat(),
                 ),
@@ -980,6 +984,26 @@ class ResearchRepository:
                 (str(run_id),),
             )
             return cursor.rowcount == 1
+
+    def is_linked_to_forecast(self, run_id: UUID) -> bool:
+        with self.connect() as connection:
+            table = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'forecast_research_packs'
+                """
+            ).fetchone()
+            if table is None:
+                return False
+            row = connection.execute(
+                """
+                SELECT 1 FROM forecast_research_packs
+                WHERE research_run_id = ?
+                LIMIT 1
+                """,
+                (str(run_id),),
+            ).fetchone()
+        return row is not None
 
     def list_waiting_runs(self, *, timeout_seconds: int) -> list[ResearchRunRecord]:
         with self.connect() as connection:
@@ -2713,6 +2737,7 @@ class ResearchRepository:
             rerun_execution_mode=RerunExecutionMode(
                 row["rerun_execution_mode"] if "rerun_execution_mode" in row.keys() else "api"
             ),
+            run_origin=row["run_origin"] if "run_origin" in row.keys() else "research",
             terminal_status=row["terminal_status"],
             review_claim_token=row["review_claim_token"],
             review_claim_operation=row["review_claim_operation"],

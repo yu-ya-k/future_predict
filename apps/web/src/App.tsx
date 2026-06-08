@@ -11,6 +11,10 @@ import {
   ReportViewer,
   AuditLog,
   Settings,
+  ForecastDashboard,
+  NewForecast,
+  ForecastDetail,
+  ForecastAudit,
 } from "./screens";
 import "./App.css";
 
@@ -69,6 +73,14 @@ export function App() {
         );
       case "settings":
         return <Settings />;
+      case "forecasts":
+        return <ForecastDashboard />;
+      case "forecast-new":
+        return <NewForecast />;
+      case "forecast-detail":
+        return route.forecastId ? <ForecastDetail forecastId={route.forecastId} /> : <NotFound />;
+      case "forecast-audit":
+        return route.forecastId ? <ForecastAudit forecastId={route.forecastId} /> : <NotFound />;
       case "not-found":
       default:
         return <NotFound />;
@@ -108,6 +120,12 @@ export function App() {
               className={`nav-link${route.name === "settings" ? " nav-link--active" : ""}`}
             >
               設定
+            </Link>
+            <Link
+              to={routes().forecasts}
+              className={`nav-link${route.name.startsWith("forecast") || route.name === "forecasts" ? " nav-link--active" : ""}`}
+            >
+              Forecasts
             </Link>
           </nav>
         </div>

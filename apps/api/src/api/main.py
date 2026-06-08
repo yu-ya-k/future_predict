@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.config import get_settings
+from api.forecast.router import router as forecast_router
 from api.research.dependencies import get_research_orchestrator
 from api.research.poller import ResearchPoller
 from api.research.router import router as research_router
@@ -40,6 +41,7 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.include_router(forecast_router)
     app.include_router(research_router)
     app.add_api_route("/health", health, methods=["GET"])
     return app

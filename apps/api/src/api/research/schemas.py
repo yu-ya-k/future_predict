@@ -692,6 +692,7 @@ class ResearchRunRecord(BaseModel):
     poll_error_count: int = 0
     poll_claimed_until: datetime | None = None
     poll_claim_owner: str | None = None
+    run_origin: str = "research"
     warnings: list[str]
     created_at: datetime
     updated_at: datetime

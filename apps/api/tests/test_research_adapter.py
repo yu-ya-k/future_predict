@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 import pytest
 from openai import APITimeoutError, BadRequestError, OpenAIError
+from pydantic import BaseModel
 
 from api.config import Settings
 from api.research import azure_responses
@@ -60,6 +61,10 @@ class _FakeClient:
     def with_options(self, **kwargs: Any) -> _FakeClient:
         self.with_options_calls.append(kwargs)
         return self
+
+
+class _StructuredPayload(BaseModel):
+    answer: str
 
 
 def _settings() -> Settings:
@@ -122,6 +127,139 @@ def test_deep_research_submit_always_includes_public_web_search_tool() -> None:
 
     tools_by_call = [call["tools"] for call in fake_client.responses.create_calls]
     assert tools_by_call == [[{"type": "web_search_preview"}]] * 2
+
+
+def test_private_deep_research_requires_allowlisted_vector_stores() -> None:
+    fake_client = _FakeClient()
+    client = AzureResponsesClient(
+        settings=Settings(
+            research_poller_enabled=False,
+            research_private_vector_store_allowlist=["vs_allowed", "vs_second"],
+        ),
+        client=fake_client,
+    )
+
+    client.submit_deep_research(
+        prompt="private research",
+        max_tool_calls=10,
+        tool_profile="private",
+        vector_store_ids=["vs_allowed", "vs_second"],
+    )
+
+    assert fake_client.responses.create_calls[0]["tools"] == [
+        {"type": "file_search", "vector_store_ids": ["vs_allowed", "vs_second"]}
+    ]
+
+    with pytest.raises(ValueError, match="at most two vector stores"):
+        client.submit_deep_research(
+            prompt="private research",
+            max_tool_calls=10,
+            tool_profile="private",
+            vector_store_ids=["vs_allowed", "vs_second", "vs_third"],
+        )
+
+    with pytest.raises(ValueError, match="not allowlisted"):
+        client.submit_deep_research(
+            prompt="private research",
+            max_tool_calls=10,
+            tool_profile="private",
+            vector_store_ids=["vs_unknown"],
+        )
+
+    fail_closed_client = AzureResponsesClient(
+        settings=_settings(),
+        client=_FakeClient(),
+    )
+    with pytest.raises(ValueError, match="configured vector store allowlist"):
+        fail_closed_client.submit_deep_research(
+            prompt="private research",
+            max_tool_calls=10,
+            tool_profile="private",
+            vector_store_ids=["vs_allowed"],
+        )
+
+
+def test_synthesis_profile_cannot_submit_deep_research() -> None:
+    client = AzureResponsesClient(settings=_settings(), client=_FakeClient())
+
+    with pytest.raises(ValueError, match="synthesis profile cannot submit"):
+        client.submit_deep_research(
+            prompt="synthesize",
+            max_tool_calls=10,
+            tool_profile="synthesis",
+        )
+
+
+def test_parse_structured_fallback_preserves_schema_and_tools() -> None:
+    fake_client = _FakeClient()
+    fake_client.responses.parse_error = TypeError("parse helper unavailable")
+    fake_client.responses.create_response = _Response(
+        response_id="resp_structured",
+        output_text='{"answer":"ok"}',
+    )
+    client = AzureResponsesClient(
+        settings=Settings(
+            research_poller_enabled=False,
+            research_private_vector_store_allowlist=["vs_allowed"],
+        ),
+        client=fake_client,
+    )
+
+    output_text, response_id, raw_response = client.parse_structured(
+        model="gpt-test",
+        prompt="parse with private context",
+        text_format=_StructuredPayload,
+        tool_profile="private",
+        policy_decision_id="policy_123",
+        vector_store_ids=["vs_allowed"],
+    )
+
+    assert output_text == '{"answer":"ok"}'
+    assert response_id == "resp_structured"
+    assert raw_response["id"] == "resp_structured"
+    fallback_request = fake_client.responses.create_calls[0]
+    assert fallback_request["tools"] == [
+        {"type": "file_search", "vector_store_ids": ["vs_allowed"]}
+    ]
+    assert fallback_request["text"]["format"]["type"] == "json_schema"
+    assert fallback_request["text"]["format"]["name"] == "_StructuredPayload"
+    assert fallback_request["text"]["format"]["strict"] is True
+    assert "answer" in fallback_request["text"]["format"]["schema"]["properties"]
+
+
+def test_parse_structured_requires_policy_id_when_tools_are_used() -> None:
+    client = AzureResponsesClient(
+        settings=Settings(
+            research_poller_enabled=False,
+            research_private_vector_store_allowlist=["vs_allowed"],
+        ),
+        client=_FakeClient(),
+    )
+
+    with pytest.raises(ValueError, match="policy_decision_id is required"):
+        client.parse_structured(
+            model="gpt-test",
+            prompt="parse",
+            text_format=_StructuredPayload,
+            tool_profile="private",
+            vector_store_ids=["vs_allowed"],
+        )
+
+
+def test_parse_structured_fallback_fails_closed_for_unknown_schema_shape() -> None:
+    fake_client = _FakeClient()
+    fake_client.responses.parse_error = TypeError("parse helper unavailable")
+    client = AzureResponsesClient(settings=_settings(), client=fake_client)
+
+    with pytest.raises(ValueError, match="cannot convert text_format"):
+        client.parse_structured(
+            model="gpt-test",
+            prompt="parse",
+            text_format=object(),
+            tool_profile="synthesis",
+        )
+
+    assert fake_client.responses.create_calls == []
 
 
 def test_review_report_falls_back_to_strict_schema_after_parse_helper_error() -> None:

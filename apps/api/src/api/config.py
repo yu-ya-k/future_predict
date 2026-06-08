@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     ]
     research_db_path: Path = Path(".data/research.sqlite3")
     research_artifact_dir: Path = Path(".data/research-runs")
+    forecast_enabled: bool = True
+    forecast_artifact_dir: Path = Path(".data/forecast-runs")
+    forecast_background_mode_enabled: bool = False
+    forecast_max_concurrent_packs: int = Field(default=1, ge=1)
     research_poller_enabled: bool = True
     research_poller_interval_seconds: float = Field(default=5.0, gt=0)
     research_deep_research_timeout_seconds: int = Field(default=7200, gt=0)
@@ -26,6 +30,7 @@ class Settings(BaseSettings):
     research_review_max_report_chars: int = Field(default=50000, ge=1)
     research_review_max_citations: int = Field(default=40, ge=0)
     research_review_web_search_enabled: bool = False
+    research_private_vector_store_allowlist: list[str] = Field(default_factory=list)
     research_manual_import_max_report_chars: int = Field(default=50000, ge=1)
     research_manual_import_max_file_bytes: int = Field(default=1048576, ge=1)
 

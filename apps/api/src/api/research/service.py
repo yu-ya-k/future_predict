@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
@@ -103,13 +103,29 @@ class ResearchOrchestrator:
         self.artifacts = artifacts
         self.azure = azure
 
-    def create_run(self, request: CreateResearchRunRequest) -> ResearchRunRecord:
+    def create_run(
+        self,
+        request: CreateResearchRunRequest,
+        *,
+        forecast_mode: bool = False,
+        tool_profile: Literal["public", "private", "synthesis"] = "public",
+        background: bool = True,
+        policy_decision_id: str | None = None,
+    ) -> ResearchRunRecord:
+        if forecast_mode and not policy_decision_id:
+            raise ValueError("policy_decision_id is required for forecast research runs.")
         run = self.repository.create_run(
             user_prompt=request.user_prompt,
             options=request.options,
             settings=self.settings,
+            run_origin="forecast" if forecast_mode else "research",
         )
-        return self.submit_deep_research(run.id)
+        return self.submit_deep_research(
+            run.id,
+            tool_profile=tool_profile,
+            background=background,
+            policy_decision_id=policy_decision_id,
+        )
 
     def create_manual_import_run(
         self,
@@ -290,8 +306,13 @@ class ResearchOrchestrator:
         *,
         human_comment: str | None = None,
         scope: str = "targeted_gap_closure",
+        tool_profile: Literal["public", "private", "synthesis"] = "public",
+        background: bool = True,
+        policy_decision_id: str | None = None,
     ) -> ResearchRunRecord:
         run = self.repository.get_run(run_id)
+        if run.run_origin == "forecast" and not policy_decision_id:
+            raise ValueError("policy_decision_id is required for forecast research runs.")
         run_no = run.deep_research_runs + 1
         requested_max_tool_calls = self.settings.default_max_total_tool_calls
 
@@ -391,6 +412,9 @@ class ResearchOrchestrator:
                     remaining_tool_calls,
                     requested_max_tool_calls,
                 ),
+                tool_profile=tool_profile,
+                background=background,
+                policy_decision_id=policy_decision_id,
             )
             response_id = get_response_id(response)
             raw_path, _ = self.artifacts.save_json(
@@ -983,8 +1007,27 @@ class ResearchOrchestrator:
         updated = self.repository.update_run_if_status(
             run.id,
             {RunStatus.COLLECTING},
-            status=RunStatus.REVIEWING,
+            status=(
+                RunStatus.COMPLETED
+                if getattr(run, "run_origin", "research") == "forecast"
+                else RunStatus.REVIEWING
+            ),
             report=merged_report,
+            final_report=(
+                merged_report
+                if getattr(run, "run_origin", "research") == "forecast"
+                else run.final_report
+            ),
+            done_reason=(
+                "forecast_raw_report_collected"
+                if getattr(run, "run_origin", "research") == "forecast"
+                else run.done_reason
+            ),
+            terminal_status=(
+                "forecast_raw_report_collected"
+                if getattr(run, "run_origin", "research") == "forecast"
+                else run.terminal_status
+            ),
             deep_research_status=response_status,
             total_tool_calls=run.total_tool_calls + tool_call_delta,
             estimated_cost_usd=run.estimated_cost_usd + cost_delta,
@@ -1001,6 +1044,8 @@ class ResearchOrchestrator:
                 },
             )
             return self.repository.get_run(run.id)
+        if getattr(run, "run_origin", "research") == "forecast":
+            return updated
         return self.review_run(updated.id)
 
     def review_run(
@@ -1009,6 +1054,9 @@ class ResearchOrchestrator:
         *,
         _review_claim_token: str | None = None,
     ) -> ResearchRunRecord:
+        current = self.repository.get_run(run_id)
+        if getattr(current, "run_origin", "research") == "forecast":
+            return current
         if _review_claim_token is not None:
             return self._review_run_claimed(
                 run_id,
@@ -1839,6 +1887,9 @@ class ResearchOrchestrator:
                     remaining_tool_calls,
                     self.settings.default_max_total_tool_calls,
                 ),
+                tool_profile="public",
+                background=True,
+                policy_decision_id=None,
             )
             response_id = get_response_id(response)
             raw_path, _ = self.artifacts.save_json(
@@ -2522,6 +2573,8 @@ class ResearchOrchestrator:
 
     def delete_run(self, run_id: UUID) -> None:
         run = self.repository.get_run(run_id)
+        if self.repository.is_linked_to_forecast(run.id):
+            raise RuntimeError("forecast_linked_research_run")
         if not _is_terminal_run_status(run.status) and _has_pending_remote_deep_research(run):
             if not self._cancel_remote_response(
                 run,

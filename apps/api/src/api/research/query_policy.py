@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from typing import cast
+from dataclasses import dataclass
+from typing import Literal, cast
 
 from api.research.schemas import QueryPolicyDecision
 
@@ -17,6 +18,35 @@ SENSITIVE_PATTERNS = [
 
 def contains_sensitive_terms(text: str) -> bool:
     return any(pattern.search(text) for pattern in SENSITIVE_PATTERNS)
+
+
+@dataclass(frozen=True)
+class PolicyDecision:
+    decision: Literal["allow", "block", "require_human_review"]
+    reason: str | None
+    safe_queries: list[str]
+
+
+def evaluate(
+    prompt: str,
+    *,
+    profile: Literal["public", "private", "synthesis"],
+) -> PolicyDecision:
+    if profile == "synthesis":
+        return PolicyDecision(decision="allow", reason=None, safe_queries=[])
+    if contains_sensitive_terms(prompt):
+        if profile == "public":
+            return PolicyDecision(
+                decision="block",
+                reason="Search query contains sensitive terms.",
+                safe_queries=[],
+            )
+        return PolicyDecision(
+            decision="require_human_review",
+            reason="Private profile prompt requires human review.",
+            safe_queries=[],
+        )
+    return PolicyDecision(decision="allow", reason=None, safe_queries=[prompt])
 
 
 def query_policy_gate(
@@ -42,6 +72,13 @@ def query_policy_gate(
     safe_queries = [
         str(query) for query in candidate_query_values if str(query).strip()
     ]
+    decision = evaluate("\n".join(safe_queries), profile="public")
+    if decision.decision == "block":
+        return QueryPolicyDecision(
+            status="blocked",
+            safe_queries=[],
+            blocked_reason=decision.reason,
+        )
     if not safe_queries:
         return QueryPolicyDecision(
             status="blocked",

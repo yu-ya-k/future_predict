@@ -107,6 +107,10 @@ class IntegrationFakeAzure:
         *,
         prompt: str,
         max_tool_calls: int,
+        tool_profile: str = "public",
+        background: bool = True,
+        policy_decision_id: str | None = None,
+        **_: object,
     ) -> dict[str, object]:
         if self.submit_raises is not None:
             raise self.submit_raises
@@ -115,6 +119,9 @@ class IntegrationFakeAzure:
             {
                 "prompt": prompt,
                 "max_tool_calls": max_tool_calls,
+                "tool_profile": tool_profile,
+                "background": background,
+                "policy_decision_id": policy_decision_id,
             }
         )
         return {
