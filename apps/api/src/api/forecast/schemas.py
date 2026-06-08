@@ -67,6 +67,101 @@ class ForecastCreateResponse(BaseModel):
     created_at: datetime
 
 
+class ForecastFramingDraftClarifyingQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question_id: str = Field(min_length=1, max_length=100)
+    label: str = Field(min_length=1, max_length=200)
+    prompt: str = Field(min_length=1, max_length=1000)
+    why_needed: str = Field(min_length=1, max_length=1000)
+    answer_type: Literal[
+        "text",
+        "single_select",
+        "multi_select",
+        "number",
+        "date",
+        "boolean",
+    ] = "text"
+    required: bool = True
+    options: list[str] = Field(default_factory=list, max_length=12)
+
+    _strip_question_id = field_validator("question_id", mode="before")(_strip)
+    _strip_label = field_validator("label", mode="before")(_strip)
+    _strip_prompt = field_validator("prompt", mode="before")(_strip)
+    _strip_why_needed = field_validator("why_needed", mode="before")(_strip)
+
+
+def _default_clarifying_questions() -> list[ForecastFramingDraftClarifyingQuestion]:
+    return []
+
+
+class ForecastFramingDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    forecast_prompt: str = Field(min_length=1, max_length=8000)
+    question: str = Field(min_length=1, max_length=5000)
+    resolution_criteria: str = Field(min_length=1, max_length=5000)
+    resolution_sources: list[str] = Field(default_factory=list, max_length=20)
+    target_population: str | None = Field(default=None, max_length=1000)
+    unit_of_analysis: str | None = Field(default=None, max_length=1000)
+    decision_context: str | None = Field(default=None, max_length=5000)
+    outcomes: list[str] = Field(default_factory=lambda: ["Yes", "No"], max_length=8)
+    clarifying_questions: list[ForecastFramingDraftClarifyingQuestion] = Field(
+        default_factory=_default_clarifying_questions,
+        max_length=5,
+    )
+    confidence: float = Field(ge=0, le=1)
+
+    _strip_forecast_prompt = field_validator("forecast_prompt", mode="before")(_strip)
+    _strip_question = field_validator("question", mode="before")(_strip)
+    _strip_resolution_criteria = field_validator("resolution_criteria", mode="before")(
+        _strip
+    )
+
+    @field_validator("outcomes", mode="after")
+    @classmethod
+    def _default_outcomes(cls, value: list[str]) -> list[str]:
+        labels = [label.strip() for label in value if label.strip()]
+        return labels or ["Yes", "No"]
+
+
+class ForecastFramingDraftAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question_id: str = Field(min_length=1, max_length=100)
+    answer: str = Field(min_length=1, max_length=2000)
+
+    _strip_question_id = field_validator("question_id", mode="before")(_strip)
+    _strip_answer = field_validator("answer", mode="before")(_strip)
+
+
+def _default_framing_draft_answers() -> list[ForecastFramingDraftAnswer]:
+    return []
+
+
+class ForecastFramingDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rough_question: str = Field(min_length=1, max_length=5000)
+    answers: list[ForecastFramingDraftAnswer] = Field(
+        default_factory=_default_framing_draft_answers,
+        max_length=5,
+    )
+    previous_draft: ForecastFramingDraft | None = None
+    locale: Literal["ja", "en"] = "ja"
+
+    _strip_rough_question = field_validator("rough_question", mode="before")(_strip)
+
+
+class ForecastFramingDraftResponse(BaseModel):
+    draft: ForecastFramingDraft
+    create_payload: ForecastCreateRequest | None = None
+    ready_to_create: bool
+    model: str
+    response_id: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
 class ForecastOutcome(BaseModel):
     outcome_id: UUID
     label: str
@@ -252,4 +347,3 @@ class ForecastAuditResponse(BaseModel):
     versions: list[dict[str, Any]]
     policy_decisions: list[dict[str, Any]]
     events: list[ForecastAuditEvent]
-

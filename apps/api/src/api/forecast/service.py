@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from pydantic import ValidationError
+
 from api.config import Settings
 from api.forecast.artifacts import ForecastArtifactStore
 from api.forecast.errors import ForecastConflict
@@ -35,6 +37,9 @@ from api.forecast.schemas import (
     ForecastCreateRequest,
     ForecastCreateResponse,
     ForecastDetail,
+    ForecastFramingDraft,
+    ForecastFramingDraftRequest,
+    ForecastFramingDraftResponse,
     ForecastOutcome,
     ForecastStatus,
     ForecastSummary,
@@ -47,6 +52,7 @@ from api.forecast.schemas import (
     SourceRecord,
     ToolProfile,
 )
+from api.research.query_policy import contains_sensitive_terms
 from api.research.schemas import CreateResearchRunRequest, ResearchRunOptions, RunStatus
 from api.research.service import ResearchOrchestrator
 
@@ -120,6 +126,57 @@ class ForecastOrchestrator:
             status=ForecastStatus(row["status"]),
             framing_version=row["current_framing_version"],
             created_at=ForecastRepository.forecast_row_to_dict(row)["created_at"],
+        )
+
+    def draft_framing(
+        self,
+        request: ForecastFramingDraftRequest,
+    ) -> ForecastFramingDraftResponse:
+        self._ensure_enabled()
+        _ensure_framing_inputs_are_public(request)
+        model = getattr(self.research.azure, "reviewer_deployment", None)
+        if not model:
+            raise ForecastConflict(
+                "framing_draft_unavailable",
+                "Forecast framing draft generation is not configured.",
+            )
+        prompt = _build_framing_draft_prompt(request)
+        try:
+            parsed, response_id, _raw_response = self.research.azure.parse_structured(
+                model=model,
+                prompt=prompt,
+                text_format=ForecastFramingDraft,
+                tool_profile="synthesis",
+            )
+        except Exception as error:
+            raise ForecastConflict(
+                "framing_draft_unavailable",
+                "Forecast framing draft generation is temporarily unavailable.",
+            ) from error
+
+        try:
+            draft = _coerce_framing_draft(parsed)
+        except (TypeError, ValueError, ValidationError, json.JSONDecodeError) as error:
+            raise ForecastConflict(
+                "framing_draft_invalid_response",
+                "Forecast framing draft generation returned an invalid response.",
+            ) from error
+
+        ready_to_create = _framing_draft_ready_to_create(
+            draft,
+            answers=request.answers,
+        )
+        warnings: list[str] = []
+        if not ready_to_create:
+            warnings.append("required_clarifying_answers_missing")
+        create_payload = _framing_create_payload(draft) if ready_to_create else None
+        return ForecastFramingDraftResponse(
+            draft=draft,
+            create_payload=create_payload,
+            ready_to_create=ready_to_create,
+            model=model,
+            response_id=response_id,
+            warnings=warnings,
         )
 
     def list_forecasts(self) -> list[ForecastSummary]:
@@ -842,6 +899,119 @@ def _scenario_response(row: Any) -> ScenarioRecord:
         probability=None,
         normalized_weight=row["normalized_weight"],
         validity_status=row["validity_status"],
+    )
+
+
+def _ensure_framing_inputs_are_public(request: ForecastFramingDraftRequest) -> None:
+    candidate_text = "\n".join(
+        [
+            request.rough_question,
+            *[answer.answer for answer in request.answers],
+        ]
+    )
+    if contains_sensitive_terms(candidate_text):
+        raise ForecastConflict(
+            "policy_requires_revision",
+            "Revise sensitive or non-public terms before generating a framing draft.",
+        )
+
+
+def _build_framing_draft_prompt(request: ForecastFramingDraftRequest) -> str:
+    locale_instruction = (
+        "Write user-facing draft text in Japanese."
+        if request.locale == "ja"
+        else "Write user-facing draft text in English."
+    )
+    payload = {
+        "rough_question": request.rough_question,
+        "answers": [answer.model_dump(mode="json") for answer in request.answers],
+        "previous_draft": (
+            request.previous_draft.model_dump(mode="json")
+            if request.previous_draft is not None
+            else None
+        ),
+        "locale": request.locale,
+    }
+    return (
+        "You help refine an early forecasting idea into a public Forecast PhaseA "
+        "framing draft. Use only the information in the request; do not browse, "
+        "search, retrieve files, or ask tools. Return exactly one structured "
+        "ForecastFramingDraft.\n\n"
+        f"{locale_instruction}\n\n"
+        "Drafting rules:\n"
+        "- forecast_prompt should be a concise internal prompt that captures the "
+        "forecasting task.\n"
+        "- question must be a clear, resolvable forecast question.\n"
+        "- resolution_criteria must explain how the outcome will be judged.\n"
+        "- resolution_sources should list public source types or named public "
+        "sources when the user provided them.\n"
+        "- outcomes should usually stay binary Yes/No unless the user's framing "
+        "clearly needs mutually exclusive alternatives.\n"
+        "- Ask at most five clarifying questions, only for information needed to "
+        "create a high-quality forecast. Mark essential questions required.\n"
+        "- Do not include private, confidential, or sensitive material.\n\n"
+        "Request JSON:\n"
+        f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
+    )
+
+
+def _coerce_framing_draft(value: Any) -> ForecastFramingDraft:
+    if isinstance(value, ForecastFramingDraft):
+        return value
+    if isinstance(value, str):
+        return ForecastFramingDraft.model_validate_json(_extract_json_object(value))
+    if hasattr(value, "model_dump"):
+        return ForecastFramingDraft.model_validate(value.model_dump(mode="json"))
+    return ForecastFramingDraft.model_validate(value)
+
+
+def _extract_json_object(value: str) -> str:
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("empty structured response")
+    try:
+        json.loads(stripped)
+        return stripped
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        candidate = stripped[start : end + 1]
+        json.loads(candidate)
+        return candidate
+
+
+def _framing_draft_ready_to_create(
+    draft: ForecastFramingDraft,
+    *,
+    answers: list[Any],
+) -> bool:
+    answered_ids = {
+        answer.question_id
+        for answer in answers
+        if getattr(answer, "answer", "").strip()
+    }
+    required_ids = {
+        question.question_id
+        for question in draft.clarifying_questions
+        if question.required
+    }
+    return bool(draft.question and draft.resolution_criteria) and required_ids.issubset(
+        answered_ids
+    )
+
+
+def _framing_create_payload(draft: ForecastFramingDraft) -> ForecastCreateRequest:
+    return ForecastCreateRequest(
+        question=draft.question,
+        target_population=draft.target_population,
+        unit_of_analysis=draft.unit_of_analysis,
+        resolution_criteria=draft.resolution_criteria,
+        resolution_sources=draft.resolution_sources,
+        decision_context=draft.decision_context,
+        confidentiality_class="public",
+        outcomes=draft.outcomes,
     )
 
 

@@ -3,7 +3,14 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "../../App";
-import type { EstimateSetResponse, ForecastDetail } from "../../types";
+import type {
+  EstimateSetResponse,
+  ForecastCreateRequest,
+  ForecastDetail,
+  ForecastFramingDraft,
+  ForecastFramingDraftClarifyingQuestion,
+  ForecastFramingDraftResponse,
+} from "../../types";
 
 Object.defineProperty(window, "scrollTo", { value: vi.fn(), writable: true });
 
@@ -85,6 +92,68 @@ function estimateSet(overrides: Partial<EstimateSetResponse> = {}): EstimateSetR
   };
 }
 
+type FramingDraftOverrides = Partial<
+  Omit<ForecastFramingDraftResponse, "create_payload" | "draft">
+> & {
+  create_payload?: Partial<ForecastCreateRequest> | null;
+  draft?: Partial<ForecastFramingDraft>;
+};
+
+function framingDraft(overrides: FramingDraftOverrides = {}): ForecastFramingDraftResponse {
+  const base: ForecastFramingDraftResponse = {
+    draft: {
+      forecast_prompt: "Forecast whether the product launches.",
+      question: "Will the product launch by Q4?",
+      resolution_criteria: "Official launch announcement.",
+      resolution_sources: ["Official site"],
+      target_population: "Product users",
+      unit_of_analysis: "Product",
+      decision_context: "Roadmap planning",
+      outcomes: ["Yes", "No"],
+      clarifying_questions: [],
+      confidence: 0.82,
+    },
+    create_payload: {
+      question: "Will the product launch by Q4?",
+      resolution_criteria: "Official launch announcement.",
+      resolution_sources: ["Official site"],
+      target_population: "Product users",
+      unit_of_analysis: "Product",
+      decision_context: "Roadmap planning",
+      confidentiality_class: "public",
+      outcomes: ["Yes", "No"],
+    },
+    ready_to_create: true,
+    model: "test-model",
+    response_id: "resp-1",
+    warnings: [],
+  };
+  return {
+    ...base,
+    ...overrides,
+    draft: { ...base.draft, ...overrides.draft },
+    create_payload:
+      overrides.create_payload === null
+        ? null
+        : ({ ...base.create_payload, ...overrides.create_payload } as ForecastCreateRequest),
+  };
+}
+
+function clarifyingQuestion(
+  overrides: Partial<ForecastFramingDraftClarifyingQuestion> = {},
+): ForecastFramingDraftClarifyingQuestion {
+  return {
+    question_id: "deadline",
+    label: "期限",
+    prompt: "期限はいつですか？",
+    why_needed: "Forecastを公開情報で判定できる期限が必要です。",
+    answer_type: "text",
+    required: true,
+    options: [],
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   vi.stubEnv("VITE_API_BASE_URL", "http://localhost:8000");
   localStorage.clear();
@@ -100,11 +169,74 @@ afterEach(() => {
 });
 
 describe("Forecast UI", () => {
-  it("shows a framing preview from getForecast before approving", async () => {
+  it("starts new forecasts with a single rough question input", () => {
+    window.location.hash = "#/forecasts/new";
+    globalThis.fetch = vi.fn();
+
+    render(<App />);
+
+    expect(screen.getByRole("heading", { name: "まずはざっくり教えてください" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: /予測したいこと/ })).toBeInTheDocument();
+    expect(screen.queryByLabelText("問い")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("判定条件")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("結果候補")).not.toBeInTheDocument();
+    expect(screen.getByText("大枠だけ入力")).toBeInTheDocument();
+    expect(screen.getByText("AIが下書き化")).toBeInTheDocument();
+    expect(screen.getByText("不足点だけ確認")).toBeInTheDocument();
+    expect(screen.getByText("保存後に承認")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "AIでForecast案を作成" })).toBeDisabled();
+  });
+
+  it("asks draft clarifying questions before final create and separate approval", async () => {
     window.location.hash = "#/forecasts/new";
     const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       const path = String(url).replace("http://localhost:8000", "");
+      if (path === "/forecasts/framing-drafts" && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        if (!body.previous_draft) {
+          expect(body).toMatchObject({
+            rough_question: "Will the product launch?",
+            locale: "ja",
+          });
+          return jsonResponse(
+            framingDraft({
+              ready_to_create: false,
+              warnings: ["期限を確認してください。"],
+              draft: {
+                clarifying_questions: [
+                  clarifyingQuestion(),
+                  clarifyingQuestion({
+                    question_id: "product",
+                    label: "対象プロダクト",
+                    prompt: "対象プロダクトは何ですか？",
+                    why_needed: "判定対象を固定するために必要です。",
+                  }),
+                ],
+              },
+              create_payload: null,
+            }),
+          );
+        }
+        expect(body.answers).toEqual([
+          { question_id: "deadline", answer: "2026 Q4" },
+          { question_id: "product", answer: "Forecast app" },
+        ]);
+        expect(body.previous_draft).toMatchObject({
+          question: "Will the product launch by Q4?",
+        });
+        return jsonResponse(framingDraft());
+      }
       if (path === "/forecasts" && init?.method === "POST") {
+        expect(JSON.parse(String(init.body))).toMatchObject({
+          question: "Will the Forecast app launch by 2026 Q4?",
+          resolution_criteria: "Official launch announcement.",
+          resolution_sources: ["Official site", "Status page"],
+          target_population: "Product users",
+          unit_of_analysis: "Product",
+          decision_context: "Roadmap planning",
+          confidentiality_class: "public",
+          outcomes: ["Yes", "No"],
+        });
         return jsonResponse({
           forecast_id: "forecast-1",
           status: "framing_pending",
@@ -129,22 +261,97 @@ describe("Forecast UI", () => {
 
     render(<App />);
 
-    expect(screen.getByText("入力の目安")).toBeInTheDocument();
-    expect(screen.getByText(/最大8件まで/)).toBeInTheDocument();
+    expect(screen.getByText("作成の流れ")).toBeInTheDocument();
 
-    await userEvent.type(screen.getByLabelText(/予測したい問い/), "Will the product launch?");
-    await userEvent.type(screen.getByLabelText(/判定条件/), "Official source.");
-    await userEvent.click(screen.getByRole("button", { name: "フレーミングを作成" }));
+    await userEvent.type(
+      screen.getByRole("textbox", { name: /予測したいこと/ }),
+      "Will the product launch?",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "AIでForecast案を作成" }));
 
-    expect(await screen.findByText("フレーミングプレビュー")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "確認したいこと" })).toBeInTheDocument();
+    expect(screen.getByText("期限を確認してください。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Forecastを作成" })).not.toBeInTheDocument();
+
+    await userEvent.type(screen.getByLabelText("期限"), "2026 Q4");
+    await userEvent.type(screen.getByLabelText("対象プロダクト"), "Forecast app");
+    await userEvent.click(screen.getByRole("button", { name: "回答をAIに反映" }));
+
+    expect(await screen.findByRole("heading", { name: "最終確認" })).toBeInTheDocument();
+    const questionInput = screen.getByRole("textbox", { name: /問い/ });
+    await userEvent.clear(questionInput);
+    await userEvent.type(questionInput, "Will the Forecast app launch by 2026 Q4?");
+    const sourcesInput = screen.getByRole("textbox", { name: /判定ソース/ });
+    await userEvent.clear(sourcesInput);
+    await userEvent.type(sourcesInput, "Official site\n\nStatus page");
+    await userEvent.click(screen.getByRole("button", { name: "Forecastを作成" }));
+
+    expect(await screen.findByRole("heading", { name: "保存済みプレビュー" })).toBeInTheDocument();
     expect(screen.getByText("Will the product launch by Q4?")).toBeInTheDocument();
-    expect(screen.getByText("Official launch announcement.")).toBeInTheDocument();
-    expect(screen.getByText("Yes")).toBeInTheDocument();
-    expect(screen.getByText("No")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "この内容で承認" })).toBeEnabled();
 
     await userEvent.click(screen.getByRole("button", { name: "この内容で承認" }));
     await waitFor(() => expect(window.location.hash).toBe("#/forecasts/forecast-1"));
+  });
+
+  it("preserves rough input when draft creation fails", async () => {
+    window.location.hash = "#/forecasts/new";
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const path = String(url).replace("http://localhost:8000", "");
+      if (path === "/forecasts/framing-drafts" && init?.method === "POST") {
+        return jsonResponse({ detail: "Draft model unavailable." }, 503);
+      }
+      return jsonResponse({ detail: "unexpected request" }, 500);
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    const roughInput = screen.getByRole("textbox", { name: /予測したいこと/ });
+    await userEvent.type(roughInput, "Keep this rough idea");
+    await userEvent.click(screen.getByRole("button", { name: "AIでForecast案を作成" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Draft model unavailable.");
+    expect(screen.getByRole("textbox", { name: /予測したいこと/ })).toHaveValue(
+      "Keep this rough idea",
+    );
+  });
+
+  it("offers retry and manual final edit when a draft is not ready without questions", async () => {
+    window.location.hash = "#/forecasts/new";
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const path = String(url).replace("http://localhost:8000", "");
+      if (path === "/forecasts/framing-drafts" && init?.method === "POST") {
+        return jsonResponse(
+          framingDraft({
+            ready_to_create: false,
+            warnings: ["公開情報で判定できる期限が不足しています。"],
+            draft: { clarifying_questions: [] },
+            create_payload: null,
+          }),
+        );
+      }
+      return jsonResponse({ detail: "unexpected request" }, 500);
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.type(
+      screen.getByRole("textbox", { name: /予測したいこと/ }),
+      "Maybe launch?",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "AIでForecast案を作成" }));
+
+    expect(await screen.findByRole("heading", { name: "大枠を調整" })).toBeInTheDocument();
+    expect(screen.getByText("公開情報で判定できる期限が不足しています。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Forecastを作成" })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "最終編集を開く" }));
+
+    expect(await screen.findByRole("heading", { name: "最終確認" })).toBeInTheDocument();
+    expect(screen.getByText(/まだ作成準備が完了していません/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Forecastを作成" })).not.toBeInTheDocument();
   });
 
   it("renders typed 409 code, message and details on forecast commands", async () => {

@@ -14,6 +14,7 @@ from api.forecast.artifacts import ForecastArtifactStore
 from api.forecast.dependencies import get_forecast_orchestrator
 from api.forecast.probability.phase_a_v1 import compute_phase_a_estimates
 from api.forecast.repository import ForecastRepository
+from api.forecast.schemas import ForecastFramingDraftRequest
 from api.forecast.service import ForecastOrchestrator
 from api.main import create_app
 from api.research.artifacts import ArtifactStore
@@ -66,6 +67,285 @@ def _request_hash(payload: object) -> str:
             default=str,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _framing_draft_payload(
+    *,
+    clarifying_questions: list[dict[str, Any]] | None = None,
+    confidence: float = 0.82,
+) -> dict[str, Any]:
+    return {
+        "forecast_prompt": "Forecast whether AI agents will handle support tickets.",
+        "question": "Will AI agents handle at least 30% of support tickets by 2029?",
+        "resolution_criteria": (
+            "Resolve Yes if public benchmark or vendor reports show AI agents "
+            "handling at least 30% of support tickets by 2029; otherwise No."
+        ),
+        "resolution_sources": ["Public vendor reports", "Independent benchmark reports"],
+        "target_population": "Customer support teams using AI agents",
+        "unit_of_analysis": "Share of support tickets handled end-to-end",
+        "decision_context": "Plan support automation roadmap.",
+        "outcomes": ["Yes", "No"],
+        "clarifying_questions": clarifying_questions or [],
+        "confidence": confidence,
+    }
+
+
+@pytest.mark.anyio
+async def test_framing_draft_route_order_and_happy_draft(tmp_path: Path) -> None:
+    fake = IntegrationFakeAzure(structured_parse_results=[_framing_draft_payload()])
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/forecasts/framing-drafts",
+            json={
+                "rough_question": (
+                    "AI agents might handle 30% of support tickets by 2029."
+                ),
+                "locale": "en",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["draft"]["question"].startswith("Will AI agents")
+    assert body["ready_to_create"] is True
+    assert body["create_payload"]["question"] == body["draft"]["question"]
+    assert body["model"] == fake.reviewer_deployment
+    assert body["response_id"] == "resp_structured_1"
+    assert fake.structured_parse_calls[0]["tool_profile"] == "synthesis"
+    assert fake.structured_parse_calls[0]["policy_decision_id"] is None
+    assert fake.structured_parse_calls[0]["vector_store_ids"] is None
+
+
+@pytest.mark.anyio
+async def test_framing_draft_answers_can_make_required_questions_ready(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure(
+        structured_parse_results=[
+            _framing_draft_payload(
+                clarifying_questions=[
+                    {
+                        "question_id": "deadline",
+                        "label": "Resolution deadline",
+                        "prompt": "What date should the forecast resolve against?",
+                        "why_needed": "The forecast needs a concrete horizon.",
+                        "answer_type": "date",
+                        "required": True,
+                        "options": [],
+                    }
+                ],
+                confidence=0.64,
+            )
+        ]
+    )
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/forecasts/framing-drafts",
+            json={
+                "rough_question": "Will AI agents handle many support tickets?",
+                "answers": [
+                    {
+                        "question_id": "deadline",
+                        "answer": "Resolve against public data available by 2029-12-31.",
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready_to_create"] is True
+    assert body["warnings"] == []
+    assert body["create_payload"]["outcomes"] == ["Yes", "No"]
+
+
+@pytest.mark.anyio
+async def test_framing_draft_blocks_sensitive_inputs_before_llm(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/forecasts/framing-drafts",
+            json={
+                "rough_question": "Will internal project codename Phoenix launch?",
+                "answers": [{"question_id": "scope", "answer": "Public customers"}],
+            },
+        )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert _typed_code(body) == "policy_requires_revision"
+    assert "Phoenix" not in json.dumps(body)
+    assert fake.structured_parse_calls == []
+
+
+@pytest.mark.anyio
+async def test_framing_draft_idempotency_replays_conflicts_and_in_progress(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure(structured_parse_results=[_framing_draft_payload()])
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        payload = {
+            "rough_question": "Will idempotent framing draft requests replay?",
+            "locale": "en",
+        }
+        first = await client.post(
+            "/forecasts/framing-drafts",
+            headers={"Idempotency-Key": "framing-replay"},
+            json=payload,
+        )
+        replay = await client.post(
+            "/forecasts/framing-drafts",
+            headers={"Idempotency-Key": "framing-replay"},
+            json=payload,
+        )
+        conflict = await client.post(
+            "/forecasts/framing-drafts",
+            headers={"Idempotency-Key": "framing-replay"},
+            json={**payload, "rough_question": "Different framing question"},
+        )
+
+        in_progress_request = ForecastFramingDraftRequest(
+            rough_question="Will in-progress framing idempotency block duplicates?"
+        )
+        existing = forecast.repository.reserve_idempotency_record(
+            command_scope="forecast:framing_draft",
+            resource_id="",
+            idempotency_key="framing-in-progress",
+            request_hash=_request_hash(in_progress_request.model_dump(mode="json")),
+        )
+        assert existing is None
+        duplicate = await client.post(
+            "/forecasts/framing-drafts",
+            headers={"Idempotency-Key": "framing-in-progress"},
+            json={"rough_question": in_progress_request.rough_question},
+        )
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json()["response_id"] == first.json()["response_id"]
+    assert len(fake.structured_parse_calls) == 1
+    assert conflict.status_code == 409
+    assert _typed_code(conflict.json()) == "idempotency_conflict"
+    assert duplicate.status_code == 409
+    assert _typed_code(duplicate.json()) == "idempotency_in_progress"
+
+
+@pytest.mark.anyio
+async def test_framing_draft_parse_text_fallback_and_invalid_response(
+    tmp_path: Path,
+) -> None:
+    fallback_fake = IntegrationFakeAzure(
+        structured_parse_results=[
+            "Here is the draft JSON:\n"
+            + json.dumps(_framing_draft_payload(), ensure_ascii=False)
+        ]
+    )
+    fallback_forecast, fallback_research = _make_orchestrators(tmp_path / "ok", fallback_fake)
+    fallback_app = create_app()
+    fallback_app.dependency_overrides[get_forecast_orchestrator] = (
+        lambda: fallback_forecast
+    )
+    fallback_app.dependency_overrides[get_research_orchestrator] = (
+        lambda: fallback_research
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=fallback_app),
+        base_url="http://testserver",
+    ) as client:
+        fallback = await client.post(
+            "/forecasts/framing-drafts",
+            json={"rough_question": "Will fallback JSON parse correctly?"},
+        )
+
+    invalid_fake = IntegrationFakeAzure(
+        structured_parse_results=['{"forecast_prompt": "missing required fields"}']
+    )
+    invalid_forecast, invalid_research = _make_orchestrators(
+        tmp_path / "invalid",
+        invalid_fake,
+    )
+    invalid_app = create_app()
+    invalid_app.dependency_overrides[get_forecast_orchestrator] = (
+        lambda: invalid_forecast
+    )
+    invalid_app.dependency_overrides[get_research_orchestrator] = (
+        lambda: invalid_research
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=invalid_app),
+        base_url="http://testserver",
+    ) as client:
+        invalid = await client.post(
+            "/forecasts/framing-drafts",
+            json={"rough_question": "Will invalid JSON schema return a typed error?"},
+        )
+
+    assert fallback.status_code == 200
+    assert fallback.json()["draft"]["confidence"] == 0.82
+    assert invalid.status_code == 502
+    assert _typed_code(invalid.json()) == "framing_draft_invalid_response"
+
+
+@pytest.mark.anyio
+async def test_framing_draft_runtime_failure_returns_unavailable(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure(
+        structured_parse_raises=RuntimeError("reviewer unavailable")
+    )
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/forecasts/framing-drafts",
+            json={"rough_question": "Will unavailable reviewer return 503?"},
+        )
+
+    assert response.status_code == 503
+    assert _typed_code(response.json()) == "framing_draft_unavailable"
 
 
 @pytest.mark.anyio

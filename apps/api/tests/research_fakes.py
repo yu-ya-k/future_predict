@@ -82,6 +82,8 @@ class IntegrationFakeAzure:
         review_next_instructions: str | None = None,
         submit_raises: Exception | None = None,
         retrieve_raises: Exception | None = None,
+        structured_parse_results: list[Any] | None = None,
+        structured_parse_raises: Exception | None = None,
     ) -> None:
         self.retrieve_statuses = retrieve_statuses or ["completed"]
         self.verdicts = verdicts or [Verdict.PASS]
@@ -95,9 +97,12 @@ class IntegrationFakeAzure:
         self.review_next_instructions = review_next_instructions
         self.submit_raises = submit_raises
         self.retrieve_raises = retrieve_raises
+        self.structured_parse_results = structured_parse_results or []
+        self.structured_parse_raises = structured_parse_raises
         self.submit_calls: list[dict[str, object]] = []
         self.retrieve_calls: list[str] = []
         self.review_calls: list[dict[str, Any]] = []
+        self.structured_parse_calls: list[dict[str, Any]] = []
         self.llm_finalize_prompts: list[str] = []
         self.verify_prompts: list[str] = []
         self.cancelled: list[str] = []
@@ -214,6 +219,52 @@ class IntegrationFakeAzure:
                 public_web_search_used=False,
                 route_rationale=f"route {verdict.value}",
             ),
+            response_id,
+            {"id": response_id, "status": "completed", "usage": self.review_usage},
+        )
+
+    def parse_structured(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        text_format: Any,
+        tool_profile: str,
+        policy_decision_id: str | None = None,
+        vector_store_ids: list[str] | None = None,
+    ) -> tuple[Any, str, dict[str, object]]:
+        if self.structured_parse_raises is not None:
+            raise self.structured_parse_raises
+
+        self.structured_parse_calls.append(
+            {
+                "model": model,
+                "prompt": prompt,
+                "text_format": text_format,
+                "tool_profile": tool_profile,
+                "policy_decision_id": policy_decision_id,
+                "vector_store_ids": vector_store_ids,
+            }
+        )
+        result_index = min(
+            len(self.structured_parse_calls) - 1,
+            max(0, len(self.structured_parse_results) - 1),
+        )
+        if self.structured_parse_results:
+            parsed = self.structured_parse_results[result_index]
+        else:
+            parsed = {
+                "forecast_prompt": "Will the forecasted event occur?",
+                "question": "Will the forecasted event occur?",
+                "resolution_criteria": "Resolve from public sources.",
+                "resolution_sources": ["Public sources"],
+                "outcomes": ["Yes", "No"],
+                "clarifying_questions": [],
+                "confidence": 0.8,
+            }
+        response_id = f"resp_structured_{len(self.structured_parse_calls)}"
+        return (
+            parsed,
             response_id,
             {"id": response_id, "status": "completed", "usage": self.review_usage},
         )

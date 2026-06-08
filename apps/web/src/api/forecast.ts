@@ -6,6 +6,8 @@ import type {
   ForecastCreateRequest,
   ForecastCreateResponse,
   ForecastDetail,
+  ForecastFramingDraftRequest,
+  ForecastFramingDraftResponse,
   ForecastReviewRequest,
   ForecastReviewResponse,
   ForecastSummary,
@@ -53,6 +55,19 @@ export function createForecast(
     body: request,
     signal: options.signal,
     idempotencyKey: commandKey("forecast-create", options),
+  });
+}
+
+export function createForecastFramingDraft(
+  request: ForecastFramingDraftRequest,
+  input?: AbortSignal | ForecastCommandOptions,
+): Promise<ForecastFramingDraftResponse> {
+  const options = optionsFrom(input);
+  return apiClient.request(`${BASE}/framing-drafts`, {
+    method: "POST",
+    body: request,
+    signal: options.signal,
+    idempotencyKey: commandKey("forecast-framing-draft", options),
   });
 }
 

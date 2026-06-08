@@ -624,6 +624,50 @@ export interface ForecastCreateResponse {
   created_at: string;
 }
 
+export interface ForecastFramingDraft {
+  forecast_prompt: string;
+  question: string;
+  resolution_criteria: string;
+  resolution_sources: string[];
+  target_population?: string | null;
+  unit_of_analysis?: string | null;
+  decision_context?: string | null;
+  outcomes: string[];
+  clarifying_questions: ForecastFramingDraftClarifyingQuestion[];
+  confidence: number;
+}
+
+export interface ForecastFramingDraftClarifyingQuestion {
+  question_id: string;
+  label: string;
+  prompt: string;
+  why_needed: string;
+  answer_type: "text" | "single_select" | "multi_select" | "number" | "date" | "boolean";
+  required: boolean;
+  options: string[];
+}
+
+export interface ForecastFramingDraftAnswer {
+  question_id: string;
+  answer: string;
+}
+
+export interface ForecastFramingDraftRequest {
+  rough_question: string;
+  answers?: ForecastFramingDraftAnswer[];
+  previous_draft?: ForecastFramingDraft | null;
+  locale?: "ja" | "en";
+}
+
+export interface ForecastFramingDraftResponse {
+  draft: ForecastFramingDraft;
+  create_payload?: ForecastCreateRequest | null;
+  ready_to_create: boolean;
+  model: string;
+  response_id?: string | null;
+  warnings: string[];
+}
+
 export interface ForecastReviewRequest {
   action: "approve_framing" | "approve_phase_a_version" | "approve_claim_target_links";
   comment?: string | null;

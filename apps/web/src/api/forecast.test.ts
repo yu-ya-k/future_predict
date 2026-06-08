@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createForecast, dispatchCurrentStatePack, getForecastEstimateSet } from "./forecast";
+import {
+  createForecast,
+  createForecastFramingDraft,
+  dispatchCurrentStatePack,
+  getForecastEstimateSet,
+} from "./forecast";
 
 function jsonResponse(data: unknown, status = 200): Response {
   return {
@@ -94,6 +99,70 @@ describe("forecast API client", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "http://localhost:8000/forecasts/forecast-1/estimate-set",
       expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("creates forecast framing drafts", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      jsonResponse({
+        draft: {
+          forecast_prompt: "Forecast prompt",
+          question: "Will this ship by Q4?",
+          resolution_criteria: "Official announcement.",
+          resolution_sources: ["Official site"],
+          target_population: null,
+          unit_of_analysis: null,
+          decision_context: null,
+          outcomes: ["Yes", "No"],
+          clarifying_questions: [
+            {
+              question_id: "deadline",
+              label: "Deadline",
+              prompt: "What is the deadline?",
+              why_needed: "A deadline is required.",
+              answer_type: "text",
+              required: true,
+              options: [],
+            },
+          ],
+          confidence: 0.7,
+        },
+        create_payload: {
+          question: "Will this ship by Q4?",
+          resolution_criteria: "Official announcement.",
+          resolution_sources: ["Official site"],
+          outcomes: ["Yes", "No"],
+          confidentiality_class: "public",
+        },
+        ready_to_create: false,
+        model: "test-model",
+        response_id: "resp-1",
+        warnings: ["Need deadline."],
+      }),
+    );
+    globalThis.fetch = fetchMock;
+
+    await expect(
+      createForecastFramingDraft({
+        rough_question: "Ship this?",
+        answers: [{ question_id: "deadline", answer: "Q4" }],
+        locale: "ja",
+      }),
+    ).resolves.toMatchObject({
+      ready_to_create: false,
+      draft: { clarifying_questions: [{ question_id: "deadline" }] },
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:8000/forecasts/framing-drafts",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          rough_question: "Ship this?",
+          answers: [{ question_id: "deadline", answer: "Q4" }],
+          locale: "ja",
+        }),
+      }),
     );
   });
 });

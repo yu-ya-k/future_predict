@@ -21,6 +21,8 @@ from api.forecast.schemas import (
     ForecastCreateRequest,
     ForecastCreateResponse,
     ForecastDetail,
+    ForecastFramingDraftRequest,
+    ForecastFramingDraftResponse,
     ForecastReviewRequest,
     ForecastReviewResponse,
     ForecastSummary,
@@ -75,6 +77,29 @@ def create_forecast(
         )
     except ForecastConflict as error:
         raise forecast_http_error(error) from error
+
+
+@router.post("/framing-drafts", response_model=ForecastFramingDraftResponse)
+def create_framing_draft(
+    request: ForecastFramingDraftRequest,
+    orchestrator: ForecastDependency,
+    idempotency_key: IdempotencyKeyHeader = None,
+) -> ForecastFramingDraftResponse:
+    try:
+        return _run_idempotent(
+            orchestrator,
+            scope="forecast:framing_draft",
+            resource_id="",
+            idempotency_key=_normalize_idempotency_key(idempotency_key),
+            payload=request.model_dump(mode="json"),
+            action=lambda: orchestrator.draft_framing(request),
+        )
+    except ForecastConflict as error:
+        error_status = {
+            "framing_draft_unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
+            "framing_draft_invalid_response": status.HTTP_502_BAD_GATEWAY,
+        }.get(error.code, status.HTTP_409_CONFLICT)
+        raise forecast_http_error(error, status_code=error_status) from error
 
 
 @router.get("/{forecast_id}", response_model=ForecastDetail)
