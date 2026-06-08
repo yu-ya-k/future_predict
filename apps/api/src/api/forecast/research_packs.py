@@ -46,7 +46,7 @@ Resolution criteria:
 Resolution sources:
 {sources or "- Not specified."}
 
-Outcomes:
+Resolution outcome metadata:
 {outcomes}
 
 Pack role: {PackRole.CURRENT_STATE.value}

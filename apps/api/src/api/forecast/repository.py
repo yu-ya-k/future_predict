@@ -517,7 +517,10 @@ class ForecastRepository:
         now = utc_now().isoformat()
         forecast_id = uuid4()
         normalization_group_id = f"ng-{forecast_id}"
-        labels = outcome_labels or ["Yes", "No"]
+        labels = [label.strip() for label in outcome_labels if label.strip()] or [
+            "Yes",
+            "No",
+        ]
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(

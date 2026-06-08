@@ -79,6 +79,11 @@ class ForecastCreateRequest(BaseModel):
         "original_execution_prompt", mode="after"
     )(_reject_blank_string)
 
+    @field_validator("outcomes", mode="after")
+    @classmethod
+    def _strip_outcomes(cls, value: list[str]) -> list[str]:
+        return [label.strip() for label in value if label.strip()]
+
 
 class ForecastCreateResponse(BaseModel):
     forecast_id: UUID
@@ -163,11 +168,13 @@ class ForecastFramingDraft(BaseModel):
         description="Extracted metadata; null when the user has not provided it.",
     )
     outcomes: list[str] = Field(
-        default_factory=lambda: ["Yes", "No"],
+        default_factory=list,
         max_length=8,
         description=(
-            "Outcome labels extracted from explicit user input; otherwise keep "
-            "the default Yes/No labels."
+            "Resolution outcome labels / 解決時の結果状態 extracted from explicit "
+            "user input. These are the possible states selected when the forecast "
+            "is resolved, not the model's final Yes/No judgment; leave empty when "
+            "not provided."
         ),
     )
     clarifying_questions: list[ForecastFramingDraftClarifyingQuestion] = Field(
@@ -184,9 +191,8 @@ class ForecastFramingDraft(BaseModel):
 
     @field_validator("outcomes", mode="after")
     @classmethod
-    def _default_outcomes(cls, value: list[str]) -> list[str]:
-        labels = [label.strip() for label in value if label.strip()]
-        return labels or ["Yes", "No"]
+    def _strip_outcomes(cls, value: list[str]) -> list[str]:
+        return [label.strip() for label in value if label.strip()]
 
 
 class ForecastFramingDraftAnswer(BaseModel):

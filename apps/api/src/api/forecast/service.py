@@ -266,6 +266,7 @@ class ForecastOrchestrator:
     ) -> ResearchPackResponse:
         forecast = self.get_forecast(forecast_id)
         self._ensure_mutable(forecast)
+        _ensure_forecast_has_outcomes(forecast)
         if forecast.approved_framing_version != forecast.current_framing_version:
             raise ForecastConflict(
                 "framing_not_approved",
@@ -356,6 +357,7 @@ class ForecastOrchestrator:
     def extract_evidence(self, forecast_id: UUID) -> tuple[list[SourceRecord], list[ClaimRecord]]:
         forecast = self.get_forecast(forecast_id)
         self._ensure_mutable(forecast)
+        _ensure_forecast_has_outcomes(forecast)
         if forecast.status not in {ForecastStatus.PACK_RUNNING, ForecastStatus.EVIDENCE_READY}:
             raise ForecastConflict(
                 "pack_not_completed",
@@ -451,6 +453,7 @@ class ForecastOrchestrator:
     def generate_scenarios(self, forecast_id: UUID) -> list[ScenarioRecord]:
         forecast = self.get_forecast(forecast_id)
         self._ensure_mutable(forecast)
+        _ensure_forecast_has_outcomes(forecast)
         if forecast.status not in {ForecastStatus.EVIDENCE_READY, ForecastStatus.SCENARIOS_READY}:
             raise ForecastConflict(
                 "evidence_not_ready",
@@ -481,6 +484,7 @@ class ForecastOrchestrator:
     def compute_probabilities(self, forecast_id: UUID) -> dict[str, Any]:
         forecast = self.get_forecast(forecast_id)
         self._ensure_mutable(forecast)
+        _ensure_forecast_has_outcomes(forecast)
         if not self.repository.get_claims(forecast.forecast_id):
             raise ForecastConflict("evidence_not_ready", "Extract evidence first.")
         if not self.repository.get_scenarios(forecast.forecast_id):
@@ -953,14 +957,21 @@ def _build_framing_draft_prompt(request: ForecastFramingDraftRequest) -> str:
         "- Extract resolution_criteria, resolution_sources, target_population, "
         "unit_of_analysis, decision_context, and outcomes only from explicit "
         "request information, answers, or previous_draft context.\n"
+        "- outcomes are resolution outcome labels / 解決時の結果状態: the possible "
+        "states selected when the forecast is resolved. They are not the model's "
+        "final Yes/No judgment or prediction.\n"
+        "- Do not convert the original prompt into a binary Yes/No forecast, do "
+        "not ask the user for a final Yes/No answer, and do not use default "
+        "Yes/No outcomes unless the user explicitly provided those labels.\n"
+        "- If explicit resolution outcome labels or an outcome axis are present, "
+        "extract them. Otherwise leave outcomes empty and ask a required "
+        "clarifying question about the resolution outcome labels or axis.\n"
         "- Do not invent missing metadata. If required metadata is missing, leave "
         "string fields empty, nullable fields null, and list fields empty; ask for "
         "the missing metadata in clarifying_questions instead of filling fields "
         "with assumptions.\n"
         "- Ask at most five clarifying questions and ask only for missing metadata "
         "needed to create the forecast. Mark essential questions required.\n"
-        "- Keep default binary outcomes Yes/No unless the user explicitly provides "
-        "mutually exclusive alternatives.\n"
         "- Do not include private, confidential, or sensitive material.\n\n"
         "Request JSON:\n"
         f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
@@ -1010,9 +1021,18 @@ def _framing_draft_ready_to_create(
         if question.required
     }
     has_required_metadata = bool(
-        draft.question.strip() and draft.resolution_criteria.strip()
+        draft.question.strip() and draft.resolution_criteria.strip() and draft.outcomes
     )
     return has_required_metadata and required_ids.issubset(answered_ids)
+
+
+def _ensure_forecast_has_outcomes(forecast: ForecastDetail) -> None:
+    if forecast.outcomes:
+        return
+    raise ForecastConflict(
+        "forecast_outcomes_required",
+        "Forecast PhaseA requires at least one resolution outcome state.",
+    )
 
 
 def _framing_create_payload(

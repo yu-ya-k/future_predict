@@ -40,7 +40,7 @@ function formatValidationIssues(issues: ValidationIssue[]): string | null {
   if (roughQuestionTooLong) {
     return `入力が長すぎます。予測したいことは${maxLengthFrom(roughQuestionTooLong).toLocaleString(
       "ja-JP",
-    )}文字以内にしてください。長い資料やプロンプトは、Forecastに必要な前提や判定条件に絞って貼り付けてください。`;
+    )}文字以内にしてください。長い資料やプロンプトは、Forecastに必要な前提や解決条件に絞って貼り付けてください。`;
   }
 
   return issues

@@ -83,19 +83,23 @@ def _framing_draft_payload(
     *,
     clarifying_questions: list[dict[str, Any]] | None = None,
     confidence: float = 0.82,
+    outcomes: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "forecast_prompt": "Forecast whether AI agents will handle support tickets.",
         "question": "Will AI agents handle at least 30% of support tickets by 2029?",
         "resolution_criteria": (
-            "Resolve Yes if public benchmark or vendor reports show AI agents "
-            "handling at least 30% of support tickets by 2029; otherwise No."
+            "Resolve as milestone reached if public benchmark or vendor reports "
+            "show AI agents handling at least 30% of support tickets by 2029; "
+            "otherwise resolve as milestone not reached."
         ),
         "resolution_sources": ["Public vendor reports", "Independent benchmark reports"],
         "target_population": "Customer support teams using AI agents",
         "unit_of_analysis": "Share of support tickets handled end-to-end",
         "decision_context": "Plan support automation roadmap.",
-        "outcomes": ["Yes", "No"],
+        "outcomes": outcomes
+        if outcomes is not None
+        else ["Milestone reached", "Milestone not reached"],
         "clarifying_questions": clarifying_questions or [],
         "confidence": confidence,
     }
@@ -124,7 +128,13 @@ def test_framing_draft_prompt_extracts_metadata_without_rewriting() -> None:
     assert "string fields empty, nullable fields null, and list fields empty" in prompt
     assert "clarifying_questions instead of filling fields with assumptions" in prompt
     assert "ask only for missing metadata" in prompt
+    assert "outcomes are resolution outcome labels / 解決時の結果状態" in prompt
+    assert "not the model's final Yes/No judgment" in prompt
+    assert "Do not convert the original prompt into a binary Yes/No forecast" in prompt
+    assert "do not ask the user for a final Yes/No answer" in prompt
+    assert "leave outcomes empty and ask a required clarifying question" in prompt
     assert "replace, rewrite, refine, summarize, normalize, translate" in prompt
+    assert "Keep default binary outcomes Yes/No" not in prompt
     assert "You help refine" not in prompt
     assert "clear, resolvable forecast question" not in prompt
 
@@ -178,6 +188,34 @@ def test_framing_draft_schema_marks_question_metadata_and_prompt_ui_only() -> No
     assert "minLength" not in resolution_criteria_schema
     assert "leave empty when not provided" in resolution_criteria_schema["description"]
 
+    outcomes_schema = properties["outcomes"]
+    assert outcomes_schema["description"].startswith(
+        "Resolution outcome labels / 解決時の結果状態"
+    )
+    assert "not the model's final Yes/No judgment" in outcomes_schema["description"]
+    assert "default" not in outcomes_schema
+    assert ForecastFramingDraft(
+        forecast_prompt="UI helper",
+        question="Will public EV charging uptime exceed 99% in Japan?",
+        resolution_criteria="Resolve from public regulator reports.",
+        outcomes=[],
+        confidence=0.5,
+    ).outcomes == []
+    assert ForecastFramingDraft(
+        forecast_prompt="UI helper",
+        question="Will public EV charging uptime exceed 99% in Japan?",
+        resolution_criteria="Resolve from public regulator reports.",
+        outcomes=[" Milestone reached ", " ", "\nMilestone missed"],
+        confidence=0.5,
+    ).outcomes == ["Milestone reached", "Milestone missed"]
+    assert ForecastFramingDraft(
+        forecast_prompt="UI helper",
+        question="Will public EV charging uptime exceed 99% in Japan?",
+        resolution_criteria="Resolve from public regulator reports.",
+        outcomes=[" ", "\n"],
+        confidence=0.5,
+    ).outcomes == []
+
 
 def test_forecast_create_idempotency_payload_omits_absent_original_prompt() -> None:
     request = ForecastCreateRequest(
@@ -227,8 +265,14 @@ async def test_framing_draft_route_order_and_happy_draft(tmp_path: Path) -> None
     assert response.status_code == 200
     body = response.json()
     assert body["draft"]["question"].startswith("Will AI agents")
+    assert body["draft"]["outcomes"] == ["Milestone reached", "Milestone not reached"]
     assert body["ready_to_create"] is True
     assert body["create_payload"]["question"] == body["draft"]["question"]
+    assert body["create_payload"]["outcomes"] == [
+        "Milestone reached",
+        "Milestone not reached",
+    ]
+    assert body["create_payload"]["outcomes"] != ["Yes", "No"]
     assert body["model"] == fake.reviewer_deployment
     assert body["response_id"] == "resp_structured_1"
     assert fake.structured_parse_calls[0]["tool_profile"] == "synthesis"
@@ -277,6 +321,61 @@ async def test_framing_draft_empty_resolution_criteria_needs_clarification(
         "resolution_criteria"
     )
     assert body["draft"]["clarifying_questions"][0]["required"] is True
+    assert body["ready_to_create"] is False
+    assert body["create_payload"] is None
+    assert body["warnings"] == ["required_clarifying_answers_missing"]
+
+
+@pytest.mark.anyio
+async def test_framing_draft_empty_outcomes_needs_resolution_axis(
+    tmp_path: Path,
+) -> None:
+    payload = _framing_draft_payload(
+        clarifying_questions=[
+            {
+                "question_id": "outcomes",
+                "label": "Resolution outcome labels",
+                "prompt": (
+                    "What mutually exclusive outcome labels should be selected at "
+                    "resolution time?"
+                ),
+                "why_needed": (
+                    "The forecast cannot be created without explicit resolution "
+                    "outcome labels."
+                ),
+                "answer_type": "text",
+                "required": True,
+                "options": [],
+            }
+        ],
+        confidence=0.51,
+    )
+    payload["outcomes"] = []
+    fake = IntegrationFakeAzure(structured_parse_results=[payload])
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/forecasts/framing-drafts",
+            json={
+                "rough_question": (
+                    "Assess support automation adoption by 2029 without imposing a "
+                    "binary final answer."
+                ),
+                "locale": "en",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["draft"]["outcomes"] == []
+    assert body["draft"]["clarifying_questions"][0]["question_id"] == "outcomes"
     assert body["ready_to_create"] is False
     assert body["create_payload"] is None
     assert body["warnings"] == ["required_clarifying_answers_missing"]
@@ -355,7 +454,10 @@ async def test_framing_draft_answers_can_make_required_questions_ready(
     body = response.json()
     assert body["ready_to_create"] is True
     assert body["warnings"] == []
-    assert body["create_payload"]["outcomes"] == ["Yes", "No"]
+    assert body["create_payload"]["outcomes"] == [
+        "Milestone reached",
+        "Milestone not reached",
+    ]
 
 
 @pytest.mark.anyio
@@ -578,6 +680,8 @@ async def test_forecast_preserves_original_execution_prompt_for_research_pack(
 
     submitted_prompt = str(fake.submit_calls[-1]["prompt"])
     assert f"Primary execution prompt:\n{original_prompt}" in submitted_prompt
+    assert "\nResolution outcome metadata:\n" in submitted_prompt
+    assert "\nOutcomes:\n" not in submitted_prompt
     assert "- Forecast question: Will AI agents handle 30% of support tickets by 2029?" in (
         submitted_prompt
     )
@@ -608,6 +712,107 @@ async def test_forecast_create_rejects_blank_original_execution_prompt(
         )
 
     assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_forecast_create_without_outcomes_uses_legacy_binary_fallback(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will legacy direct create still receive binary outcomes?",
+                "resolution_criteria": "Resolve from public evidence.",
+            },
+        )
+        assert create.status_code == 202
+        detail = await client.get(f"/forecasts/{create.json()['forecast_id']}")
+
+    assert detail.status_code == 200
+    assert [outcome["label"] for outcome in detail.json()["outcomes"]] == ["Yes", "No"]
+
+
+@pytest.mark.anyio
+async def test_forecast_create_blank_outcomes_uses_legacy_binary_fallback(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will blank outcome labels be normalized?",
+                "resolution_criteria": "Resolve from public evidence.",
+                "outcomes": ["  ", "\n"],
+            },
+        )
+        assert create.status_code == 202
+        detail = await client.get(f"/forecasts/{create.json()['forecast_id']}")
+
+    assert detail.status_code == 200
+    assert [outcome["label"] for outcome in detail.json()["outcomes"]] == ["Yes", "No"]
+
+
+@pytest.mark.anyio
+async def test_research_pack_blocks_legacy_forecast_without_outcomes(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will a legacy empty-outcome forecast be blocked?",
+                "resolution_criteria": "Resolve from public evidence.",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+        assert create.status_code == 202
+        forecast_id = create.json()["forecast_id"]
+        approve = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={"action": "approve_framing"},
+        )
+        assert approve.status_code == 200
+        with forecast.repository.connect() as connection:
+            connection.execute(
+                "DELETE FROM forecast_outcomes WHERE forecast_id = ?",
+                (forecast_id,),
+            )
+        pack = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={"pack_role": "current_state", "tool_profile": "public"},
+        )
+
+    assert pack.status_code == 409
+    assert _typed_code(pack.json()) == "forecast_outcomes_required"
+    assert fake.submit_calls == []
 
 
 @pytest.mark.anyio
@@ -708,6 +913,8 @@ async def test_research_pack_prompt_falls_back_to_metadata_for_old_forecasts(
         in submitted_prompt
     )
     assert "Original execution prompt was not stored for this forecast" in submitted_prompt
+    assert "\nResolution outcome metadata:\n" in submitted_prompt
+    assert "\nOutcomes:\n" not in submitted_prompt
     assert (
         "- Forecast question: Will robotics firms ship one million humanoids by 2030?"
         in submitted_prompt
@@ -793,11 +1000,10 @@ async def test_repository_migrates_old_forecast_rows_without_original_prompt(
             f"/forecasts/{forecast_id}/research-packs",
             json={"pack_role": "current_state", "tool_profile": "public"},
         )
-        assert pack.status_code == 200
+        assert pack.status_code == 409
 
-    submitted_prompt = str(fake.submit_calls[-1]["prompt"])
-    assert "Original execution prompt was not stored for this forecast" in submitted_prompt
-    assert "Will old forecasts keep working after migration?" in submitted_prompt
+    assert _typed_code(pack.json()) == "forecast_outcomes_required"
+    assert fake.submit_calls == []
 
 
 @pytest.mark.anyio

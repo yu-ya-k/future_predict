@@ -28,6 +28,9 @@ type State =
   | "approving"
   | "detail";
 
+type ForecastFlowStatus = "done" | "active" | "pending";
+type ForecastFlowTone = "brief" | "research" | "review" | "finalize";
+
 interface FinalFields {
   question: string;
   resolutionCriteria: string;
@@ -58,15 +61,21 @@ function optionalValue(value: string): string | null {
   return trimmed ? trimmed : null;
 }
 
-function finalFieldsFromDraft(response: ForecastFramingDraftResponse): FinalFields {
+function finalFieldsFromDraft(
+  response: ForecastFramingDraftResponse,
+): FinalFields {
   const draft = response.draft;
   const payload = response.create_payload;
   return {
     question: payload?.question || draft.question || "",
-    resolutionCriteria: payload?.resolution_criteria ?? draft.resolution_criteria ?? "",
-    resolutionSources: joinLines(payload?.resolution_sources ?? draft.resolution_sources),
+    resolutionCriteria:
+      payload?.resolution_criteria ?? draft.resolution_criteria ?? "",
+    resolutionSources: joinLines(
+      payload?.resolution_sources ?? draft.resolution_sources,
+    ),
     outcomes: joinLines(payload?.outcomes ?? draft.outcomes),
-    targetPopulation: payload?.target_population ?? draft.target_population ?? "",
+    targetPopulation:
+      payload?.target_population ?? draft.target_population ?? "",
     unitOfAnalysis: payload?.unit_of_analysis ?? draft.unit_of_analysis ?? "",
     decisionContext: payload?.decision_context ?? draft.decision_context ?? "",
   };
@@ -81,7 +90,9 @@ function finalPayloadFromFields(
     ...basePayload,
     question: fields.question.trim(),
     original_execution_prompt:
-      optionalValue(originalExecutionPrompt) ?? basePayload?.original_execution_prompt ?? null,
+      optionalValue(originalExecutionPrompt) ??
+      basePayload?.original_execution_prompt ??
+      null,
     resolution_criteria: fields.resolutionCriteria.trim(),
     resolution_sources: splitLines(fields.resolutionSources),
     outcomes: splitLines(fields.outcomes),
@@ -114,13 +125,13 @@ function aiChangeSummaryItems(
     items.push("元の依頼からForecast用の短い問いを抽出しました。");
   }
   if (fields.resolutionCriteria.trim()) {
-    items.push("判定条件を確認対象として整理しました。");
+    items.push("解決条件を確認対象として整理しました。");
   }
   if (splitLines(fields.resolutionSources).length > 0) {
-    items.push("公開情報で確認する判定ソースを整理しました。");
+    items.push("公開情報で確認する解決確認ソースを整理しました。");
   }
   if (splitLines(fields.outcomes).length > 0) {
-    items.push("結果候補を確認対象として整理しました。");
+    items.push("解決時の結果状態を確認対象として整理しました。");
   }
   if (
     fields.targetPopulation.trim() ||
@@ -130,7 +141,9 @@ function aiChangeSummaryItems(
     items.push("対象、分析単位、意思決定文脈を確認対象として抽出しました。");
   }
   if (items.length === 0) {
-    return ["元の依頼から大きな変更はありません。不足メタデータだけ確認します。"];
+    return [
+      "元の依頼から大きな変更はありません。不足メタデータだけ確認します。",
+    ];
   }
   return items.slice(0, 4);
 }
@@ -147,9 +160,16 @@ function answerPayload(
     .filter((answer) => answer.answer.length > 0);
 }
 
+const FORECAST_FLOW_STATUS_LABEL: Record<ForecastFlowStatus, string> = {
+  done: "完了",
+  active: "実行中",
+  pending: "待機",
+};
+
 export function NewForecast() {
   const [roughQuestion, setRoughQuestion] = useState("");
-  const [draftResponse, setDraftResponse] = useState<ForecastFramingDraftResponse | null>(null);
+  const [draftResponse, setDraftResponse] =
+    useState<ForecastFramingDraftResponse | null>(null);
   const [originalExecutionPrompt, setOriginalExecutionPrompt] = useState("");
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [finalFields, setFinalFields] = useState<FinalFields>({
@@ -178,11 +198,16 @@ export function NewForecast() {
     () => splitLines(finalFields.resolutionSources),
     [finalFields.resolutionSources],
   );
-  const outcomeLabels = useMemo(() => splitLines(finalFields.outcomes), [finalFields.outcomes]);
+  const outcomeLabels = useMemo(
+    () => splitLines(finalFields.outcomes),
+    [finalFields.outcomes],
+  );
   const hasTooManySources = sourceLines.length > 20;
   const hasTooManyOutcomes = outcomeLabels.length > 8;
   const hasNoOutcome = outcomeLabels.length === 0;
   const hasNoQuestion = finalFields.question.trim().length === 0;
+  const hasNoResolutionCriteria =
+    finalFields.resolutionCriteria.trim().length === 0;
   const isCreatingForecast = state === "creating";
   const finalPayload = useMemo(
     () =>
@@ -194,21 +219,32 @@ export function NewForecast() {
     [draftResponse?.create_payload, finalFields, originalExecutionPrompt],
   );
   const aiChangeSummary = useMemo(
-    () => aiChangeSummaryItems(draftResponse, finalFields, originalExecutionPrompt),
+    () =>
+      aiChangeSummaryItems(draftResponse, finalFields, originalExecutionPrompt),
     [draftResponse, finalFields, originalExecutionPrompt],
   );
   const roughQuestionLength = roughQuestion.length;
-  const hasTooLongRoughQuestion = roughQuestionLength > FRAMING_ROUGH_QUESTION_MAX_LENGTH;
+  const hasTooLongRoughQuestion =
+    roughQuestionLength > FRAMING_ROUGH_QUESTION_MAX_LENGTH;
   const canSubmitRough =
-    roughQuestion.trim().length > 0 && !hasTooLongRoughQuestion && state !== "drafting";
+    roughQuestion.trim().length > 0 &&
+    !hasTooLongRoughQuestion &&
+    state !== "drafting";
   const areAnswersReady =
     clarifyingQuestions.length > 0 &&
     clarifyingQuestions.every(
       (question) => !question.required || answers[question.question_id]?.trim(),
     );
-  const isFinalValid = !hasNoQuestion && !hasNoOutcome && !hasTooManyOutcomes && !hasTooManySources;
+  const isFinalValid =
+    !hasNoQuestion &&
+    !hasNoResolutionCriteria &&
+    !hasNoOutcome &&
+    !hasTooManyOutcomes &&
+    !hasTooManySources;
   const canCreate =
-    state === "final_edit" && Boolean(draftResponse?.ready_to_create) && isFinalValid;
+    state === "final_edit" &&
+    Boolean(draftResponse?.ready_to_create) &&
+    isFinalValid;
   const canOpenManualEdit = Boolean(draftResponse) && isFinalValid;
 
   function applyDraftResponse(response: ForecastFramingDraftResponse) {
@@ -219,7 +255,8 @@ export function NewForecast() {
 
   async function onGenerateDraft() {
     const requestRoughQuestion = roughQuestion;
-    const shouldCaptureOriginalPrompt = !draftResponse && !originalExecutionPrompt.trim();
+    const shouldCaptureOriginalPrompt =
+      !draftResponse && !originalExecutionPrompt.trim();
     setError(null);
     setState("drafting");
     setDraftResponse(null);
@@ -228,12 +265,15 @@ export function NewForecast() {
     setAnswers({});
     idempotencyKeys.current.draft = stableKey("framing-draft");
     try {
-      const response = await createForecastFramingDraft({
-        rough_question: requestRoughQuestion,
-        locale: "ja",
-      }, {
-        idempotencyKey: idempotencyKeys.current.draft,
-      });
+      const response = await createForecastFramingDraft(
+        {
+          rough_question: requestRoughQuestion,
+          locale: "ja",
+        },
+        {
+          idempotencyKey: idempotencyKeys.current.draft,
+        },
+      );
       if (shouldCaptureOriginalPrompt) {
         setOriginalExecutionPrompt(requestRoughQuestion);
       }
@@ -250,14 +290,17 @@ export function NewForecast() {
     setState("refining");
     idempotencyKeys.current.refine = stableKey("framing-draft-refine");
     try {
-      const response = await createForecastFramingDraft({
-        rough_question: roughQuestion,
-        answers: answerPayload(clarifyingQuestions, answers),
-        previous_draft: draftResponse.draft,
-        locale: "ja",
-      }, {
-        idempotencyKey: idempotencyKeys.current.refine,
-      });
+      const response = await createForecastFramingDraft(
+        {
+          rough_question: roughQuestion,
+          answers: answerPayload(clarifyingQuestions, answers),
+          previous_draft: draftResponse.draft,
+          locale: "ja",
+        },
+        {
+          idempotencyKey: idempotencyKeys.current.refine,
+        },
+      );
       applyDraftResponse(response);
     } catch (err) {
       setError(formatForecastError(err));
@@ -317,7 +360,11 @@ export function NewForecast() {
       </div>
 
       {error && (
-        <div className="alert alert-error" role="alert" style={{ whiteSpace: "pre-wrap" }}>
+        <div
+          className="alert alert-error"
+          role="alert"
+          style={{ whiteSpace: "pre-wrap" }}
+        >
           {error}
         </div>
       )}
@@ -325,13 +372,56 @@ export function NewForecast() {
       <div className="forecast-create-layout">
         <div className="forecast-create-main">
           {(state === "rough_input" || state === "drafting") && (
-            <section className="form-panel forecast-form-panel" aria-labelledby="rough-title">
+            <section
+              className="form-panel forecast-form-panel"
+              aria-labelledby="rough-title"
+            >
               <div className="forecast-panel-heading">
                 <p className="forecast-step-label">Step 1</p>
                 <h2 id="rough-title">まずはざっくり教えてください</h2>
               </div>
 
-              <label className="forecast-field" htmlFor="forecast-rough-question">
+              {state === "drafting" && (
+                <ForecastFlowProgress
+                  heading="AI応答待ち"
+                  summary="元の依頼を保持したまま、Forecastメタデータを抽出しています。"
+                  nodes={[
+                    {
+                      id: "preserve",
+                      title: "元の依頼",
+                      meta: "verbatimで保持",
+                      status: "done",
+                      tone: "brief",
+                    },
+                    {
+                      id: "extract",
+                      title: "AIメタデータ抽出",
+                      meta: "問い / 解決条件 / 結果状態",
+                      status: "active",
+                      tone: "research",
+                    },
+                    {
+                      id: "clarify",
+                      title: "不足点確認",
+                      meta: "必要な質問を生成",
+                      status: "pending",
+                      tone: "review",
+                    },
+                    {
+                      id: "confirm",
+                      title: "保存前確認",
+                      meta: "編集して保存",
+                      status: "pending",
+                      tone: "finalize",
+                    },
+                  ]}
+                />
+              )}
+
+              <label
+                className="forecast-field"
+                htmlFor="forecast-rough-question"
+              >
                 <span className="forecast-field-header">
                   <span className="forecast-field-label">予測したいこと</span>
                   <span className="forecast-required">必須</span>
@@ -354,9 +444,10 @@ export function NewForecast() {
                   }`}
                 >
                   {roughQuestionLength.toLocaleString("ja-JP")} /{" "}
-                  {FRAMING_ROUGH_QUESTION_MAX_LENGTH.toLocaleString("ja-JP")} 文字
+                  {FRAMING_ROUGH_QUESTION_MAX_LENGTH.toLocaleString("ja-JP")}{" "}
+                  文字
                   {hasTooLongRoughQuestion
-                    ? "。長すぎるため、Forecastに必要な前提や判定条件に絞ってください。"
+                    ? "。長すぎるため、Forecastに必要な前提や解決条件に絞ってください。"
                     : ""}
                 </span>
               </label>
@@ -368,21 +459,63 @@ export function NewForecast() {
                   disabled={!canSubmitRough}
                   onClick={onGenerateDraft}
                 >
-                  {state === "drafting" ? "Forecast案を作成中" : "AIでForecast案を作成"}
+                  {state === "drafting"
+                    ? "Forecast案を作成中"
+                    : "AIでForecast案を作成"}
                 </button>
               </div>
             </section>
           )}
 
           {(state === "questions" || state === "refining") && draftResponse && (
-            <section className="form-panel forecast-form-panel" aria-labelledby="questions-title">
+            <section
+              className="form-panel forecast-form-panel"
+              aria-labelledby="questions-title"
+            >
               <div className="forecast-panel-heading">
                 <p className="forecast-step-label">Step 2</p>
-                <h2 id="questions-title">確認したいこと</h2>
+                <h2 id="questions-title">Forecastメタデータの不足確認</h2>
                 <p>
-                  元の依頼は保持したまま、不足しているForecastメタデータだけ確認します。
+                  元の実行プロンプトは変更しません。ここでは公開情報で解決状態を判定するために不足している期限・対象・ソースなどだけを確認します。
                 </p>
               </div>
+
+              {state === "refining" && (
+                <ForecastFlowProgress
+                  heading="回答を反映中"
+                  summary="入力済みの回答を使い、Forecastメタデータだけを更新しています。"
+                  nodes={[
+                    {
+                      id: "preserve",
+                      title: "元の依頼",
+                      meta: "変更せず保持",
+                      status: "done",
+                      tone: "brief",
+                    },
+                    {
+                      id: "answers",
+                      title: "追加回答",
+                      meta: `${answerPayload(clarifyingQuestions, answers).length}/${clarifyingQuestions.length}件`,
+                      status: "done",
+                      tone: "review",
+                    },
+                    {
+                      id: "refine",
+                      title: "AIメタデータ更新",
+                      meta: "解決条件と結果状態を再整理",
+                      status: "active",
+                      tone: "research",
+                    },
+                    {
+                      id: "confirm",
+                      title: "保存前確認",
+                      meta: "編集して保存",
+                      status: "pending",
+                      tone: "finalize",
+                    },
+                  ]}
+                />
+              )}
 
               <OriginalPromptDisclosure prompt={originalExecutionPrompt} />
               <AiChangeSummary items={aiChangeSummary} />
@@ -390,18 +523,30 @@ export function NewForecast() {
 
               <div className="forecast-question-grid">
                 {clarifyingQuestions.map((question, index) => (
-                  <article className="forecast-question-card" key={question.question_id}>
-                    <label className="forecast-field" htmlFor={`forecast-answer-${index}`}>
+                  <article
+                    className="forecast-question-card"
+                    key={question.question_id}
+                  >
+                    <label
+                      className="forecast-field"
+                      htmlFor={`forecast-answer-${index}`}
+                    >
                       <span className="forecast-field-header">
-                        <span className="forecast-field-label">{question.label}</span>
+                        <span className="forecast-field-label">
+                          {question.label}
+                        </span>
                         {question.required ? (
                           <span className="forecast-required">必須</span>
                         ) : (
                           <span className="forecast-optional">任意</span>
                         )}
                       </span>
-                      <span className="forecast-field-help">{question.prompt}</span>
-                      <span className="forecast-field-meta">{question.why_needed}</span>
+                      <span className="forecast-field-help">
+                        {question.prompt}
+                      </span>
+                      <span className="forecast-field-meta">
+                        {question.why_needed}
+                      </span>
                       <textarea
                         id={`forecast-answer-${index}`}
                         className="forecast-textarea forecast-textarea--answer"
@@ -437,14 +582,19 @@ export function NewForecast() {
                   disabled={!areAnswersReady || state === "refining"}
                   onClick={onRefineDraft}
                 >
-                  {state === "refining" ? "Forecast案を更新中" : "回答をAIに反映"}
+                  {state === "refining"
+                    ? "Forecast案を更新中"
+                    : "回答をメタデータ案に反映"}
                 </button>
               </div>
             </section>
           )}
 
           {state === "needs_retry" && draftResponse && (
-            <section className="form-panel forecast-form-panel" aria-labelledby="retry-title">
+            <section
+              className="form-panel forecast-form-panel"
+              aria-labelledby="retry-title"
+            >
               <div className="forecast-panel-heading">
                 <p className="forecast-step-label">Step 2</p>
                 <h2 id="retry-title">大枠を調整</h2>
@@ -473,9 +623,10 @@ export function NewForecast() {
                   }`}
                 >
                   {roughQuestionLength.toLocaleString("ja-JP")} /{" "}
-                  {FRAMING_ROUGH_QUESTION_MAX_LENGTH.toLocaleString("ja-JP")} 文字
+                  {FRAMING_ROUGH_QUESTION_MAX_LENGTH.toLocaleString("ja-JP")}{" "}
+                  文字
                   {hasTooLongRoughQuestion
-                    ? "。長すぎるため、Forecastに必要な前提や判定条件に絞ってください。"
+                    ? "。長すぎるため、Forecastに必要な前提や解決条件に絞ってください。"
                     : ""}
                 </span>
               </label>
@@ -502,18 +653,26 @@ export function NewForecast() {
             </section>
           )}
 
-          {(state === "final_edit" || state === "creating" || state === "preview_ready" || state === "approving") &&
+          {(state === "final_edit" ||
+            state === "creating" ||
+            state === "preview_ready" ||
+            state === "approving") &&
             draftResponse && (
-              <section className="form-panel forecast-form-panel" aria-labelledby="final-title">
+              <section
+                className="form-panel forecast-form-panel"
+                aria-labelledby="final-title"
+              >
                 <div className="forecast-panel-heading">
                   <p className="forecast-step-label">Step 3</p>
-                  <h2 id="final-title">最終確認</h2>
+                  <h2 id="final-title">保存前のフレーミング確認</h2>
                   <p>
                     元の依頼は保存時に保持されます。ここでは作成に必要なForecastメタデータだけ編集します。
                   </p>
                   <div className="forecast-draft-meta">
                     <span>{draftResponse.model}</span>
-                    <span>confidence {draftResponse.draft.confidence.toFixed(2)}</span>
+                    <span>
+                      confidence {draftResponse.draft.confidence.toFixed(2)}
+                    </span>
                   </div>
                 </div>
 
@@ -527,9 +686,14 @@ export function NewForecast() {
                     <p>AIが整えた項目です。必要な範囲だけ編集できます。</p>
                   </div>
 
-                  <label className="forecast-field" htmlFor="forecast-final-question">
+                  <label
+                    className="forecast-field"
+                    htmlFor="forecast-final-question"
+                  >
                     <span className="forecast-field-header">
-                      <span className="forecast-field-label">問い</span>
+                      <span className="forecast-field-label">
+                        Forecast用の短い問い
+                      </span>
                       <span className="forecast-required">必須</span>
                     </span>
                     <textarea
@@ -537,15 +701,36 @@ export function NewForecast() {
                       className="forecast-textarea"
                       value={finalFields.question}
                       onChange={(event) =>
-                        setFinalFields((current) => ({ ...current, question: event.target.value }))
+                        setFinalFields((current) => ({
+                          ...current,
+                          question: event.target.value,
+                        }))
                       }
                       rows={3}
                       disabled={state !== "final_edit"}
+                      aria-describedby="forecast-final-question-help"
+                      aria-invalid={hasNoQuestion}
                     />
+                    <span
+                      id="forecast-final-question-help"
+                      className={`forecast-field-meta${
+                        hasNoQuestion ? " forecast-field-meta--error" : ""
+                      }`}
+                    >
+                      {hasNoQuestion
+                        ? "Forecast用の短い問いを入力してください。"
+                        : "元の依頼を置き換える本文ではなく、解決対象を短く示すメタデータです。"}
+                    </span>
                   </label>
 
-                  <label className="forecast-field" htmlFor="forecast-final-criteria">
-                    <span className="forecast-field-label">判定条件</span>
+                  <label
+                    className="forecast-field"
+                    htmlFor="forecast-final-criteria"
+                  >
+                    <span className="forecast-field-header">
+                      <span className="forecast-field-label">解決条件</span>
+                      <span className="forecast-required">必須</span>
+                    </span>
                     <textarea
                       id="forecast-final-criteria"
                       className="forecast-textarea"
@@ -558,12 +743,31 @@ export function NewForecast() {
                       }
                       rows={5}
                       disabled={state !== "final_edit"}
+                      aria-describedby="forecast-final-criteria-help"
+                      aria-invalid={hasNoResolutionCriteria}
                     />
+                    <span
+                      id="forecast-final-criteria-help"
+                      className={`forecast-field-meta${
+                        hasNoResolutionCriteria
+                          ? " forecast-field-meta--error"
+                          : ""
+                      }`}
+                    >
+                      {hasNoResolutionCriteria
+                        ? "解決条件を入力してください。"
+                        : "公開情報で解決状態を選べる条件を書きます。"}
+                    </span>
                   </label>
 
-                  <label className="forecast-field" htmlFor="forecast-final-sources">
+                  <label
+                    className="forecast-field"
+                    htmlFor="forecast-final-sources"
+                  >
                     <span className="forecast-field-header">
-                      <span className="forecast-field-label">判定ソース</span>
+                      <span className="forecast-field-label">
+                        解決確認ソース
+                      </span>
                       <span className="forecast-optional">1行1ソース</span>
                     </span>
                     <textarea
@@ -585,38 +789,62 @@ export function NewForecast() {
                       className={`forecast-field-meta${hasTooManySources ? " forecast-field-meta--error" : ""}`}
                     >
                       {sourceLines.length}/20 件
-                      {hasTooManySources ? "。判定ソースを20件以内にしてください。" : ""}
+                      {hasTooManySources
+                        ? "。解決確認ソースを20件以内にしてください。"
+                        : ""}
                     </span>
                   </label>
 
-                  <label className="forecast-field" htmlFor="forecast-final-outcomes">
+                  <label
+                    className="forecast-field"
+                    htmlFor="forecast-final-outcomes"
+                  >
                     <span className="forecast-field-header">
-                      <span className="forecast-field-label">結果候補</span>
+                      <span className="forecast-field-label">
+                        解決時の結果状態
+                      </span>
                       <span className="forecast-required">1行1候補</span>
+                    </span>
+                    <span
+                      id="forecast-outcomes-help"
+                      className="forecast-field-help"
+                    >
+                      これは元の調査依頼の答えではなく、後で公開情報に照らして選ぶ解決・結果状態です。Yes/Noに限る必要はありません。
                     </span>
                     <textarea
                       id="forecast-final-outcomes"
                       className="forecast-textarea forecast-textarea--compact"
                       value={finalFields.outcomes}
                       onChange={(event) =>
-                        setFinalFields((current) => ({ ...current, outcomes: event.target.value }))
+                        setFinalFields((current) => ({
+                          ...current,
+                          outcomes: event.target.value,
+                        }))
                       }
                       rows={4}
                       disabled={state !== "final_edit"}
-                      aria-describedby="forecast-outcome-count"
+                      aria-describedby="forecast-outcomes-help forecast-outcome-count"
+                      aria-invalid={hasNoOutcome || hasTooManyOutcomes}
                     />
                     <span
                       id="forecast-outcome-count"
                       className={`forecast-field-meta${hasTooManyOutcomes || hasNoOutcome ? " forecast-field-meta--error" : ""}`}
                     >
                       {outcomeLabels.length}/8 件
-                      {hasNoOutcome ? "。結果候補を1件以上入力してください。" : ""}
-                      {hasTooManyOutcomes ? "。結果候補を8件以内にしてください。" : ""}
+                      {hasNoOutcome
+                        ? "。解決時の結果状態を1件以上入力してください。"
+                        : ""}
+                      {hasTooManyOutcomes
+                        ? "。解決時の結果状態を8件以内にしてください。"
+                        : ""}
                     </span>
                   </label>
 
                   <div className="forecast-optional-grid">
-                    <label className="forecast-field" htmlFor="forecast-final-target">
+                    <label
+                      className="forecast-field"
+                      htmlFor="forecast-final-target"
+                    >
                       <span className="forecast-field-label">対象集団</span>
                       <input
                         id="forecast-final-target"
@@ -631,7 +859,10 @@ export function NewForecast() {
                         disabled={state !== "final_edit"}
                       />
                     </label>
-                    <label className="forecast-field" htmlFor="forecast-final-unit">
+                    <label
+                      className="forecast-field"
+                      htmlFor="forecast-final-unit"
+                    >
                       <span className="forecast-field-label">分析単位</span>
                       <input
                         id="forecast-final-unit"
@@ -648,7 +879,10 @@ export function NewForecast() {
                     </label>
                   </div>
 
-                  <label className="forecast-field" htmlFor="forecast-final-context">
+                  <label
+                    className="forecast-field"
+                    htmlFor="forecast-final-context"
+                  >
                     <span className="forecast-field-label">意思決定文脈</span>
                     <textarea
                       id="forecast-final-context"
@@ -666,9 +900,46 @@ export function NewForecast() {
                   </label>
                 </div>
 
+                {state === "creating" && (
+                  <ForecastFlowProgress
+                    heading="Forecastを保存中"
+                    summary="元の依頼とForecastメタデータを保存済みフレーミングにしています。"
+                    nodes={[
+                      {
+                        id: "preserve",
+                        title: "元の依頼",
+                        meta: "保存対象",
+                        status: "done",
+                        tone: "brief",
+                      },
+                      {
+                        id: "metadata",
+                        title: "メタデータ",
+                        meta: "編集内容を反映",
+                        status: "done",
+                        tone: "review",
+                      },
+                      {
+                        id: "save",
+                        title: "Forecast保存",
+                        meta: "作成リクエスト中",
+                        status: "active",
+                        tone: "research",
+                      },
+                      {
+                        id: "approval",
+                        title: "承認",
+                        meta: "保存後に実行",
+                        status: "pending",
+                        tone: "finalize",
+                      },
+                    ]}
+                  />
+                )}
+
                 {state === "final_edit" && !draftResponse.ready_to_create && (
                   <div className="forecast-ready-note" role="status">
-                    AI判定ではまだ作成準備が完了していません。大枠を編集して再作成してください。
+                    メタデータ抽出ではまだ作成に必要な項目がそろっていません。大枠を編集して再作成してください。
                   </div>
                 )}
 
@@ -678,24 +949,35 @@ export function NewForecast() {
                       type="button"
                       className="btn-secondary"
                       onClick={() =>
-                        setState(clarifyingQuestions.length > 0 ? "questions" : "needs_retry")
+                        setState(
+                          clarifyingQuestions.length > 0
+                            ? "questions"
+                            : "needs_retry",
+                        )
                       }
                     >
                       前のステップへ
                     </button>
                   )}
-                  {draftResponse.ready_to_create && (state === "final_edit" || isCreatingForecast) && (
+                  {draftResponse.ready_to_create &&
+                    (state === "final_edit" || isCreatingForecast) && (
+                      <button
+                        type="button"
+                        className="btn-primary"
+                        disabled={!canCreate || isCreatingForecast}
+                        onClick={onCreate}
+                      >
+                        {isCreatingForecast
+                          ? "Forecastを作成中"
+                          : "Forecastを作成"}
+                      </button>
+                    )}
+                  {state === "preview_ready" && (
                     <button
                       type="button"
                       className="btn-primary"
-                      disabled={!canCreate || isCreatingForecast}
-                      onClick={onCreate}
+                      onClick={onApprove}
                     >
-                      {isCreatingForecast ? "Forecastを作成中" : "Forecastを作成"}
-                    </button>
-                  )}
-                  {state === "preview_ready" && (
-                    <button type="button" className="btn-primary" onClick={onApprove}>
                       この内容で承認
                     </button>
                   )}
@@ -709,11 +991,16 @@ export function NewForecast() {
             )}
 
           {preview && (
-            <section className="form-panel forecast-preview-panel" aria-labelledby="saved-preview-title">
+            <section
+              className="form-panel forecast-preview-panel"
+              aria-labelledby="saved-preview-title"
+            >
               <div className="forecast-panel-heading">
                 <p className="forecast-step-label">Saved</p>
                 <h2 id="saved-preview-title">保存済みプレビュー</h2>
-                <p>承認すると、このフレーミングでcurrent_state packへ進めます。</p>
+                <p>
+                  承認すると、このフレーミングでcurrent_state packへ進めます。
+                </p>
               </div>
               <div className="run-card-meta">
                 <span>Version {preview.current_framing_version}</span>
@@ -721,7 +1008,7 @@ export function NewForecast() {
               </div>
               <div className="forecast-preview-summary">
                 <p className="run-card-title">{preview.question}</p>
-                <p>{preview.resolution_criteria || "判定条件は未入力です。"}</p>
+                <p>{preview.resolution_criteria || "解決条件は未入力です。"}</p>
                 {preview.resolution_sources.length > 0 && (
                   <ul className="forecast-source-list">
                     {preview.resolution_sources.map((source) => (
@@ -732,10 +1019,15 @@ export function NewForecast() {
               </div>
               <div className="result-list forecast-outcome-list">
                 {preview.outcomes.map((outcome) => (
-                  <article className="run-card forecast-outcome-card" key={outcome.outcome_id}>
+                  <article
+                    className="run-card forecast-outcome-card"
+                    key={outcome.outcome_id}
+                  >
                     <p className="run-card-title">{outcome.label}</p>
                     <p>{outcome.definition}</p>
-                    <p className="run-card-meta">{outcome.normalization_group_id}</p>
+                    <p className="run-card-meta">
+                      {outcome.normalization_group_id}
+                    </p>
                   </article>
                 ))}
               </div>
@@ -760,13 +1052,86 @@ function WarningsList({ warnings }: { warnings: string[] }) {
   );
 }
 
+interface ForecastFlowNode {
+  id: string;
+  title: string;
+  meta: string;
+  status: ForecastFlowStatus;
+  tone: ForecastFlowTone;
+}
+
+function ForecastFlowProgress({
+  heading,
+  summary,
+  nodes,
+}: {
+  heading: string;
+  summary: string;
+  nodes: ForecastFlowNode[];
+}) {
+  const doneCount = nodes.filter((node) => node.status === "done").length;
+  const activeNode = nodes.find((node) => node.status === "active");
+  const statusText = `${heading}。${doneCount}/${nodes.length}完了。${
+    activeNode ? `現在: ${activeNode.title}。` : ""
+  }`;
+  const headingId = `forecast-flow-${nodes.map((node) => node.id).join("-")}-heading`;
+
+  return (
+    <section className="forecast-flow-progress" aria-labelledby={headingId}>
+      <p className="sr-only" aria-live="polite" role="status">
+        {statusText}
+      </p>
+      <div className="forecast-flow-header">
+        <div>
+          <h3 id={headingId}>{heading}</h3>
+          <p>{summary}</p>
+        </div>
+        <span className="forecast-flow-summary">
+          {doneCount}/{nodes.length} 完了
+        </span>
+      </div>
+      <ol className="forecast-flow-track" aria-label="Forecast作成フロー">
+        {nodes.map((node, index) => (
+          <li className="forecast-flow-item" key={node.id}>
+            <article
+              className={[
+                "execution-dag-node",
+                "forecast-flow-node",
+                `execution-dag-node--${node.status}`,
+                `execution-dag-node--${node.tone}`,
+              ].join(" ")}
+            >
+              <div className="execution-dag-node-topline">
+                <span className="execution-dag-dot" aria-hidden="true" />
+                <span className="execution-dag-state">
+                  {FORECAST_FLOW_STATUS_LABEL[node.status]}
+                </span>
+              </div>
+              <h4 className="execution-dag-title">{node.title}</h4>
+              <p className="execution-dag-meta">{node.meta}</p>
+            </article>
+            {index < nodes.length - 1 && (
+              <span
+                className={`forecast-flow-edge forecast-flow-edge--${nodes[index + 1].status}`}
+                aria-hidden="true"
+              />
+            )}
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
 function OriginalPromptDisclosure({ prompt }: { prompt: string }) {
   const preservedPrompt = prompt.trim();
   if (!preservedPrompt) return null;
   return (
     <details className="forecast-original-prompt" open>
       <summary>Step 1の元の依頼</summary>
-      <p>元の依頼は保存時にそのまま保持します。ここでは不足しているForecastメタデータだけを確認します。</p>
+      <p>
+        元の依頼は保存時にそのまま保持します。ここでは不足しているForecastメタデータだけを確認します。
+      </p>
       <pre>{preservedPrompt}</pre>
     </details>
   );
@@ -775,7 +1140,10 @@ function OriginalPromptDisclosure({ prompt }: { prompt: string }) {
 function AiChangeSummary({ items }: { items: string[] }) {
   if (items.length === 0) return null;
   return (
-    <section className="forecast-ai-summary" aria-labelledby="forecast-ai-summary-title">
+    <section
+      className="forecast-ai-summary"
+      aria-labelledby="forecast-ai-summary-title"
+    >
       <h3 id="forecast-ai-summary-title">AIが抽出・整理した点</h3>
       <ul>
         {items.map((item) => (
@@ -793,19 +1161,27 @@ function GuidePanel() {
       <div className="forecast-guide-stack">
         <div>
           <strong>大枠だけ入力</strong>
-          <span>期限、対象、判定条件が曖昧でも、まずは一文で始められます。</span>
+          <span>
+            期限、対象、解決条件が曖昧でも、まずは一文で始められます。
+          </span>
         </div>
         <div>
           <strong>AIがメタデータ抽出</strong>
-          <span>問い、判定条件、公開ソース、結果候補を元の依頼から拾います。</span>
+          <span>
+            Forecast用の短い問い、解決条件、解決確認ソース、解決時の結果状態を元の依頼から拾います。
+          </span>
         </div>
         <div>
           <strong>不足点だけ確認</strong>
-          <span>元の依頼は保持し、足りないForecastメタデータだけ確認します。</span>
+          <span>
+            元の依頼は保持し、足りないForecastメタデータだけ確認します。
+          </span>
         </div>
         <div>
           <strong>保存後に承認</strong>
-          <span>Forecast作成後、保存済みフレーミングを確認して承認します。</span>
+          <span>
+            Forecast作成後、保存済みフレーミングを確認して承認します。
+          </span>
         </div>
       </div>
       <div className="forecast-guidance-note">
