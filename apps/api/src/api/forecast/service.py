@@ -44,6 +44,7 @@ from api.forecast.schemas import (
     ForecastOutcome,
     ForecastStatus,
     ForecastSummary,
+    ManualResearchPackPromptResponse,
     PackRole,
     ProbabilityEstimateRecord,
     ResearchPackRequest,
@@ -54,7 +55,7 @@ from api.forecast.schemas import (
     ToolProfile,
 )
 from api.research.query_policy import contains_sensitive_terms
-from api.research.schemas import CreateResearchRunRequest, ResearchRunOptions, RunStatus
+from api.research.schemas import CreateResearchRunRequest, ResearchRunOptions, RunStatus, utc_now
 from api.research.service import ResearchOrchestrator
 
 
@@ -482,6 +483,239 @@ class ForecastOrchestrator:
                 status=submitted.status.value,
             )
         return _pack_response(pack)
+
+    def get_manual_research_pack_prompt(
+        self,
+        forecast_id: UUID,
+    ) -> ManualResearchPackPromptResponse:
+        forecast, prompt = self._prepare_current_state_pack_prompt(
+            forecast_id,
+            pack_role=PackRole.CURRENT_STATE,
+            tool_profile=ToolProfile.PUBLIC,
+            allow_existing_pack=False,
+        )
+        policy = evaluate_forecast_policy(prompt, profile=ToolProfile.PUBLIC.value)
+        if policy.status == "blocked":
+            raise ForecastConflict(
+                "policy_blocked",
+                policy.reason or "Forecast research pack was blocked by policy.",
+            )
+        if policy.status == "require_human_review":
+            raise ForecastConflict(
+                "policy_requires_revision",
+                policy.reason or "Policy requires revision for PhaseA.",
+            )
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        return ManualResearchPackPromptResponse(
+            forecast_id=forecast_id,
+            framing_version=forecast.current_framing_version,
+            prompt=prompt,
+            prompt_sha256=prompt_sha256,
+            prompt_version=CURRENT_STATE_PROMPT_VERSION,
+            pack_role=PackRole.CURRENT_STATE,
+            tool_profile=ToolProfile.PUBLIC,
+            max_report_chars=self.settings.research_manual_import_max_report_chars,
+            max_file_bytes=self.settings.research_manual_import_max_file_bytes,
+        )
+
+    def import_manual_research_pack(
+        self,
+        forecast_id: UUID,
+        *,
+        prompt_sha256: str,
+        report: str,
+        source_kind: str,
+        source_filename: str | None = None,
+    ) -> ResearchPackResponse:
+        forecast, prompt = self._prepare_current_state_pack_prompt(
+            forecast_id,
+            pack_role=PackRole.CURRENT_STATE,
+            tool_profile=ToolProfile.PUBLIC,
+            allow_existing_pack=False,
+        )
+        expected_prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        if prompt_sha256 != expected_prompt_sha256:
+            raise ForecastConflict(
+                "prompt_stale",
+                "Manual research prompt is stale. Regenerate the prompt and try again.",
+                {
+                    "expected_prompt_sha256": expected_prompt_sha256,
+                    "received_prompt_sha256": prompt_sha256,
+                },
+            )
+        if contains_sensitive_terms(report):
+            raise ForecastConflict(
+                "policy_requires_revision",
+                "Manual research report contains sensitive or non-public terms.",
+            )
+        policy = evaluate_forecast_policy(prompt, profile=ToolProfile.PUBLIC.value)
+        policy_decision_id = self.repository.add_policy_decision(
+            forecast_id=forecast_id,
+            profile=ToolProfile.PUBLIC.value,
+            status=policy.status,
+            reason=policy.reason,
+            prompt_hash=policy.prompt_hash,
+        )
+        if policy.status == "blocked":
+            raise ForecastConflict(
+                "policy_blocked",
+                policy.reason or "Forecast research pack was blocked by policy.",
+                {"policy_decision_id": str(policy_decision_id)},
+            )
+        if policy.status == "require_human_review":
+            raise ForecastConflict(
+                "policy_requires_revision",
+                policy.reason or "Policy requires revision for PhaseA.",
+                {"policy_decision_id": str(policy_decision_id)},
+            )
+
+        report_sha256 = hashlib.sha256(report.encode("utf-8")).hexdigest()
+        run = self.research.create_forecast_manual_import_run(
+            input_prompt=prompt,
+            report=report,
+            metadata={
+                "forecast_id": str(forecast.forecast_id),
+                "framing_version": forecast.current_framing_version,
+                "pack_role": PackRole.CURRENT_STATE.value,
+                "tool_profile": ToolProfile.PUBLIC.value,
+                "prompt_version": CURRENT_STATE_PROMPT_VERSION,
+                "prompt_sha256": expected_prompt_sha256,
+                "report_sha256": report_sha256,
+                "source_kind": source_kind,
+                "source_filename": source_filename,
+            },
+        )
+        pack_id: UUID | None = None
+        try:
+            pack = self.repository.add_research_pack(
+                forecast_id=forecast_id,
+                research_run_id=run.id,
+                pack_role=PackRole.CURRENT_STATE.value,
+                tool_profile=ToolProfile.PUBLIC.value,
+                status="completed",
+                model_deployment="chatgpt-deep-research-manual",
+                prompt_version=CURRENT_STATE_PROMPT_VERSION,
+                max_tool_calls=0,
+                policy_decision_id=policy_decision_id,
+            )
+            pack_id = UUID(pack["pack_id"])
+            pack = self.repository.update_research_pack_status(
+                pack_id=pack_id,
+                status="completed",
+                report_artifact_hash=report_sha256,
+            )
+            with self.repository.connect() as connection:
+                self.repository.append_audit(
+                    connection,
+                    forecast_id,
+                    "manual_research_pack_imported",
+                    {
+                        "pack_id": str(pack["pack_id"]),
+                        "research_run_id": str(run.id),
+                        "prompt_sha256": expected_prompt_sha256,
+                        "report_sha256": report_sha256,
+                        "report_chars": len(report),
+                        "source_kind": source_kind,
+                        "source_filename": source_filename,
+                    },
+                )
+        except ResearchPackAlreadyExists as error:
+            self._cleanup_failed_manual_import(run_id=run.id)
+            raise ForecastConflict(
+                "research_pack_already_exists",
+                "A current-state research pack already exists for this Forecast.",
+                {"pack_id": str(error.existing_pack["pack_id"])},
+            ) from error
+        except Exception as error:
+            try:
+                self._cleanup_failed_manual_import(
+                    run_id=run.id,
+                    forecast_id=forecast_id,
+                    pack_id=pack_id,
+                )
+            except Exception as cleanup_error:
+                error.add_note(
+                    f"manual import compensation failed: {cleanup_error!r}"
+                )
+            raise
+        return _pack_response(pack)
+
+    def _cleanup_failed_manual_import(
+        self,
+        *,
+        run_id: UUID,
+        forecast_id: UUID | None = None,
+        pack_id: UUID | None = None,
+    ) -> None:
+        if pack_id is not None:
+            with self.repository.connect() as connection:
+                connection.execute(
+                    """
+                    DELETE FROM forecast_research_packs
+                    WHERE pack_id = ? AND research_run_id = ?
+                    """,
+                    (str(pack_id), str(run_id)),
+                )
+                if forecast_id is not None:
+                    connection.execute(
+                        """
+                        UPDATE forecast_forecasts
+                        SET status = ?, updated_at = ?
+                        WHERE id = ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM forecast_research_packs
+                              WHERE forecast_id = ?
+                          )
+                        """,
+                        (
+                            ForecastStatus.FRAMING_APPROVED.value,
+                            utc_now().isoformat(),
+                            str(forecast_id),
+                            str(forecast_id),
+                        ),
+                    )
+        self.research.artifacts.delete_run(run_id)
+        self.research.repository.delete_run(run_id)
+
+    def _prepare_current_state_pack_prompt(
+        self,
+        forecast_id: UUID,
+        *,
+        pack_role: PackRole,
+        tool_profile: ToolProfile,
+        allow_existing_pack: bool,
+    ) -> tuple[ForecastDetail, str]:
+        forecast = self.get_forecast(forecast_id)
+        self._ensure_mutable(forecast)
+        _ensure_forecast_has_outcomes(forecast)
+        if forecast.approved_framing_version != forecast.current_framing_version:
+            raise ForecastConflict(
+                "framing_not_approved",
+                "Approve the latest framing before dispatching research packs.",
+            )
+        if forecast.confidentiality_class != "public":
+            raise ForecastConflict(
+                "policy_requires_revision",
+                "PhaseA only supports public forecasts.",
+            )
+        if pack_role != PackRole.CURRENT_STATE or tool_profile != ToolProfile.PUBLIC:
+            raise ForecastConflict(
+                "policy_requires_revision",
+                "PhaseA only supports public current_state research packs.",
+            )
+        existing = self.repository.list_packs(forecast_id)
+        if existing and not allow_existing_pack:
+            raise ForecastConflict(
+                "research_pack_already_exists",
+                "A current-state research pack already exists for this Forecast.",
+                {"pack_id": str(existing[-1]["pack_id"])},
+            )
+        if not existing and forecast.status != ForecastStatus.FRAMING_APPROVED:
+            raise ForecastConflict(
+                "forecast_already_started",
+                "A PhaseA research pack can only be dispatched once.",
+            )
+        return forecast, build_current_state_prompt(forecast)
 
     def extract_evidence(self, forecast_id: UUID) -> tuple[list[SourceRecord], list[ClaimRecord]]:
         forecast = self.get_forecast(forecast_id)

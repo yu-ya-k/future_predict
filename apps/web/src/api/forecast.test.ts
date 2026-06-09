@@ -4,7 +4,9 @@ import {
   createForecast,
   createForecastFramingDraft,
   dispatchCurrentStatePack,
+  getManualResearchPackPrompt,
   getForecastEstimateSet,
+  importManualResearchPack,
 } from "./forecast";
 
 function jsonResponse(data: unknown, status = 200): Response {
@@ -100,6 +102,111 @@ describe("forecast API client", () => {
       "http://localhost:8000/forecasts/forecast-1/estimate-set",
       expect.objectContaining({ method: "GET" }),
     );
+  });
+
+  it("loads and imports forecast manual research packs with FormData", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          forecast_id: "forecast-1",
+          framing_version: 1,
+          prompt: "Manual prompt",
+          prompt_sha256: "prompt-hash",
+          prompt_version: "current_state_pack_v1",
+          pack_role: "current_state",
+          tool_profile: "public",
+          max_report_chars: 50000,
+          max_file_bytes: 1048576,
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          pack_id: "pack-1",
+          forecast_id: "forecast-1",
+          research_run_id: "run-1",
+          pack_role: "current_state",
+          tool_profile: "public",
+          status: "completed",
+          policy_decision_id: "policy-1",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          pack_id: "pack-2",
+          forecast_id: "forecast-1",
+          research_run_id: "run-2",
+          pack_role: "current_state",
+          tool_profile: "public",
+          status: "completed",
+          policy_decision_id: "policy-2",
+        }),
+      );
+    globalThis.fetch = fetchMock;
+    const file = new File(["Manual report file"], "manual-report.md", {
+      type: "text/markdown",
+    });
+
+    await expect(getManualResearchPackPrompt("forecast-1")).resolves.toMatchObject({
+      prompt_sha256: "prompt-hash",
+    });
+    await importManualResearchPack(
+      "forecast-1",
+      {
+        promptSha256: "prompt-hash",
+        report: { source: "text", text: "Manual report" },
+      },
+      { idempotencyKey: "manual-pack-key" },
+    );
+    await importManualResearchPack(
+      "forecast-1",
+      {
+        promptSha256: "prompt-hash",
+        report: { source: "file", file },
+      },
+      { idempotencyKey: "manual-pack-file-key" },
+    );
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://localhost:8000/forecasts/forecast-1/research-packs/manual-prompt",
+      expect.objectContaining({ method: "GET" }),
+    );
+    const secondCall = fetchMock.mock.calls[1];
+    expect(secondCall[0]).toBe(
+      "http://localhost:8000/forecasts/forecast-1/research-packs/manual-import",
+    );
+    expect(secondCall[1]).toEqual(
+      expect.objectContaining({
+        method: "POST",
+        body: expect.any(FormData),
+        headers: expect.objectContaining({ "Idempotency-Key": "manual-pack-key" }),
+      }),
+    );
+    expect(secondCall[1].headers).not.toHaveProperty("Content-Type");
+    const textBody = secondCall[1].body as FormData;
+    expect(textBody.get("prompt_sha256")).toBe("prompt-hash");
+    expect(textBody.get("report_text")).toBe("Manual report");
+    expect(textBody.has("report_file")).toBe(false);
+
+    const thirdCall = fetchMock.mock.calls[2];
+    expect(thirdCall[0]).toBe(
+      "http://localhost:8000/forecasts/forecast-1/research-packs/manual-import",
+    );
+    expect(thirdCall[1]).toEqual(
+      expect.objectContaining({
+        method: "POST",
+        body: expect.any(FormData),
+        headers: expect.objectContaining({
+          "Idempotency-Key": "manual-pack-file-key",
+        }),
+      }),
+    );
+    expect(thirdCall[1].headers).not.toHaveProperty("Content-Type");
+    const fileBody = thirdCall[1].body as FormData;
+    expect(fileBody.get("prompt_sha256")).toBe("prompt-hash");
+    expect(fileBody.has("report_text")).toBe(false);
+    expect(fileBody.get("report_file")).toBe(file);
   });
 
   it("creates forecast framing drafts", async () => {

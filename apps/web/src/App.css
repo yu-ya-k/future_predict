@@ -666,6 +666,101 @@ body {
   justify-content: flex-start;
 }
 
+.forecast-collection-choice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-4);
+  border: 0.5px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+}
+
+.forecast-collection-choice__modes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.forecast-collection-choice__modes button {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+  padding: var(--space-3);
+  border: 0.5px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--ink);
+  font-weight: var(--weight-semibold);
+  text-align: left;
+}
+
+.forecast-collection-choice__modes button span {
+  color: var(--ink-faint);
+  font-size: var(--text-caption);
+  font-weight: var(--weight-regular);
+}
+
+.forecast-collection-choice__modes button.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.forecast-collection-choice__action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.forecast-collection-choice__action p {
+  max-width: 680px;
+  margin: 0;
+  color: var(--ink-soft);
+  line-height: var(--leading-normal);
+}
+
+.forecast-manual-pack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.forecast-manual-pack__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.forecast-manual-pack__header h3 {
+  margin: 0 0 var(--space-1);
+  font-size: var(--text-lg);
+}
+
+.forecast-manual-pack__header p {
+  margin: 0;
+  color: var(--ink-soft);
+  line-height: var(--leading-normal);
+}
+
+.forecast-manual-pack__prompt {
+  width: 100%;
+  max-height: 320px;
+  resize: vertical;
+  font-family: var(--mono);
+  font-size: var(--text-label);
+  line-height: var(--leading-normal);
+}
+
+.forecast-manual-pack__tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
 .alert-error {
   border: 0.5px solid var(--error-border);
   background: var(--error-bg);
@@ -1110,6 +1205,16 @@ body {
 
   .forecast-current-step__details {
     grid-template-columns: 1fr;
+  }
+
+  .forecast-collection-choice__modes {
+    grid-template-columns: 1fr;
+  }
+
+  .forecast-collection-choice__action,
+  .forecast-manual-pack__header {
+    flex-direction: column;
+    align-items: stretch;
   }
 
   .forecast-create-layout {

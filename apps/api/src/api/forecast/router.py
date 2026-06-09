@@ -6,7 +6,7 @@ from collections.abc import Callable
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 from fastapi.encoders import jsonable_encoder
 
 from api.forecast.dependencies import get_forecast_orchestrator
@@ -26,6 +26,7 @@ from api.forecast.schemas import (
     ForecastReviewRequest,
     ForecastReviewResponse,
     ForecastSummary,
+    ManualResearchPackPromptResponse,
     ResearchPackRequest,
     ResearchPackResponse,
     ResolveForecastRequest,
@@ -196,6 +197,73 @@ def create_research_pack(
                 forecast_id,
                 request,
                 idempotency_key=None,
+            ),
+        )
+    except ForecastConflict as error:
+        raise forecast_http_error(error) from error
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Forecast not found.") from error
+
+
+@router.get(
+    "/{forecast_id}/research-packs/manual-prompt",
+    response_model=ManualResearchPackPromptResponse,
+)
+def get_manual_research_pack_prompt(
+    forecast_id: UUID,
+    orchestrator: ForecastDependency,
+) -> ManualResearchPackPromptResponse:
+    try:
+        return orchestrator.get_manual_research_pack_prompt(forecast_id)
+    except ForecastConflict as error:
+        raise forecast_http_error(error) from error
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Forecast not found.") from error
+
+
+@router.post(
+    "/{forecast_id}/research-packs/manual-import",
+    response_model=ResearchPackResponse,
+)
+async def import_manual_research_pack(
+    forecast_id: UUID,
+    orchestrator: ForecastDependency,
+    prompt_sha256: Annotated[
+        str,
+        Form(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"),
+    ],
+    idempotency_key: IdempotencyKeyHeader = None,
+    report_file: Annotated[UploadFile | None, File()] = None,
+    report_text: Annotated[str | None, Form()] = None,
+) -> ResearchPackResponse:
+    report, report_meta = await _read_manual_research_report(
+        file=report_file,
+        text=report_text,
+        max_chars=orchestrator.settings.research_manual_import_max_report_chars,
+        max_file_bytes=orchestrator.settings.research_manual_import_max_file_bytes,
+    )
+    normalized_prompt_sha256 = prompt_sha256.strip()
+    report_sha256 = hashlib.sha256(report.encode("utf-8")).hexdigest()
+    source_kind = str(report_meta["source"])
+    source_filename = report_meta.get("filename")
+    try:
+        return _run_idempotent(
+            orchestrator,
+            scope="forecast:research_pack_manual_import",
+            resource_id=str(forecast_id),
+            idempotency_key=_normalize_idempotency_key(idempotency_key),
+            payload={
+                "prompt_sha256": normalized_prompt_sha256,
+                "report_sha256": report_sha256,
+                "source_kind": source_kind,
+                "source_filename": str(source_filename) if source_filename else None,
+            },
+            action=lambda: orchestrator.import_manual_research_pack(
+                forecast_id,
+                prompt_sha256=normalized_prompt_sha256,
+                report=report,
+                source_kind=source_kind,
+                source_filename=str(source_filename) if source_filename else None,
             ),
         )
     except ForecastConflict as error:
@@ -376,6 +444,71 @@ def _forecast_create_idempotency_payload(request: ForecastCreateRequest) -> dict
     if payload.get("original_execution_prompt") is None:
         payload.pop("original_execution_prompt", None)
     return payload
+
+
+async def _read_manual_research_report(
+    *,
+    file: UploadFile | None,
+    text: str | None,
+    max_chars: int,
+    max_file_bytes: int,
+) -> tuple[str, dict[str, object]]:
+    has_file = file is not None
+    has_text = text is not None
+    if has_file == has_text:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide exactly one of report_file or report_text.",
+        )
+    if has_text:
+        assert text is not None
+        stripped = text.strip()
+        if not stripped:
+            raise HTTPException(status_code=422, detail="report_text must not be blank.")
+        if len(stripped) > max_chars:
+            raise HTTPException(
+                status_code=422,
+                detail=f"report exceeds the {max_chars} character limit.",
+            )
+        return stripped, {
+            "source": "text",
+            "chars": len(stripped),
+            "sha256": hashlib.sha256(stripped.encode("utf-8")).hexdigest(),
+        }
+
+    assert file is not None
+    filename = file.filename or ""
+    if not filename.lower().endswith((".md", ".txt")):
+        raise HTTPException(
+            status_code=422,
+            detail="report_file must be a .md or .txt file.",
+        )
+    data = await file.read(max_file_bytes + 1)
+    if len(data) > max_file_bytes:
+        raise HTTPException(
+            status_code=422,
+            detail=f"report_file exceeds the {max_file_bytes} byte limit.",
+        )
+    try:
+        decoded = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise HTTPException(status_code=422, detail="report_file must be valid UTF-8.") from error
+    stripped = decoded.strip()
+    if not stripped:
+        raise HTTPException(status_code=422, detail="report_file must not be blank.")
+    if len(stripped) > max_chars:
+        raise HTTPException(
+            status_code=422,
+            detail=f"report exceeds the {max_chars} character limit.",
+        )
+    return stripped, {
+        "source": "file",
+        "filename": filename,
+        "content_type": file.content_type,
+        "bytes": len(data),
+        "chars": len(stripped),
+        "sha256": hashlib.sha256(stripped.encode("utf-8")).hexdigest(),
+    }
 
 
 def _run_idempotent[T](

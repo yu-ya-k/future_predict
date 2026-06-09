@@ -322,6 +322,18 @@ class ResearchPackResponse(BaseModel):
     policy_decision_id: UUID
 
 
+class ManualResearchPackPromptResponse(BaseModel):
+    forecast_id: UUID
+    framing_version: int
+    prompt: str
+    prompt_sha256: str
+    prompt_version: str
+    pack_role: PackRole
+    tool_profile: ToolProfile
+    max_report_chars: int
+    max_file_bytes: int
+
+
 class SourceRecord(BaseModel):
     source_id: UUID
     title: str

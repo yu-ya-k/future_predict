@@ -8,6 +8,8 @@ import {
   generateScenarios,
   getForecast,
   getForecastEstimateSet,
+  getManualResearchPackPrompt,
+  importManualResearchPack,
   resolveForecast,
   reviewForecast,
 } from "../../api/forecast";
@@ -16,6 +18,7 @@ import { formatElapsed, useElapsed } from "../../hooks/useElapsed";
 import type {
   EstimateSetResponse,
   ForecastDetail as ForecastDetailType,
+  ManualResearchPackPromptResponse,
   ForecastStatus,
   ResolveForecastResponse,
 } from "../../types";
@@ -28,6 +31,7 @@ import {
 
 type Command =
   | "pack"
+  | "manualPack"
   | "evidence"
   | "scenarios"
   | "claimTargets"
@@ -53,6 +57,8 @@ interface CurrentStepModel {
   action: CurrentStepAction;
   actionLabel?: string;
 }
+
+type CollectionMode = "auto" | "manual";
 
 function stableKey(forecastId: string, action: Command): string {
   return `forecast-${forecastId}-${action}-${crypto.randomUUID()}`;
@@ -321,13 +327,12 @@ function deriveCurrentStep({
 
   if (canDispatch) {
     return {
-      title: "公開情報はまだ収集されていません",
+      title: "公開情報の収集方法を選択",
       description:
-        "承認済みフレーミングをもとに、まず公開情報の収集を開始します。",
+        "アプリで自動収集するか、ChatGPT Deep Researchで手動収集した結果を取り込めます。",
       stateLabel: "未収集",
       tone: "ready",
-      action: "pack",
-      actionLabel: "公開情報の収集を開始",
+      action: null,
     };
   }
 
@@ -581,8 +586,17 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   const [busy, setBusy] = useState<Command | null>(null);
   const [busyStartedAt, setBusyStartedAt] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [collectionMode, setCollectionMode] = useState<CollectionMode>("auto");
+  const [manualPrompt, setManualPrompt] =
+    useState<ManualResearchPackPromptResponse | null>(null);
+  const [manualPromptLoading, setManualPromptLoading] = useState(false);
+  const [manualReportText, setManualReportText] = useState("");
+  const [manualReportFile, setManualReportFile] = useState<File | null>(null);
+  const manualPromptRequestId = useRef(0);
+  const manualReportFileInputRef = useRef<HTMLInputElement | null>(null);
   const idempotencyKeys = useRef<Record<Command, string>>({
     pack: stableKey(forecastId, "pack"),
+    manualPack: stableKey(forecastId, "manualPack"),
     evidence: stableKey(forecastId, "evidence"),
     scenarios: stableKey(forecastId, "scenarios"),
     claimTargets: stableKey(forecastId, "claimTargets"),
@@ -591,6 +605,29 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     commit: stableKey(forecastId, "commit"),
     resolve: stableKey(forecastId, "resolve"),
   });
+
+  useEffect(() => {
+    manualPromptRequestId.current += 1;
+    setCollectionMode("auto");
+    setManualPrompt(null);
+    setManualPromptLoading(false);
+    setManualReportText("");
+    setManualReportFile(null);
+    if (manualReportFileInputRef.current) {
+      manualReportFileInputRef.current.value = "";
+    }
+    idempotencyKeys.current = {
+      pack: stableKey(forecastId, "pack"),
+      manualPack: stableKey(forecastId, "manualPack"),
+      evidence: stableKey(forecastId, "evidence"),
+      scenarios: stableKey(forecastId, "scenarios"),
+      claimTargets: stableKey(forecastId, "claimTargets"),
+      compute: stableKey(forecastId, "compute"),
+      approve: stableKey(forecastId, "approve"),
+      commit: stableKey(forecastId, "commit"),
+      resolve: stableKey(forecastId, "resolve"),
+    };
+  }, [forecastId]);
 
   const load = useCallback(async () => {
     const nextForecast = await getForecast(forecastId);
@@ -636,6 +673,11 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   const researchRunPath = currentResearchPack?.research_run_id
     ? routes().monitor(currentResearchPack.research_run_id)
     : null;
+  const researchRunLinkLabel =
+    currentResearchPack?.research_run_status === "completed" &&
+    (currentResearchPack.total_tool_calls ?? 0) === 0
+      ? "取り込み記録"
+      : "Research run詳細";
 
   const shouldPollCurrentResearchPack = researchPackRunning || researchPackSubmitting;
 
@@ -662,6 +704,15 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   }, [busy, currentResearchPack]);
 
   useEffect(() => {
+    if (!currentResearchPack) return;
+    setManualReportText("");
+    setManualReportFile(null);
+    if (manualReportFileInputRef.current) {
+      manualReportFileInputRef.current.value = "";
+    }
+  }, [currentResearchPack]);
+
+  useEffect(() => {
     if (!selectedOutcomeId && forecast?.outcomes[0]) {
       setSelectedOutcomeId(forecast.outcomes[0].outcome_id);
     }
@@ -673,7 +724,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     }
   }, [forecast?.status]);
 
-  async function runStep(step: Command, fn: () => Promise<unknown>) {
+  async function runStep(step: Command, fn: () => Promise<unknown>): Promise<boolean> {
     setBusyStartedAt(new Date(Date.now()));
     setBusy(step);
     setError(null);
@@ -686,8 +737,10 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       if (step === "compute") setEstimate(result as EstimateSetResponse);
       if (step === "resolve") setResolution(result as ResolveForecastResponse);
       await load();
+      return true;
     } catch (err) {
       setError(formatForecastError(err));
+      return false;
     } finally {
       setBusy(null);
       setBusyStartedAt(null);
@@ -702,6 +755,8 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
             idempotencyKey: idempotencyKeys.current.pack,
           }),
         );
+      case "manualPack":
+        return Promise.resolve();
       case "evidence":
         return runStep("evidence", () =>
           extractEvidence(forecastId, {
@@ -766,7 +821,83 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     }
   }
 
+  async function loadManualPrompt() {
+    if (manualPromptLoading) return;
+    const requestId = manualPromptRequestId.current + 1;
+    manualPromptRequestId.current = requestId;
+    setManualPromptLoading(true);
+    setError(null);
+    try {
+      const prompt = await getManualResearchPackPrompt(forecastId);
+      if (manualPromptRequestId.current === requestId) {
+        setManualPrompt(prompt);
+      }
+    } catch (err) {
+      if (manualPromptRequestId.current === requestId) {
+        setError(formatForecastError(err));
+      }
+    } finally {
+      if (manualPromptRequestId.current === requestId) {
+        setManualPromptLoading(false);
+      }
+    }
+  }
+
+  function selectCollectionMode(mode: CollectionMode) {
+    setCollectionMode(mode);
+    if (mode === "manual" && !manualPrompt) {
+      void loadManualPrompt();
+    }
+  }
+
+  async function copyManualPrompt() {
+    if (!manualPrompt) return;
+    try {
+      await navigator.clipboard.writeText(manualPrompt.prompt);
+    } catch (err) {
+      setError(formatForecastError(err));
+    }
+  }
+
+  function downloadManualPrompt() {
+    if (!manualPrompt) return;
+    const blob = new Blob([manualPrompt.prompt], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `forecast-${forecastId}-deep-research-prompt.md`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function importManualPack() {
+    if (!manualPrompt) return;
+    const text = manualReportText.trim();
+    const report =
+      manualReportFile !== null
+        ? { source: "file" as const, file: manualReportFile }
+        : { source: "text" as const, text };
+    const imported = await runStep("manualPack", () =>
+      importManualResearchPack(
+        forecastId,
+        {
+          promptSha256: manualPrompt.prompt_sha256,
+          report,
+        },
+        { idempotencyKey: idempotencyKeys.current.manualPack },
+      ),
+    );
+    if (imported) {
+      setManualReportText("");
+      setManualReportFile(null);
+      if (manualReportFileInputRef.current) {
+        manualReportFileInputRef.current.value = "";
+      }
+    }
+  }
+
   const canDispatch = approvedFraming && status === "framing_approved";
+  const manualReportReady = manualReportFile !== null || manualReportText.trim().length > 0;
   const canExtract = status === "pack_running" && researchPackCompleted;
   const canGenerate = status === "evidence_ready";
   const effectiveClaimTargetsApproved =
@@ -899,7 +1030,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
           </span>
           {researchRunPath && (
             <Link to={researchRunPath} className="btn-secondary">
-              Research run詳細
+              {researchRunLinkLabel}
             </Link>
           )}
           <Link to={routes().forecastAudit(forecastId)} className="btn-secondary">
@@ -972,6 +1103,148 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
                   ? "状態を再確認"
                   : currentStep.actionLabel}
               </button>
+            )}
+          </div>
+        )}
+        {canDispatch && (
+          <div className="forecast-collection-choice">
+            <div
+              className="forecast-collection-choice__modes"
+              role="group"
+              aria-label="公開情報の収集方法"
+            >
+              <button
+                type="button"
+                className={collectionMode === "auto" ? "is-active" : ""}
+                aria-pressed={collectionMode === "auto"}
+                onClick={() => selectCollectionMode("auto")}
+              >
+                アプリで自動収集
+                <span>おすすめ</span>
+              </button>
+              <button
+                type="button"
+                className={collectionMode === "manual" ? "is-active" : ""}
+                aria-pressed={collectionMode === "manual"}
+                onClick={() => selectCollectionMode("manual")}
+              >
+                ChatGPTで手動収集
+                <span>APIが使えない時</span>
+              </button>
+            </div>
+            {collectionMode === "auto" ? (
+              <div className="forecast-collection-choice__action">
+                <p>
+                  Deep Research APIで公開情報を収集し、完了後に証拠抽出へ進めます。
+                </p>
+                <button
+                  type="button"
+                  className="btn-primary"
+                  disabled={!!busy}
+                  onClick={() => void runCommand("pack")}
+                >
+                  公開情報の収集を開始
+                </button>
+              </div>
+            ) : (
+              <div className="forecast-manual-pack">
+                <div className="forecast-manual-pack__header">
+                  <div>
+                    <h3>ChatGPT Deep Researchへ渡すPrompt</h3>
+                    <p>
+                      このPromptを手動で実行し、得られたレポートを貼り付けるか
+                      md/txtでアップロードします。
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    disabled={manualPromptLoading}
+                    onClick={() => void loadManualPrompt()}
+                  >
+                    {manualPrompt ? "Promptを再取得" : "Promptを取得"}
+                  </button>
+                </div>
+                {manualPromptLoading && <p className="muted">Promptを取得しています。</p>}
+                {manualPrompt && (
+                  <>
+                    <textarea
+                      className="forecast-manual-pack__prompt"
+                      aria-label="ChatGPT Deep Researchへ渡すPrompt"
+                      value={manualPrompt.prompt}
+                      readOnly
+                      rows={8}
+                    />
+                    <div className="forecast-manual-pack__tools">
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={() => void copyManualPrompt()}
+                      >
+                        Promptをコピー
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={downloadManualPrompt}
+                      >
+                        PromptをMarkdownでダウンロード
+                      </button>
+                    </div>
+                  </>
+                )}
+                <label className="field">
+                  <span>結果を貼り付け</span>
+                  <textarea
+                    value={manualReportText}
+                    onChange={(event) => {
+                      setManualReportText(event.target.value);
+                      if (event.target.value.length > 0) {
+                        setManualReportFile(null);
+                        if (manualReportFileInputRef.current) {
+                          manualReportFileInputRef.current.value = "";
+                        }
+                      }
+                    }}
+                    rows={6}
+                    placeholder="ChatGPT Deep Researchの最終レポートを貼り付け"
+                  />
+                </label>
+                <label className="field">
+                  <span>md/txtをアップロード</span>
+                  <input
+                    ref={manualReportFileInputRef}
+                    type="file"
+                    accept=".md,.txt,text/markdown,text/plain"
+                    onChange={(event) => {
+                      setManualReportFile(event.target.files?.[0] ?? null);
+                      if (event.target.files?.[0]) setManualReportText("");
+                    }}
+                  />
+                </label>
+                {manualReportFile && (
+                  <p className="muted">選択中: {manualReportFile.name}</p>
+                )}
+                <div className="forecast-collection-choice__action">
+                  <p>
+                    手動レポートは未検証の公開情報として保存され、次の証拠抽出で
+                    Forecast用の主張とソースに分解します。
+                  </p>
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    disabled={
+                      !!busy ||
+                      manualPromptLoading ||
+                      !manualPrompt ||
+                      !manualReportReady
+                    }
+                    onClick={() => void importManualPack()}
+                  >
+                    結果を取り込む
+                  </button>
+                </div>
+              </div>
             )}
           </div>
         )}

@@ -551,6 +551,9 @@ class ResearchRepository:
         manual_checkpoint_report_hash: str | None,
         human_review_checkpoint_snapshot: dict[str, Any] | None = None,
         human_review_checkpoint_report_hash: str | None = None,
+        final_report: str | None = None,
+        run_origin: str = "research",
+        terminal_status: str | None = None,
     ) -> tuple[ResearchRunRecord, bool]:
         now = utc_now()
         now_text = now.isoformat()
@@ -584,7 +587,7 @@ class ResearchRepository:
             connection.execute(
                 """
                 INSERT INTO research_runs (
-                    id, thread_id, user_prompt, optimized_prompt, status, report,
+                    id, thread_id, user_prompt, optimized_prompt, status, report, final_report,
                     done_reason,
                     needs_human_review, pending_deep_research_response_id,
                     deep_research_status, deep_research_runs,
@@ -592,11 +595,12 @@ class ResearchRepository:
                     max_targeted_rerun_runs, max_full_rerun_runs,
                     max_llm_patch_runs, max_verification_runs, max_total_iterations,
                     max_total_tool_calls, total_tool_calls, estimated_cost_usd,
-                    rerun_execution_mode, warnings, created_at, updated_at
+                    rerun_execution_mode, warnings, run_origin, terminal_status,
+                    created_at, updated_at
                 )
                 VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 1, 0, 0, ?, ?, ?, ?, ?, ?,
-                    0, 0, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 1, 0, 0, ?, ?, ?, ?, ?, ?,
+                    0, 0, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -606,6 +610,7 @@ class ResearchRepository:
                     input_prompt,
                     initial_status.value,
                     report,
+                    final_report,
                     done_reason,
                     int(needs_human_review),
                     "completed",
@@ -625,6 +630,8 @@ class ResearchRepository:
                     max_tool_calls,
                     request_metadata.get("rerun_execution_mode", RerunExecutionMode.API.value),
                     _json_dump([]),
+                    run_origin,
+                    terminal_status,
                     now_text,
                     now_text,
                 ),

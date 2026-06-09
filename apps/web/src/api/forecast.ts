@@ -8,6 +8,7 @@ import type {
   ForecastDetail,
   ForecastFramingDraftRequest,
   ForecastFramingDraftResponse,
+  ManualResearchPackPromptResponse,
   ForecastReviewRequest,
   ForecastReviewResponse,
   ForecastSummary,
@@ -102,6 +103,43 @@ export function dispatchCurrentStatePack(
     body: { pack_role: "current_state", tool_profile: "public" },
     signal: options.signal,
     idempotencyKey: commandKey("forecast-pack", options),
+  });
+}
+
+export function getManualResearchPackPrompt(
+  forecastId: string,
+  signal?: AbortSignal,
+): Promise<ManualResearchPackPromptResponse> {
+  return apiClient.request(`${BASE}/${forecastId}/research-packs/manual-prompt`, {
+    signal,
+  });
+}
+
+type ManualPackReportSource =
+  | { source: "text"; text: string }
+  | { source: "file"; file: File };
+
+export function importManualResearchPack(
+  forecastId: string,
+  request: {
+    promptSha256: string;
+    report: ManualPackReportSource;
+  },
+  input?: AbortSignal | ForecastCommandOptions,
+): Promise<ResearchPackResponse> {
+  const options = optionsFrom(input);
+  const body = new FormData();
+  body.append("prompt_sha256", request.promptSha256);
+  if (request.report.source === "file") {
+    body.append("report_file", request.report.file);
+  } else {
+    body.append("report_text", request.report.text);
+  }
+  return apiClient.request(`${BASE}/${forecastId}/research-packs/manual-import`, {
+    method: "POST",
+    body,
+    signal: options.signal,
+    idempotencyKey: commandKey("forecast-manual-pack", options),
   });
 }
 

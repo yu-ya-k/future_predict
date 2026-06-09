@@ -725,6 +725,18 @@ export interface ResearchPackResponse {
   policy_decision_id: string;
 }
 
+export interface ManualResearchPackPromptResponse {
+  forecast_id: string;
+  framing_version: number;
+  prompt: string;
+  prompt_sha256: string;
+  prompt_version: string;
+  pack_role: "current_state";
+  tool_profile: "public";
+  max_report_chars: number;
+  max_file_bytes: number;
+}
+
 export interface ForecastSource {
   source_id: string;
   title: string;

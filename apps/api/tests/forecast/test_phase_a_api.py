@@ -80,6 +80,39 @@ def _request_hash(payload: object) -> str:
     ).hexdigest()
 
 
+async def _create_approved_forecast(client: AsyncClient, *, question: str) -> str:
+    create = await client.post(
+        "/forecasts",
+        json={
+            "question": question,
+            "resolution_criteria": "Resolve from public vendor and benchmark reports.",
+            "outcomes": ["Reached", "Not reached"],
+        },
+    )
+    assert create.status_code == 202
+    forecast_id = create.json()["forecast_id"]
+
+    approve = await client.post(
+        f"/forecasts/{forecast_id}/review",
+        json={"action": "approve_framing"},
+    )
+    assert approve.status_code == 200
+    return str(forecast_id)
+
+
+def _forecast_pack_and_run_counts(
+    forecast: ForecastOrchestrator,
+    forecast_id: str,
+) -> tuple[int, int]:
+    with forecast.repository.connect() as connection:
+        pack_count = connection.execute(
+            "SELECT COUNT(*) FROM forecast_research_packs WHERE forecast_id = ?",
+            (forecast_id,),
+        ).fetchone()[0]
+        run_count = connection.execute("SELECT COUNT(*) FROM research_runs").fetchone()[0]
+    return int(pack_count), int(run_count)
+
+
 class _MissingResponseIdFakeAzure(IntegrationFakeAzure):
     def submit_deep_research(
         self,
@@ -1518,6 +1551,402 @@ async def test_research_pack_submit_failure_remains_visible_on_forecast(
         delete_response = await client.delete(f"/research-runs/{run_id}")
         assert delete_response.status_code == 409
         assert "forecast_linked_research_run" in str(delete_response.json()["detail"])
+
+
+@pytest.mark.anyio
+async def test_manual_research_pack_import_links_completed_pack_and_evidence(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+    report = (
+        "Public source A reports adoption grew in 2028.\n"
+        "Public source B says support-ticket automation exceeded the threshold.\n"
+        "Counter evidence remains limited but public benchmarks support the result."
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will AI agents handle 30% of support tickets by 2029?",
+                "resolution_criteria": "Resolve from public vendor and benchmark reports.",
+                "outcomes": ["Reached", "Not reached"],
+            },
+        )
+        assert create.status_code == 202
+        forecast_id = create.json()["forecast_id"]
+
+        approve = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={"action": "approve_framing"},
+        )
+        assert approve.status_code == 200
+
+        prompt = await client.get(
+            f"/forecasts/{forecast_id}/research-packs/manual-prompt"
+        )
+        assert prompt.status_code == 200
+        prompt_json = prompt.json()
+        assert prompt_json["forecast_id"] == forecast_id
+        assert prompt_json["pack_role"] == "current_state"
+        assert prompt_json["tool_profile"] == "public"
+        assert prompt_json["prompt_sha256"] == hashlib.sha256(
+            prompt_json["prompt"].encode("utf-8")
+        ).hexdigest()
+
+        imported = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            headers={"Idempotency-Key": "manual-pack-1"},
+            data={
+                "prompt_sha256": prompt_json["prompt_sha256"],
+                "report_text": report,
+            },
+        )
+        assert imported.status_code == 200
+        imported_json = imported.json()
+        assert imported_json["status"] == "completed"
+        run_id = imported_json["research_run_id"]
+
+        replay = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            headers={"Idempotency-Key": "manual-pack-1"},
+            data={
+                "prompt_sha256": prompt_json["prompt_sha256"],
+                "report_text": report,
+            },
+        )
+        assert replay.status_code == 200
+        assert replay.json() == imported_json
+
+        conflict = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            headers={"Idempotency-Key": "manual-pack-1"},
+            data={
+                "prompt_sha256": prompt_json["prompt_sha256"],
+                "report_text": f"{report}\nDifferent line.",
+            },
+        )
+        assert conflict.status_code == 409
+        assert _typed_code(conflict.json()) == "idempotency_conflict"
+
+        detail = await client.get(f"/forecasts/{forecast_id}")
+        assert detail.status_code == 200
+        detail_json = detail.json()
+        assert detail_json["status"] == "pack_running"
+        assert detail_json["current_research_pack_status"] == "completed"
+        pack_detail = detail_json["current_research_pack"]
+        assert pack_detail["research_run_id"] == run_id
+        assert pack_detail["pack_status"] == "completed"
+        assert pack_detail["effective_status"] == "completed"
+        assert pack_detail["research_run_status"] == "completed"
+        assert pack_detail["done_reason"] is None
+        assert pack_detail["needs_human_review"] is False
+
+        run_status = await client.get(f"/research-runs/{run_id}")
+        assert run_status.status_code == 200
+        run_status_json = run_status.json()
+        assert run_status_json["status"] == "completed"
+        assert run_status_json["terminal_status"] == "completed_manual_import"
+        assert run_status_json["forecast_context"]["forecast_id"] == forecast_id
+        assert run_status_json["forecast_context"]["pack_id"] == imported_json["pack_id"]
+        assert research.repository.get_run(UUID(run_id)).run_origin == "forecast"
+
+        delete_response = await client.delete(f"/research-runs/{run_id}")
+        assert delete_response.status_code == 409
+        assert "forecast_linked_research_run" in str(delete_response.json()["detail"])
+
+        evidence = await client.post(f"/forecasts/{forecast_id}/evidence/extract")
+        assert evidence.status_code == 200
+        assert evidence.json()["sources"]
+        assert evidence.json()["claims"]
+
+        duplicate = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            headers={"Idempotency-Key": "manual-pack-2"},
+            data={
+                "prompt_sha256": prompt_json["prompt_sha256"],
+                "report_text": report,
+            },
+        )
+        assert duplicate.status_code == 409
+        assert _typed_code(duplicate.json()) == "research_pack_already_exists"
+
+
+@pytest.mark.anyio
+async def test_manual_research_pack_import_rejects_stale_prompt_without_run(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will AI agents handle 30% of support tickets by 2029?",
+                "resolution_criteria": "Resolve from public vendor and benchmark reports.",
+                "outcomes": ["Reached", "Not reached"],
+            },
+        )
+        assert create.status_code == 202
+        forecast_id = create.json()["forecast_id"]
+
+        approve = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={"action": "approve_framing"},
+        )
+        assert approve.status_code == 200
+
+        imported = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            headers={"Idempotency-Key": "manual-pack-stale"},
+            data={
+                "prompt_sha256": "0" * 64,
+                "report_text": "Public report text from a manual Deep Research run.",
+            },
+        )
+        assert imported.status_code == 409
+        assert _typed_code(imported.json()) == "prompt_stale"
+
+    with forecast.repository.connect() as connection:
+        pack_count = connection.execute(
+            "SELECT COUNT(*) FROM forecast_research_packs WHERE forecast_id = ?",
+            (forecast_id,),
+        ).fetchone()[0]
+        run_count = connection.execute("SELECT COUNT(*) FROM research_runs").fetchone()[0]
+    assert pack_count == 0
+    assert run_count == 0
+
+
+@pytest.mark.anyio
+async def test_manual_research_pack_import_rejects_invalid_prompt_hash_before_report(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+    forecast_id = "00000000-0000-4000-8000-000000000001"
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        imported = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            data={
+                "prompt_sha256": "A" * 64,
+                "report_text": "",
+            },
+        )
+
+    assert imported.status_code == 422
+    detail = cast(list[dict[str, Any]], imported.json()["detail"])
+    assert isinstance(detail, list)
+    assert any(error["loc"][-1] == "prompt_sha256" for error in detail)
+    assert _forecast_pack_and_run_counts(forecast, forecast_id) == (0, 0)
+
+
+@pytest.mark.anyio
+async def test_manual_research_pack_import_rejects_sensitive_report_without_run(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        forecast_id = await _create_approved_forecast(
+            client,
+            question="Will AI agents handle 30% of support tickets by 2029?",
+        )
+        prompt = await client.get(
+            f"/forecasts/{forecast_id}/research-packs/manual-prompt"
+        )
+        assert prompt.status_code == 200
+
+        imported = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            headers={"Idempotency-Key": "manual-pack-sensitive"},
+            data={
+                "prompt_sha256": prompt.json()["prompt_sha256"],
+                "report_text": "Public summary accidentally included API_KEY=skipped.",
+            },
+        )
+
+    assert imported.status_code == 409
+    assert _typed_code(imported.json()) == "policy_requires_revision"
+    assert _forecast_pack_and_run_counts(forecast, forecast_id) == (0, 0)
+
+
+@pytest.mark.anyio
+async def test_manual_research_pack_file_upload_tracks_filename_idempotency(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+    report = (
+        "Public source A reports adoption grew in 2028.\n"
+        "Public source B says support-ticket automation exceeded the threshold.\n"
+        "Public benchmarks support the result."
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        forecast_id = await _create_approved_forecast(
+            client,
+            question="Will AI agents handle 30% of support tickets by 2029?",
+        )
+        prompt = await client.get(
+            f"/forecasts/{forecast_id}/research-packs/manual-prompt"
+        )
+        assert prompt.status_code == 200
+        prompt_sha256 = prompt.json()["prompt_sha256"]
+
+        invalid_file = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            data={"prompt_sha256": prompt_sha256},
+            files={
+                "report_file": (
+                    "report.pdf",
+                    report.encode("utf-8"),
+                    "application/pdf",
+                ),
+            },
+        )
+        assert invalid_file.status_code == 422
+        assert _forecast_pack_and_run_counts(forecast, forecast_id) == (0, 0)
+
+        imported = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            headers={"Idempotency-Key": "manual-pack-file"},
+            data={"prompt_sha256": prompt_sha256},
+            files={
+                "report_file": (
+                    "first.md",
+                    report.encode("utf-8"),
+                    "text/markdown",
+                ),
+            },
+        )
+        assert imported.status_code == 200
+        imported_json = imported.json()
+        assert imported_json["status"] == "completed"
+
+        replay = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            headers={"Idempotency-Key": "manual-pack-file"},
+            data={"prompt_sha256": prompt_sha256},
+            files={
+                "report_file": (
+                    "first.md",
+                    report.encode("utf-8"),
+                    "text/markdown",
+                ),
+            },
+        )
+        assert replay.status_code == 200
+        assert replay.json() == imported_json
+
+        conflict = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            headers={"Idempotency-Key": "manual-pack-file"},
+            data={"prompt_sha256": prompt_sha256},
+            files={
+                "report_file": (
+                    "second.md",
+                    report.encode("utf-8"),
+                    "text/markdown",
+                ),
+            },
+        )
+
+    assert conflict.status_code == 409
+    assert _typed_code(conflict.json()) == "idempotency_conflict"
+    assert _forecast_pack_and_run_counts(forecast, forecast_id) == (1, 1)
+
+
+@pytest.mark.anyio
+async def test_manual_research_pack_import_cleans_up_run_when_pack_update_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+    report = (
+        "Public source A reports adoption grew in 2028.\n"
+        "Public source B says support-ticket automation exceeded the threshold."
+    )
+
+    def fail_pack_update(**_kwargs: object) -> sqlite3.Row:
+        raise RuntimeError("pack update failed")
+
+    monkeypatch.setattr(
+        forecast.repository,
+        "update_research_pack_status",
+        fail_pack_update,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://testserver",
+    ) as client:
+        forecast_id = await _create_approved_forecast(
+            client,
+            question="Will AI agents handle 30% of support tickets by 2029?",
+        )
+        prompt = await client.get(
+            f"/forecasts/{forecast_id}/research-packs/manual-prompt"
+        )
+        assert prompt.status_code == 200
+
+        imported = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            data={
+                "prompt_sha256": prompt.json()["prompt_sha256"],
+                "report_text": report,
+            },
+        )
+        assert imported.status_code == 500
+
+        detail = await client.get(f"/forecasts/{forecast_id}")
+        assert detail.status_code == 200
+
+    assert _forecast_pack_and_run_counts(forecast, forecast_id) == (0, 0)
+    assert not research.artifacts.root.exists() or not any(
+        research.artifacts.root.iterdir()
+    )
+    detail_json = detail.json()
+    assert detail_json["status"] == "framing_approved"
+    assert detail_json["current_research_pack"] is None
+    assert detail_json["current_research_pack_status"] is None
 
 
 @pytest.mark.anyio

@@ -1286,10 +1286,12 @@ describe("Forecast UI", () => {
 
     expect(
       await screen.findByRole("heading", {
-        name: "公開情報はまだ収集されていません",
+        name: "公開情報の収集方法を選択",
         level: 2,
       }),
     ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /アプリで自動収集/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /ChatGPTで手動収集/ })).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "公開情報の収集を開始" }),
     ).toBeEnabled();
@@ -1329,6 +1331,306 @@ describe("Forecast UI", () => {
     expect(flow.querySelectorAll(".forecast-flow-edge--wrap-break")).toHaveLength(2);
     expect(screen.queryByText("次にやること")).not.toBeInTheDocument();
     expect(screen.queryByText("実行できます")).not.toBeInTheDocument();
+  });
+
+  it("imports manual public information and advances to evidence extraction", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    let imported = false;
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: imported ? "pack_running" : "framing_approved",
+              approved_framing_version: 1,
+              current_research_pack: imported
+                ? currentResearchPack({
+                    pack_status: "completed",
+                    effective_status: "completed",
+                    research_run_status: "completed",
+                    total_tool_calls: 0,
+                  })
+                : null,
+              current_research_pack_status: imported ? "completed" : null,
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/research-packs/manual-prompt" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse({
+            forecast_id: "forecast-1",
+            framing_version: 1,
+            prompt: "Manual Deep Research prompt",
+            prompt_sha256: "prompt-hash",
+            prompt_version: "current_state_pack_v1",
+            pack_role: "current_state",
+            tool_profile: "public",
+            max_report_chars: 50000,
+            max_file_bytes: 1048576,
+          });
+        }
+        if (
+          path === "/forecasts/forecast-1/research-packs/manual-import" &&
+          init?.method === "POST"
+        ) {
+          expect(init.body).toBeInstanceOf(FormData);
+          const body = init.body as FormData;
+          expect(body.get("prompt_sha256")).toBe("prompt-hash");
+          expect(body.get("report_text")).toBe(
+            "Manual report from ChatGPT Deep Research.",
+          );
+          expect(body.has("report_file")).toBe(false);
+          imported = true;
+          return jsonResponse({
+            pack_id: "pack-1",
+            forecast_id: "forecast-1",
+            research_run_id: "run-1",
+            pack_role: "current_state",
+            tool_profile: "public",
+            status: "completed",
+            policy_decision_id: "policy-1",
+          });
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "公開情報の収集方法を選択",
+      level: 2,
+    });
+    const modeGroup = screen.getByRole("group", { name: "公開情報の収集方法" });
+    const autoMode = within(modeGroup).getByRole("button", {
+      name: /アプリで自動収集/,
+    });
+    const manualMode = within(modeGroup).getByRole("button", {
+      name: /ChatGPTで手動収集/,
+    });
+    expect(autoMode).toHaveAttribute("aria-pressed", "true");
+    expect(manualMode).toHaveAttribute("aria-pressed", "false");
+    expect(within(modeGroup).queryByRole("tab")).not.toBeInTheDocument();
+    await userEvent.click(manualMode);
+
+    expect(manualMode).toHaveAttribute("aria-pressed", "true");
+    expect(
+      await screen.findByRole("textbox", {
+        name: "ChatGPT Deep Researchへ渡すPrompt",
+      }),
+    ).toHaveValue("Manual Deep Research prompt");
+    await userEvent.type(
+      screen.getByLabelText("結果を貼り付け"),
+      "Manual report from ChatGPT Deep Research.",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "結果を取り込む" }));
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "公開情報の収集が完了しました",
+        level: 2,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "証拠を抽出" })).toBeEnabled();
+    expect(screen.getByRole("link", { name: "取り込み記録" })).toHaveAttribute(
+      "href",
+      "#/runs/run-1",
+    );
+  });
+
+  it("clears the actual manual report file input when text is typed and after successful file import", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const importBodyRef: { current: FormData | null } = { current: null };
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: "framing_approved",
+              approved_framing_version: 1,
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/research-packs/manual-prompt" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse({
+            forecast_id: "forecast-1",
+            framing_version: 1,
+            prompt: "Manual Deep Research prompt",
+            prompt_sha256: "prompt-hash",
+            prompt_version: "current_state_pack_v1",
+            pack_role: "current_state",
+            tool_profile: "public",
+            max_report_chars: 50000,
+            max_file_bytes: 1048576,
+          });
+        }
+        if (
+          path === "/forecasts/forecast-1/research-packs/manual-import" &&
+          init?.method === "POST"
+        ) {
+          expect(init.body).toBeInstanceOf(FormData);
+          importBodyRef.current = init.body as FormData;
+          return jsonResponse({
+            pack_id: "pack-1",
+            forecast_id: "forecast-1",
+            research_run_id: "run-1",
+            pack_role: "current_state",
+            tool_profile: "public",
+            status: "completed",
+            policy_decision_id: "policy-1",
+          });
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "公開情報の収集方法を選択",
+      level: 2,
+    });
+    await userEvent.click(screen.getByRole("button", { name: /ChatGPTで手動収集/ }));
+    await screen.findByRole("textbox", {
+      name: "ChatGPT Deep Researchへ渡すPrompt",
+    });
+
+    const fileInput = screen.getByLabelText(
+      "md/txtをアップロード",
+    ) as HTMLInputElement;
+    const reportText = screen.getByLabelText(
+      "結果を貼り付け",
+    ) as HTMLTextAreaElement;
+    const firstFile = new File(["Old file report"], "old-report.md", {
+      type: "text/markdown",
+    });
+    await userEvent.upload(fileInput, firstFile);
+
+    expect(fileInput.files).toHaveLength(1);
+    expect(fileInput.files?.[0]).toBe(firstFile);
+    expect(screen.getByText("選択中: old-report.md")).toBeInTheDocument();
+
+    await userEvent.type(reportText, "Typed report replaces the file.");
+
+    expect(fileInput.files).toHaveLength(0);
+    expect(screen.queryByText(/選択中:/)).not.toBeInTheDocument();
+
+    const importedFile = new File(["Imported file report"], "imported.md", {
+      type: "text/markdown",
+    });
+    await userEvent.upload(fileInput, importedFile);
+
+    expect(reportText).toHaveValue("");
+    expect(fileInput.files).toHaveLength(1);
+    expect(fileInput.files?.[0]).toBe(importedFile);
+
+    await userEvent.click(screen.getByRole("button", { name: "結果を取り込む" }));
+
+    await waitFor(() => expect(importBodyRef.current).not.toBeNull());
+    const importBody = importBodyRef.current;
+    if (!importBody) throw new Error("manual import FormData was not captured");
+    expect(importBody.get("prompt_sha256")).toBe("prompt-hash");
+    expect(importBody.has("report_text")).toBe(false);
+    expect(importBody.get("report_file")).toBe(importedFile);
+    await waitFor(() => expect(fileInput.files).toHaveLength(0));
+    expect(reportText).toHaveValue("");
+    expect(screen.getByRole("button", { name: "結果を取り込む" })).toBeDisabled();
+  });
+
+  it("resets manual prompt and report state when moving between forecast routes", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const promptForecastIds: string[] = [];
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        const forecastMatch = path.match(/^\/forecasts\/([^/]+)$/);
+        if (forecastMatch && (!init || init.method === "GET")) {
+          const forecastId = forecastMatch[1];
+          return jsonResponse(
+            forecastDetail({
+              forecast_id: forecastId,
+              question: `Question for ${forecastId}`,
+              status: "framing_approved",
+              approved_framing_version: 1,
+            }),
+          );
+        }
+        const promptMatch = path.match(
+          /^\/forecasts\/([^/]+)\/research-packs\/manual-prompt$/,
+        );
+        if (promptMatch && (!init || init.method === "GET")) {
+          const forecastId = promptMatch[1];
+          promptForecastIds.push(forecastId);
+          return jsonResponse({
+            forecast_id: forecastId,
+            framing_version: 1,
+            prompt: `Manual prompt for ${forecastId}`,
+            prompt_sha256: `${forecastId}-prompt-hash`,
+            prompt_version: "current_state_pack_v1",
+            pack_role: "current_state",
+            tool_profile: "public",
+            max_report_chars: 50000,
+            max_file_bytes: 1048576,
+          });
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    expect(await screen.findByText("Question for forecast-1")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /ChatGPTで手動収集/ }));
+    expect(
+      await screen.findByRole("textbox", {
+        name: "ChatGPT Deep Researchへ渡すPrompt",
+      }),
+    ).toHaveValue("Manual prompt for forecast-1");
+    await userEvent.type(screen.getByLabelText("結果を貼り付け"), "Old report");
+
+    act(() => {
+      window.location.hash = "#/forecasts/forecast-2";
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+
+    expect(await screen.findByText("Question for forecast-2")).toBeInTheDocument();
+    const modeGroup = screen.getByRole("group", { name: "公開情報の収集方法" });
+    expect(
+      within(modeGroup).getByRole("button", { name: /アプリで自動収集/ }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(
+      screen.queryByRole("textbox", {
+        name: "ChatGPT Deep Researchへ渡すPrompt",
+      }),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(
+      within(modeGroup).getByRole("button", { name: /ChatGPTで手動収集/ }),
+    );
+
+    expect(
+      await screen.findByRole("textbox", {
+        name: "ChatGPT Deep Researchへ渡すPrompt",
+      }),
+    ).toHaveValue("Manual prompt for forecast-2");
+    expect(screen.getByLabelText("結果を貼り付け")).toHaveValue("");
+    expect(promptForecastIds).toEqual(["forecast-1", "forecast-2"]);
   });
 
   it("separates pack submission from a backend-running research pack", async () => {

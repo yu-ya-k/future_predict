@@ -314,6 +314,125 @@ class ResearchOrchestrator:
             return run, False
         return run, dispatch_review
 
+    def create_forecast_manual_import_run(
+        self,
+        *,
+        input_prompt: str,
+        report: str,
+        metadata: dict[str, Any],
+    ) -> ResearchRunRecord:
+        imported_at = utc_now()
+        options = ResearchRunOptions(
+            max_targeted_rerun_runs=0,
+            max_full_rerun_runs=0,
+        )
+        options_payload = options.model_dump(mode="json")
+        request_metadata = {
+            **metadata,
+            "prompt_sha256": hashlib.sha256(input_prompt.encode("utf-8")).hexdigest(),
+            "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+            "prompt_chars": len(input_prompt),
+            "report_chars": len(report),
+            "allow_remote_review": False,
+            "allow_api_reruns": False,
+            "rerun_execution_mode": RerunExecutionMode.DISABLED.value,
+            "options": options_payload,
+            "imported_at": imported_at.isoformat(),
+            "run_origin": "forecast",
+        }
+        request_hash = _manual_import_request_hash(
+            input_prompt=input_prompt,
+            report=report,
+            options=options_payload,
+            allow_remote_review=False,
+            allow_api_reruns=False,
+            rerun_execution_mode=RerunExecutionMode.DISABLED,
+        )
+        contract, research_items, _optimized_prompt = build_objective_contract(
+            user_prompt=input_prompt,
+        )
+        run_id = uuid4()
+        thread_id = str(uuid4())
+        try:
+            prompt_path, _ = self.artifacts.save_text(
+                run_id,
+                "prompts/forecast_manual_prompt.txt",
+                input_prompt,
+            )
+            report_path, _ = self.artifacts.save_text(
+                run_id,
+                "reports/report_attempt_001.md",
+                report,
+            )
+            raw_path, _ = self.artifacts.save_json(
+                run_id,
+                "raw-responses/forecast_manual_import_001.json",
+                {
+                    **request_metadata,
+                    "source": "manual_upload",
+                    "prompt_path": prompt_path,
+                    "report_path": report_path,
+                    "request_hash": request_hash,
+                },
+            )
+            citations = _manual_upload_citations(report, retrieved_at=imported_at.isoformat())
+            attempt = ResearchAttempt(
+                run_no=1,
+                response_id=None,
+                status="completed",
+                model="chatgpt-deep-research-manual",
+                source="manual_upload",
+                prompt=input_prompt,
+                report=report,
+                citations=citations,
+                raw_response_artifact_path=raw_path,
+            )
+            report_digest = report_hash(report)
+            checkpoint_snapshot = _manual_import_checkpoint_snapshot(
+                kind="deep_research_collected",
+                status=RunStatus.COMPLETED,
+                input_prompt=input_prompt,
+                report=report,
+                source_attempt_no=1,
+                snapshot_extra={
+                    "source": "manual_upload",
+                    "prompt_path": prompt_path,
+                    "report_path": report_path,
+                    "citations_count": len(citations),
+                    "forecast_manual_import": True,
+                },
+            )
+            run, created = self.repository.create_manual_import_run(
+                run_id=run_id,
+                thread_id=thread_id,
+                input_prompt=input_prompt,
+                report=report,
+                options=options,
+                settings=self.settings,
+                request_hash=request_hash,
+                request_metadata=request_metadata,
+                idempotency_key=None,
+                contract=contract,
+                research_items=research_items,
+                attempt=attempt,
+                prompt_path=prompt_path,
+                report_path=report_path,
+                initial_status=RunStatus.COMPLETED,
+                needs_human_review=False,
+                done_reason=None,
+                manual_checkpoint_snapshot=checkpoint_snapshot,
+                manual_checkpoint_report_hash=report_digest,
+                final_report=report,
+                run_origin="forecast",
+                terminal_status="completed_manual_import",
+            )
+        except Exception:
+            self.artifacts.delete_run(run_id)
+            raise
+        if not created:
+            self.artifacts.delete_run(run_id)
+        return run
+
     def submit_deep_research(
         self,
         run_id: UUID,
