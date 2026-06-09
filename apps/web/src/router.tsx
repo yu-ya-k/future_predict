@@ -14,6 +14,10 @@
  *   #/runs/:id/report      Report viewer       (SCR-5)
  *   #/runs/:id/audit       Audit log           (SCR-6)
  *   #/settings             Settings            (SCR-7)
+ *   #/forecasts            Forecast dashboard
+ *   #/forecasts/new        New forecast
+ *   #/forecasts/:id        Forecast detail
+ *   #/forecasts/:id/audit  Forecast audit
  */
 
 /* eslint-disable react-refresh/only-export-components --
@@ -37,6 +41,10 @@ export type RouteName =
   | "report"
   | "audit"
   | "settings"
+  | "forecasts"
+  | "forecast-new"
+  | "forecast-detail"
+  | "forecast-audit"
   | "not-found";
 
 export type ReportTab = "research";
@@ -55,6 +63,8 @@ export interface Route {
   auditReviewNo?: number | null;
   /** Optional canonical path for legacy route compatibility. */
   redirectTo?: string;
+  /** forecast id for forecast-scoped routes. */
+  forecastId?: string;
   path: string;
 }
 
@@ -65,8 +75,21 @@ function parseHash(hash: string): Route {
   const segments = path.split("/").filter(Boolean);
 
   if (segments.length === 0) return { name: "dashboard", path };
-  if (segments[0] === "new") return { name: "new", path };
-  if (segments[0] === "settings") return { name: "settings", path };
+  if (segments[0] === "new" && segments.length === 1) return { name: "new", path };
+  if (segments[0] === "settings" && segments.length === 1) {
+    return { name: "settings", path };
+  }
+  if (segments[0] === "forecasts") {
+    if (segments.length === 1) return { name: "forecasts", path };
+    if (segments[1] === "new" && segments.length === 2) {
+      return { name: "forecast-new", path };
+    }
+    const forecastId = decodeURIComponent(segments[1]);
+    if (segments.length === 3 && segments[2] === "audit") {
+      return { name: "forecast-audit", forecastId, path };
+    }
+    if (segments.length === 2) return { name: "forecast-detail", forecastId, path };
+  }
 
   if (segments[0] === "runs" && segments[1]) {
     const runId = decodeURIComponent(segments[1]);
@@ -143,6 +166,11 @@ export function routes() {
       return `/runs/${encodeURIComponent(runId)}/audit${query ? `?${query}` : ""}`;
     },
     settings: "/settings",
+    forecasts: "/forecasts",
+    forecastNew: "/forecasts/new",
+    forecastDetail: (forecastId: string) => `/forecasts/${encodeURIComponent(forecastId)}`,
+    forecastAudit: (forecastId: string) =>
+      `/forecasts/${encodeURIComponent(forecastId)}/audit`,
   };
 }
 

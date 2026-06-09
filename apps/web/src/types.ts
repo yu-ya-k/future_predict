@@ -169,14 +169,24 @@ export interface RunProgress {
   estimated_cost_usd: number;
 }
 
+export interface ForecastRunContext {
+  forecast_id: string;
+  pack_id: string;
+  pack_role: string;
+  tool_profile: string;
+}
+
 export interface ResearchRunStatusResponse {
   run_id: string;
   status: RunStatus;
   terminal_status?: string | null;
   done_reason: string | null;
   needs_human_review: boolean;
+  created_at: string;
+  updated_at: string;
   deep_research_submitted_at?: string | null;
   progress: RunProgress;
+  forecast_context: ForecastRunContext | null;
 }
 
 export interface AcceptanceCriterion {
@@ -559,4 +569,280 @@ export const TERMINAL_STATUSES: ReadonlySet<RunStatus> = new Set([
 
 export function isTerminal(status: RunStatus): boolean {
   return TERMINAL_STATUSES.has(status);
+}
+
+// ── Forecast PhaseA ─────────────────────────────────────────────────────────
+
+export type ForecastStatus =
+  | "framing_pending"
+  | "framing_approved"
+  | "pack_running"
+  | "evidence_ready"
+  | "scenarios_ready"
+  | "draft_ready"
+  | "committed"
+  | "resolved";
+
+export interface ForecastOutcome {
+  outcome_id: string;
+  label: string;
+  definition: string;
+  resolution_rule: string;
+  normalization_group_id: string;
+  sort_order: number;
+}
+
+export interface ForecastSummary {
+  forecast_id: string;
+  question: string;
+  status: ForecastStatus;
+  resolution_date?: string | null;
+  current_framing_version: number;
+  approved_framing_version?: number | null;
+  committed_version_id?: string | null;
+  resolved_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ForecastCurrentResearchPack {
+  pack_id: string;
+  research_run_id: string;
+  pack_status: string;
+  effective_status: string;
+  research_run_status: string;
+  pack_created_at: string;
+  pack_updated_at: string;
+  research_run_created_at?: string | null;
+  research_run_updated_at?: string | null;
+  deep_research_started_at?: string | null;
+  total_tool_calls: number;
+  estimated_cost_usd: number;
+  done_reason?: string | null;
+  last_error?: string | null;
+  needs_human_review: boolean;
+}
+
+export interface ForecastDetail extends ForecastSummary {
+  original_execution_prompt: string | null;
+  target_population?: string | null;
+  unit_of_analysis?: string | null;
+  resolution_criteria: string;
+  resolution_sources: string[];
+  decision_context?: string | null;
+  confidentiality_class: string;
+  outcomes: ForecastOutcome[];
+  current_research_pack?: ForecastCurrentResearchPack | null;
+  current_research_pack_status?: string | null;
+  approved_claim_target_link_count: number;
+}
+
+export interface ForecastCreateRequest {
+  question: string;
+  original_execution_prompt?: string | null;
+  resolution_date?: string | null;
+  target_population?: string | null;
+  unit_of_analysis?: string | null;
+  resolution_criteria?: string;
+  resolution_sources?: string[];
+  decision_context?: string | null;
+  confidentiality_class?: "public" | "restricted";
+  outcomes?: string[];
+}
+
+export interface ForecastCreateResponse {
+  forecast_id: string;
+  status: ForecastStatus;
+  framing_version: number;
+  created_at: string;
+}
+
+export interface ForecastFramingDraft {
+  forecast_prompt: string;
+  question: string;
+  resolution_criteria: string;
+  resolution_sources: string[];
+  target_population?: string | null;
+  unit_of_analysis?: string | null;
+  decision_context?: string | null;
+  outcomes: string[];
+  clarifying_questions: ForecastFramingDraftClarifyingQuestion[];
+  confidence: number;
+}
+
+export interface ForecastFramingDraftClarifyingQuestion {
+  question_id: string;
+  label: string;
+  prompt: string;
+  why_needed: string;
+  answer_type: "text" | "single_select" | "multi_select" | "number" | "date" | "boolean";
+  required: boolean;
+  options: string[];
+}
+
+export interface ForecastFramingDraftAnswer {
+  question_id: string;
+  answer: string;
+}
+
+export interface ForecastFramingDraftRequest {
+  rough_question: string;
+  answers?: ForecastFramingDraftAnswer[];
+  previous_draft?: ForecastFramingDraft | null;
+  locale?: "ja" | "en";
+}
+
+export interface ForecastFramingDraftResponse {
+  draft: ForecastFramingDraft;
+  create_payload?: ForecastCreateRequest | null;
+  ready_to_create: boolean;
+  model: string;
+  response_id?: string | null;
+  warnings: string[];
+}
+
+export interface ForecastReviewRequest {
+  action: "approve_framing" | "approve_phase_a_version" | "approve_claim_target_links";
+  comment?: string | null;
+  estimate_set_id?: string | null;
+  version_id?: string | null;
+}
+
+export interface ForecastReviewResponse {
+  forecast_id: string;
+  action: ForecastReviewRequest["action"];
+  status: ForecastStatus;
+  approved_framing_version?: number | null;
+  estimate_set_id?: string | null;
+}
+
+export interface ResearchPackResponse {
+  pack_id: string;
+  forecast_id: string;
+  research_run_id: string;
+  pack_role: "current_state";
+  tool_profile: "public";
+  status: string;
+  policy_decision_id: string;
+}
+
+export interface ManualResearchPackPromptResponse {
+  forecast_id: string;
+  framing_version: number;
+  prompt: string;
+  prompt_sha256: string;
+  prompt_version: string;
+  pack_role: "current_state";
+  tool_profile: "public";
+  max_report_chars: number;
+  max_file_bytes: number;
+  pack_id?: string | null;
+  research_run_id?: string | null;
+  recovering_existing_pack?: boolean;
+  recoverable_status?: string | null;
+}
+
+export interface ForecastSource {
+  source_id: string;
+  title: string;
+  publisher?: string | null;
+  url?: string | null;
+  source_type: string;
+  source_classification: string;
+  reliability_score: number;
+}
+
+export interface ForecastClaim {
+  claim_id: string;
+  text: string;
+  claim_type: string;
+  polarity: number;
+  evidence_strength: number;
+  reliability_score: number;
+  cluster_id: string;
+  independence_group: string;
+  source_ids: string[];
+  review_status: string;
+}
+
+export interface EvidenceExtractResponse {
+  forecast_id: string;
+  sources: ForecastSource[];
+  claims: ForecastClaim[];
+  quarantine_artifact_path?: string | null;
+}
+
+export interface ForecastScenario {
+  scenario_id: string;
+  outcome_id: string;
+  label: string;
+  description: string;
+  probability?: number | null;
+  normalized_weight: number;
+  validity_status: string;
+}
+
+export interface ScenarioGenerateResponse {
+  forecast_id: string;
+  scenarios: ForecastScenario[];
+}
+
+export interface ProbabilityEstimate {
+  estimate_id: string;
+  target_kind: string;
+  target_id: string;
+  prior: number;
+  evidence_update: number;
+  cross_impact_adjustment: number;
+  simulation_adjustment: number;
+  calibration_adjustment: number;
+  human_adjustment: number;
+  final_probability: number;
+  uncertainty_range: { lo80: number; hi80: number };
+  components: Record<string, unknown>;
+}
+
+export interface EstimateSetResponse {
+  estimate_set_id: string;
+  forecast_id: string;
+  status: string;
+  approved: boolean;
+  engine_version: string;
+  input_snapshot_hash: string;
+  engine_code_hash: string;
+  random_seed: number;
+  normalization_group_id: string;
+  estimates: ProbabilityEstimate[];
+}
+
+export interface CommitVersionResponse {
+  version_id: string;
+  forecast_id: string;
+  estimate_set_id: string;
+  input_snapshot_hash: string;
+  snapshot_artifact_path: string;
+  committed_at: string;
+}
+
+export interface ResolveForecastResponse {
+  forecast_id: string;
+  outcome_id: string;
+  multiclass_brier: number;
+  log_score: number;
+  scorer_version: string;
+  resolved_at: string;
+}
+
+export interface ForecastAuditResponse {
+  forecast_id: string;
+  reviews: Record<string, unknown>[];
+  versions: Record<string, unknown>[];
+  policy_decisions: Record<string, unknown>[];
+  events: Array<{
+    event_id: string;
+    forecast_id: string;
+    event_type: string;
+    event_json: Record<string, unknown>;
+    created_at: string;
+  }>;
 }

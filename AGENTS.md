@@ -100,6 +100,12 @@ COREPACK_HOME=$PWD/.corepack corepack pnpm --dir apps/web check
 - The API includes a Deep Research Review Orchestrator with background
   submission, polling, collection, review, bounded repair loops, human review,
   audit records, and local artifacts.
+- Forecast PhaseA lives under `apps/api/src/api/forecast` and
+  `apps/web/src/screens/forecast`. It is public-only, uses one
+  `current_state` pack, stores Forecast tables in the shared Research SQLite DB,
+  and keeps Forecast artifacts under `.data/forecast-runs/`.
+- Forecast-linked ResearchRuns must not be deleted; the API returns
+  `409 forecast_linked_research_run` for linked run deletion.
 - Keep detailed user/operator information in these docs instead of duplicating
   it here:
   - `docs/research-orchestrator.md`
@@ -110,6 +116,8 @@ COREPACK_HOME=$PWD/.corepack corepack pnpm --dir apps/web check
 - Human-review resume decisions currently do not require reviewer identity.
 - Live Azure OpenAI / OpenAI tests are opt-in only. Do not run them unless the
   user explicitly asks for live API testing and the required environment is set.
+  Forecast live testing also requires `FORECAST_LIVE_API_TESTS=1` when such
+  tests are added.
 
 ## Testing
 
@@ -121,6 +129,11 @@ git diff --check
 
 - For executable changes, run the narrowest relevant checks first, then
   `make check` when the change can affect shared behavior.
+- Forecast backend checks can be run with:
+
+```sh
+UV_CACHE_DIR=.uv-cache uv --project apps/api run pytest apps/api/tests/forecast
+```
 - Local integration tests can be run with:
 
 ```sh

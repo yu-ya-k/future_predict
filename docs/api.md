@@ -566,6 +566,69 @@ endpoints return `404`.
 - `GET /research-runs/{run_id}/checkpoints/{checkpoint_id}`
 - `GET /research-runs/{run_id}/lineage`
 
+## Forecast PhaseA API
+
+All Forecast endpoints use the same API-key behavior as `/research-runs`.
+Command endpoints accept `Idempotency-Key`. Reusing a completed key with the
+same request replays the stored response. Reusing the key with different request
+content returns `409 idempotency_conflict`; reusing a key while the original
+command is still reserved returns `409 idempotency_in_progress`. Conflict
+responses use typed detail:
+
+```json
+{
+  "code": "framing_not_approved",
+  "message": "Approve the latest framing before dispatching research packs.",
+  "details": {}
+}
+```
+
+Required PhaseA `409` codes include `forecast_disabled`,
+`framing_not_approved`, `forecast_already_started`, `policy_blocked`,
+`policy_requires_revision`, `pack_not_completed`, `evidence_not_ready`,
+`scenarios_not_ready`, `claim_targets_not_approved`,
+`draft_estimate_set_exists`, `approval_required`,
+`estimate_set_already_committed`, `forecast_already_resolved`,
+`idempotency_conflict`, and `idempotency_in_progress`.
+
+Lifecycle:
+
+- `POST /forecasts` returns `202` and creates a forecast plus framing version.
+- `POST /forecasts/{id}/review` with `{"action":"approve_framing"}` freezes the
+  latest question/outcome framing.
+- `POST /forecasts/{id}/research-packs` dispatches the public `current_state`
+  pack after framing approval.
+- `POST /forecasts/{id}/evidence/extract` requires a completed pack and stores
+  only source-linked public claims.
+- `POST /forecasts/{id}/scenarios/generate` requires evidence and creates
+  outcome-bound scenarios.
+- `POST /forecasts/{id}/probabilities/compute` requires scenarios and approved
+  outcome claim-target links. If the current canonical input snapshot matches an
+  existing draft, the existing draft is returned. A different snapshot while a
+  draft exists returns `409 draft_estimate_set_exists`.
+- `POST /forecasts/{id}/review` with
+  `{"action":"approve_phase_a_version","estimate_set_id":"..."}` records human
+  approval for that draft only.
+- `POST /forecasts/{id}/versions/commit` requires approval and freezes the draft
+  into a version with canonical snapshot bytes and hash.
+- `POST /forecasts/{id}/resolve` requires a committed version and rejects a
+  second resolution with `409 forecast_already_resolved`.
+
+Read endpoints:
+
+- `GET /forecasts`
+- `GET /forecasts/{id}`
+- `GET /forecasts/{id}/audit`
+
+Forecast-linked ResearchRuns are protected. If
+`forecast_research_packs.research_run_id` references the run, deletion returns
+`409 forecast_linked_research_run`; retain both Research artifacts and Forecast
+version artifacts for reproducibility.
+
+PhaseA read APIs return public sources and claims only. Private data approval,
+private packs, reforecasting, and narrative-only scenarios are PhaseB/C work and
+are not available in PhaseA.
+
 ## Storage Compatibility
 
 Startup performs SQLite compatibility migrations for manual ChatGPT reruns. An

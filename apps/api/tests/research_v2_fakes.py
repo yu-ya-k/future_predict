@@ -97,6 +97,10 @@ class V2FakeAzure:
         *,
         prompt: str,
         max_tool_calls: int,
+        tool_profile: str = "public",
+        background: bool = True,
+        policy_decision_id: str | None = None,
+        **_: object,
     ) -> dict[str, object]:
         self.submitted_prompts.append(prompt)
         self.submitted_max_tool_calls.append(max_tool_calls)

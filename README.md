@@ -7,6 +7,11 @@ Deep Research jobs, polls for completion, reviews generated reports, loops
 through bounded fixes when useful, and escalates uncertain or blocked runs to
 human review.
 
+It also includes Forecast PhaseA: a public-only forecast workflow that frames a
+question, dispatches one `current_state` Deep Research pack, extracts sourced
+evidence, generates outcome-bound scenarios, computes reproducible `phase_a_v1`
+probabilities, and freezes approved versions for audit.
+
 ## Stack
 
 - API: FastAPI, Python 3.12, uv
@@ -58,6 +63,9 @@ Start here for the implemented research workflow:
 - [Configuration](docs/configuration.md)
 - [Testing](docs/testing.md)
 - [Operations](docs/operations.md)
+
+Forecast PhaseA uses the same SQLite database as Research. Forecast-linked
+ResearchRuns cannot be deleted while referenced by a forecast pack.
 
 Live Azure OpenAI / OpenAI API tests are opt-in because they call real services
 and may incur cost. See [Testing](docs/testing.md) for the explicit command and

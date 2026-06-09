@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
@@ -103,13 +103,43 @@ class ResearchOrchestrator:
         self.artifacts = artifacts
         self.azure = azure
 
-    def create_run(self, request: CreateResearchRunRequest) -> ResearchRunRecord:
+    def create_run(
+        self,
+        request: CreateResearchRunRequest,
+        *,
+        forecast_mode: bool = False,
+        tool_profile: Literal["public", "private", "synthesis"] = "public",
+        background: bool = True,
+        policy_decision_id: str | None = None,
+    ) -> ResearchRunRecord:
+        if forecast_mode and not policy_decision_id:
+            raise ValueError("policy_decision_id is required for forecast research runs.")
         run = self.repository.create_run(
             user_prompt=request.user_prompt,
             options=request.options,
             settings=self.settings,
+            run_origin="forecast" if forecast_mode else "research",
         )
-        return self.submit_deep_research(run.id)
+        return self.submit_deep_research(
+            run.id,
+            tool_profile=tool_profile,
+            background=background,
+            policy_decision_id=policy_decision_id,
+        )
+
+    def create_run_record(
+        self,
+        request: CreateResearchRunRequest,
+        *,
+        forecast_mode: bool = False,
+    ) -> ResearchRunRecord:
+        """Create a ResearchRun row without submitting it to Deep Research."""
+        return self.repository.create_run(
+            user_prompt=request.user_prompt,
+            options=request.options,
+            settings=self.settings,
+            run_origin="forecast" if forecast_mode else "research",
+        )
 
     def create_manual_import_run(
         self,
@@ -284,14 +314,259 @@ class ResearchOrchestrator:
             return run, False
         return run, dispatch_review
 
+    def create_forecast_manual_import_run(
+        self,
+        *,
+        input_prompt: str,
+        report: str,
+        metadata: dict[str, Any],
+    ) -> ResearchRunRecord:
+        imported_at = utc_now()
+        options = ResearchRunOptions(
+            max_targeted_rerun_runs=0,
+            max_full_rerun_runs=0,
+        )
+        options_payload = options.model_dump(mode="json")
+        request_metadata = {
+            **metadata,
+            "prompt_sha256": hashlib.sha256(input_prompt.encode("utf-8")).hexdigest(),
+            "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+            "prompt_chars": len(input_prompt),
+            "report_chars": len(report),
+            "allow_remote_review": False,
+            "allow_api_reruns": False,
+            "rerun_execution_mode": RerunExecutionMode.DISABLED.value,
+            "options": options_payload,
+            "imported_at": imported_at.isoformat(),
+            "run_origin": "forecast",
+        }
+        request_hash = _manual_import_request_hash(
+            input_prompt=input_prompt,
+            report=report,
+            options=options_payload,
+            allow_remote_review=False,
+            allow_api_reruns=False,
+            rerun_execution_mode=RerunExecutionMode.DISABLED,
+        )
+        contract, research_items, _optimized_prompt = build_objective_contract(
+            user_prompt=input_prompt,
+        )
+        run_id = uuid4()
+        thread_id = str(uuid4())
+        try:
+            prompt_path, _ = self.artifacts.save_text(
+                run_id,
+                "prompts/forecast_manual_prompt.txt",
+                input_prompt,
+            )
+            report_path, _ = self.artifacts.save_text(
+                run_id,
+                "reports/report_attempt_001.md",
+                report,
+            )
+            raw_path, _ = self.artifacts.save_json(
+                run_id,
+                "raw-responses/forecast_manual_import_001.json",
+                {
+                    **request_metadata,
+                    "source": "manual_upload",
+                    "prompt_path": prompt_path,
+                    "report_path": report_path,
+                    "request_hash": request_hash,
+                },
+            )
+            citations = _manual_upload_citations(report, retrieved_at=imported_at.isoformat())
+            attempt = ResearchAttempt(
+                run_no=1,
+                response_id=None,
+                status="completed",
+                model="chatgpt-deep-research-manual",
+                source="manual_upload",
+                prompt=input_prompt,
+                report=report,
+                citations=citations,
+                raw_response_artifact_path=raw_path,
+            )
+            report_digest = report_hash(report)
+            checkpoint_snapshot = _manual_import_checkpoint_snapshot(
+                kind="deep_research_collected",
+                status=RunStatus.COMPLETED,
+                input_prompt=input_prompt,
+                report=report,
+                source_attempt_no=1,
+                snapshot_extra={
+                    "source": "manual_upload",
+                    "prompt_path": prompt_path,
+                    "report_path": report_path,
+                    "citations_count": len(citations),
+                    "forecast_manual_import": True,
+                },
+            )
+            run, created = self.repository.create_manual_import_run(
+                run_id=run_id,
+                thread_id=thread_id,
+                input_prompt=input_prompt,
+                report=report,
+                options=options,
+                settings=self.settings,
+                request_hash=request_hash,
+                request_metadata=request_metadata,
+                idempotency_key=None,
+                contract=contract,
+                research_items=research_items,
+                attempt=attempt,
+                prompt_path=prompt_path,
+                report_path=report_path,
+                initial_status=RunStatus.COMPLETED,
+                needs_human_review=False,
+                done_reason=None,
+                manual_checkpoint_snapshot=checkpoint_snapshot,
+                manual_checkpoint_report_hash=report_digest,
+                final_report=report,
+                run_origin="forecast",
+                terminal_status="completed_manual_import",
+            )
+        except Exception:
+            self.artifacts.delete_run(run_id)
+            raise
+        if not created:
+            self.artifacts.delete_run(run_id)
+        return run
+
+    def complete_existing_forecast_manual_import_run(
+        self,
+        run_id: UUID,
+        *,
+        input_prompt: str,
+        report: str,
+        metadata: dict[str, Any],
+    ) -> ResearchRunRecord:
+        run = self.repository.get_run(run_id)
+        if run.run_origin != "forecast":
+            raise ValueError("Only forecast-linked research runs can be recovered.")
+        allowed_statuses = {
+            RunStatus.NEEDS_HUMAN_REVIEW,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+        }
+        if run.status not in allowed_statuses:
+            raise ValueError(f"Run status {run.status.value} cannot be manually recovered.")
+
+        imported_at = utc_now()
+        attempts = self.repository.get_attempts(run_id)
+        next_attempt_no = max(
+            [run.deep_research_runs, *(attempt.run_no for attempt in attempts)],
+            default=0,
+        ) + 1
+        prompt_sha256 = hashlib.sha256(input_prompt.encode("utf-8")).hexdigest()
+        report_sha256 = hashlib.sha256(report.encode("utf-8")).hexdigest()
+        request_metadata = {
+            **metadata,
+            "prompt_sha256": prompt_sha256,
+            "report_sha256": report_sha256,
+            "prompt_chars": len(input_prompt),
+            "report_chars": len(report),
+            "imported_at": imported_at.isoformat(),
+            "run_origin": "forecast",
+            "manual_recovery": True,
+            "recovered_from_status": run.status.value,
+            "recovered_from_done_reason": run.done_reason,
+        }
+        prompt_path, _ = self.artifacts.save_text(
+            run_id,
+            f"prompts/forecast_manual_recovery_prompt_{next_attempt_no:03d}.txt",
+            input_prompt,
+        )
+        report_path, _ = self.artifacts.save_text(
+            run_id,
+            f"reports/report_attempt_{next_attempt_no:03d}.md",
+            report,
+        )
+        raw_path, _ = self.artifacts.save_json(
+            run_id,
+            f"raw-responses/forecast_manual_recovery_{next_attempt_no:03d}.json",
+            {
+                **request_metadata,
+                "source": "manual_upload",
+                "prompt_path": prompt_path,
+                "report_path": report_path,
+            },
+        )
+        citations = _manual_upload_citations(report, retrieved_at=imported_at.isoformat())
+        updated = self.repository.add_attempt_and_update_run_if_status(
+            run_id,
+            allowed_statuses,
+            ResearchAttempt(
+                run_no=next_attempt_no,
+                response_id=None,
+                status="completed",
+                model="chatgpt-deep-research-manual",
+                source="manual_upload",
+                prompt=input_prompt,
+                report=report,
+                citations=citations,
+                raw_response_artifact_path=raw_path,
+            ),
+            optimized_prompt=input_prompt,
+            status=RunStatus.COMPLETED,
+            report=report,
+            final_report=report,
+            done_reason=None,
+            needs_human_review=False,
+            pending_deep_research_response_id=None,
+            deep_research_status="completed",
+            deep_research_runs=next_attempt_no,
+            terminal_status="completed_manual_import",
+            review_claim_token=None,
+            review_claim_operation=None,
+            review_claim_expires_at=None,
+        )
+        if updated is None:
+            raise ValueError("Research run is no longer recoverable.")
+        self.repository.append_history_event(
+            run_id,
+            {
+                "step": "forecast_manual_research_pack_recovered",
+                "source": "manual_upload",
+                "run_no": next_attempt_no,
+                "prompt_path": prompt_path,
+                "report_path": report_path,
+                "citations_count": len(citations),
+                "report_sha256": report_sha256,
+                "recovered_from_status": run.status.value,
+                "recovered_from_done_reason": run.done_reason,
+            },
+        )
+        self._save_checkpoint(
+            updated,
+            kind="deep_research_collected",
+            node_anchor=f"deep_research:{next_attempt_no}",
+            source_attempt_no=next_attempt_no,
+            report_override=report,
+            snapshot_extra={
+                "source": "manual_upload",
+                "prompt_path": prompt_path,
+                "report_path": report_path,
+                "citations_count": len(citations),
+                "forecast_manual_import": True,
+                "forecast_manual_recovery": True,
+            },
+        )
+        return self.repository.get_run(run_id)
+
     def submit_deep_research(
         self,
         run_id: UUID,
         *,
         human_comment: str | None = None,
         scope: str = "targeted_gap_closure",
+        tool_profile: Literal["public", "private", "synthesis"] = "public",
+        background: bool = True,
+        policy_decision_id: str | None = None,
     ) -> ResearchRunRecord:
         run = self.repository.get_run(run_id)
+        if run.run_origin == "forecast" and not policy_decision_id:
+            raise ValueError("policy_decision_id is required for forecast research runs.")
         run_no = run.deep_research_runs + 1
         requested_max_tool_calls = self.settings.default_max_total_tool_calls
 
@@ -383,6 +658,36 @@ class ResearchOrchestrator:
                 optimized_prompt=optimized_prompt,
             )
 
+        self.repository.add_attempt(
+            run.id,
+            ResearchAttempt(
+                run_no=run_no,
+                response_id=None,
+                status="submitting",
+                model=self.azure.deep_research_deployment,
+                prompt=prompt,
+            ),
+        )
+        self.repository.append_history_event(
+            run.id,
+            {
+                "step": "deep_research_submit_started",
+                "run_no": run_no,
+                "background": background,
+            },
+        )
+        run = (
+            self.repository.update_run_if_status(
+                run.id,
+                {RunStatus.QUEUED, RunStatus.REVIEWING, RunStatus.SUBMITTED},
+                optimized_prompt=optimized_prompt,
+                status=RunStatus.SUBMITTED,
+                needs_human_review=False,
+                done_reason=None,
+            )
+            or self.repository.get_run(run.id)
+        )
+
         response_id: str | None = None
         try:
             response = self.azure.submit_deep_research(
@@ -391,6 +696,9 @@ class ResearchOrchestrator:
                     remaining_tool_calls,
                     requested_max_tool_calls,
                 ),
+                tool_profile=tool_profile,
+                background=background,
+                policy_decision_id=policy_decision_id,
             )
             response_id = get_response_id(response)
             raw_path, _ = self.artifacts.save_json(
@@ -446,7 +754,14 @@ class ResearchOrchestrator:
             done_reason = (
                 "deep_research_submitted_but_persistence_failed"
                 if response_id
-                else "deep_research_submit_failed"
+                else (
+                    "deep_research_submit_timeout"
+                    if (
+                        isinstance(error, TimeoutError)
+                        or error.__class__.__name__ == "APITimeoutError"
+                    )
+                    else "deep_research_submit_failed"
+                )
             )
             return self._enter_human_review(
                 run.id,
@@ -741,6 +1056,69 @@ class ResearchOrchestrator:
                 },
             )
 
+    def mark_submit_stalled(self, run_id: UUID) -> ResearchRunRecord:
+        run = self.repository.get_run(run_id)
+        if (
+            run.run_origin != "forecast"
+            or run.status not in {RunStatus.QUEUED, RunStatus.SUBMITTED}
+            or run.pending_deep_research_response_id is not None
+        ):
+            return run
+        recovered = self._recover_recorded_submit_response(run)
+        if recovered is not None:
+            return recovered
+        self.repository.append_history_event(
+            run.id,
+            {
+                "step": "deep_research_submit_stalled",
+                "timeout_seconds": self.settings.research_deep_research_submit_stale_seconds,
+            },
+        )
+        return self._enter_human_review(
+            run.id,
+            done_reason="deep_research_submit_stalled",
+            allowed_statuses={RunStatus.QUEUED, RunStatus.SUBMITTED},
+            deep_research_status="submit_stalled",
+        )
+
+    def _recover_recorded_submit_response(
+        self,
+        run: ResearchRunRecord,
+    ) -> ResearchRunRecord | None:
+        attempts = self.repository.get_attempts(run.id)
+        recoverable = [
+            attempt
+            for attempt in attempts
+            if attempt.response_id
+            and attempt.status
+            not in {"failed_to_submit", "submitted_but_persistence_failed"}
+        ]
+        if not recoverable:
+            return None
+        attempt = recoverable[-1]
+        updated = self.repository.update_run_if_status(
+            run.id,
+            {RunStatus.QUEUED, RunStatus.SUBMITTED},
+            status=RunStatus.WAITING_DEEP_RESEARCH,
+            needs_human_review=False,
+            pending_deep_research_response_id=attempt.response_id,
+            deep_research_status=attempt.status or "queued",
+            deep_research_runs=max(run.deep_research_runs, attempt.run_no),
+            done_reason=None,
+        )
+        if updated is None:
+            return self.repository.get_run(run.id)
+        self.repository.append_history_event(
+            run.id,
+            {
+                "step": "deep_research_submit_recovered",
+                "run_no": attempt.run_no,
+                "response_id": attempt.response_id,
+                "status": attempt.status,
+            },
+        )
+        return updated
+
     def collect_deep_research(self, run_id: UUID) -> ResearchRunRecord:
         run = self.repository.get_run(run_id)
         if run.status not in {RunStatus.WAITING_DEEP_RESEARCH, RunStatus.COLLECTING}:
@@ -983,8 +1361,27 @@ class ResearchOrchestrator:
         updated = self.repository.update_run_if_status(
             run.id,
             {RunStatus.COLLECTING},
-            status=RunStatus.REVIEWING,
+            status=(
+                RunStatus.COMPLETED
+                if getattr(run, "run_origin", "research") == "forecast"
+                else RunStatus.REVIEWING
+            ),
             report=merged_report,
+            final_report=(
+                merged_report
+                if getattr(run, "run_origin", "research") == "forecast"
+                else run.final_report
+            ),
+            done_reason=(
+                "forecast_raw_report_collected"
+                if getattr(run, "run_origin", "research") == "forecast"
+                else run.done_reason
+            ),
+            terminal_status=(
+                "forecast_raw_report_collected"
+                if getattr(run, "run_origin", "research") == "forecast"
+                else run.terminal_status
+            ),
             deep_research_status=response_status,
             total_tool_calls=run.total_tool_calls + tool_call_delta,
             estimated_cost_usd=run.estimated_cost_usd + cost_delta,
@@ -1001,6 +1398,8 @@ class ResearchOrchestrator:
                 },
             )
             return self.repository.get_run(run.id)
+        if getattr(run, "run_origin", "research") == "forecast":
+            return updated
         return self.review_run(updated.id)
 
     def review_run(
@@ -1009,6 +1408,9 @@ class ResearchOrchestrator:
         *,
         _review_claim_token: str | None = None,
     ) -> ResearchRunRecord:
+        current = self.repository.get_run(run_id)
+        if getattr(current, "run_origin", "research") == "forecast":
+            return current
         if _review_claim_token is not None:
             return self._review_run_claimed(
                 run_id,
@@ -1839,6 +2241,9 @@ class ResearchOrchestrator:
                     remaining_tool_calls,
                     self.settings.default_max_total_tool_calls,
                 ),
+                tool_profile="public",
+                background=True,
+                policy_decision_id=None,
             )
             response_id = get_response_id(response)
             raw_path, _ = self.artifacts.save_json(
@@ -2522,6 +2927,8 @@ class ResearchOrchestrator:
 
     def delete_run(self, run_id: UUID) -> None:
         run = self.repository.get_run(run_id)
+        if self.repository.is_linked_to_forecast(run.id):
+            raise RuntimeError("forecast_linked_research_run")
         if not _is_terminal_run_status(run.status) and _has_pending_remote_deep_research(run):
             if not self._cancel_remote_response(
                 run,

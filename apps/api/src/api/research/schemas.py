@@ -7,6 +7,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+RESEARCH_USER_PROMPT_MAX_LENGTH = 120_000
+
 
 def _strip_string(value: Any) -> Any:
     if isinstance(value, str):
@@ -72,7 +74,10 @@ class ResearchRunOptions(BaseModel):
 class CreateResearchRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    user_prompt: str = Field(min_length=1, max_length=50000)
+    user_prompt: str = Field(
+        min_length=1,
+        max_length=RESEARCH_USER_PROMPT_MAX_LENGTH,
+    )
     options: ResearchRunOptions = Field(default_factory=ResearchRunOptions)
 
     _strip_user_prompt = field_validator("user_prompt", mode="before")(_strip_string)
@@ -116,14 +121,24 @@ class HumanReviewAuditSummary(BaseModel):
     estimated_cost_usd: float = 0.0
 
 
+class ForecastRunContext(BaseModel):
+    forecast_id: UUID
+    pack_id: UUID
+    pack_role: str
+    tool_profile: str
+
+
 class ResearchRunStatusResponse(BaseModel):
     run_id: UUID
     status: RunStatus
     terminal_status: str | None = None
     done_reason: str | None
     needs_human_review: bool
+    created_at: datetime
+    updated_at: datetime
     deep_research_submitted_at: datetime | None = None
     progress: RunProgress
+    forecast_context: ForecastRunContext | None = None
 
 
 class ReportResponse(BaseModel):
@@ -692,6 +707,7 @@ class ResearchRunRecord(BaseModel):
     poll_error_count: int = 0
     poll_claimed_until: datetime | None = None
     poll_claim_owner: str | None = None
+    run_origin: str = "research"
     warnings: list[str]
     created_at: datetime
     updated_at: datetime

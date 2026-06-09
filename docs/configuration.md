@@ -44,6 +44,7 @@ The repository and artifact store create parent directories as needed.
 | `RESEARCH_REVIEW_MAX_REPORT_CHARS` | `50000` | Caps report text sent to the reviewer. Long reports are truncated with a marker. |
 | `RESEARCH_REVIEW_MAX_CITATIONS` | `40` | Caps citation metadata sent to the reviewer. |
 | `RESEARCH_REVIEW_WEB_SEARCH_ENABLED` | `false` | Enables Web Search tools for structured review calls. LLM patch/finalization fallback and targeted verification have separate public-context/query-policy checks before using Web Search. |
+| `RESEARCH_PRIVATE_VECTOR_STORE_ALLOWLIST` | `[]` | JSON array of vector store ids allowed for private `file_search` tool calls. Private tool use fails closed when unset, and each request may use at most two allowlisted vector stores. |
 | `RESEARCH_MANUAL_IMPORT_MAX_REPORT_CHARS` | `50000` | Caps pasted or uploaded report text accepted by `/research-runs/manual-import`. |
 | `RESEARCH_MANUAL_IMPORT_MAX_FILE_BYTES` | `1048576` | Caps each manual import upload before UTF-8 decoding. |
 

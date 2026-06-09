@@ -14,6 +14,16 @@ from live_helpers import require_live_reviewer_settings
     [
         {"research_poller_interval_seconds": 0},
         {"research_deep_research_timeout_seconds": 0},
+        {"research_deep_research_submit_timeout_seconds": 0},
+        {"research_deep_research_submit_stale_seconds": 0},
+        {
+            "research_deep_research_submit_timeout_seconds": 120,
+            "research_deep_research_submit_stale_seconds": 120,
+        },
+        {
+            "research_deep_research_submit_timeout_seconds": 121,
+            "research_deep_research_submit_stale_seconds": 120,
+        },
         {"research_deep_research_collecting_stale_seconds": 0},
         {"research_review_timeout_seconds": 0},
         {"research_review_max_report_chars": 0},
@@ -28,6 +38,16 @@ def test_settings_reject_invalid_runtime_bounds(
 ) -> None:
     with pytest.raises(ValidationError):
         Settings(research_poller_enabled=False, **settings_kwargs)
+
+
+def test_settings_allow_submit_stale_after_submit_timeout() -> None:
+    settings = Settings(
+        research_poller_enabled=False,
+        research_deep_research_submit_timeout_seconds=120,
+        research_deep_research_submit_stale_seconds=121,
+    )
+
+    assert settings.research_deep_research_submit_stale_seconds == 121
 
 
 def test_live_reviewer_settings_skip_on_partial_gpt_client_settings() -> None:

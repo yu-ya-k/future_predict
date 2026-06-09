@@ -324,3 +324,39 @@ table enforces one active pending manual rerun per run.
   check `/lineage` from the child run.
 - Check artifact files when raw Responses API payloads or saved prompts are
   needed for debugging.
+
+## Forecast PhaseA Rollout And Rollback
+
+Before enabling Forecast PhaseA, back up the shared SQLite database and artifact
+roots:
+
+```sh
+cp .data/research.sqlite3 .data/research.sqlite3.bak
+tar -czf .data/forecast-artifacts-backup.tgz .data/forecast-runs .data/research-runs
+```
+
+Run a WAL smoke check after deployment by creating a forecast, approving
+framing, dispatching one public `current_state` pack, collecting it through the
+Research poller, and reading `/forecasts/{id}/audit`.
+
+For a repeatable local smoke that avoids live Azure/OpenAI calls, use the
+manual verification runbook in
+[`docs/forecast-phase-a-manual-verification.md`](forecast-phase-a-manual-verification.md).
+
+Rollback is feature-level first: set `FORECAST_ENABLED=false` and restart the
+API. Research remains available because Forecast uses additive tables in the
+shared Research SQLite DB. After rollback, run a Research smoke:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8000/research-runs \
+  -H 'Content-Type: application/json' \
+  -d '{"user_prompt":"Research public information about a current market."}'
+```
+
+Do not delete Forecast-linked ResearchRuns. The API intentionally rejects this
+with `409 forecast_linked_research_run` so committed Forecast snapshots,
+Research raw responses, and report artifacts remain reproducible.
+
+PhaseA is public-only. Private-data approval, private packs, and reforecast
+workflows are PhaseB/C features and should not be included in operator runbooks
+for this release.

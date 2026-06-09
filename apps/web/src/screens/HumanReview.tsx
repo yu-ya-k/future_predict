@@ -30,6 +30,7 @@ import {
   uploadManualRerunResult,
 } from "../api/research";
 import { ApiError } from "../api/client";
+import { copyTextToClipboard } from "../lib/clipboard";
 import { navigate, routes } from "../router";
 import {
   type HumanReviewAction,
@@ -39,6 +40,8 @@ import {
 
 const NO_PROGRESS_WARN_THRESHOLD = 2;
 const MAX_COMMENT_CHARS = 10_000;
+const COPY_FAILED_MESSAGE =
+  "コピーできませんでした。プロンプト欄を選択してコピーするか、.mdをダウンロードしてください。";
 
 const ITEM_STATUS_LABEL: Record<ResearchItem["status"], string> = {
   not_started: "未開始",
@@ -151,6 +154,8 @@ interface HumanReviewProps {
   runId: string;
 }
 
+type PromptCopyTarget = "suggested" | "pending";
+
 export function HumanReview({ runId }: HumanReviewProps) {
   const [payload, setPayload] = useState<HumanReviewPayload | null>(null);
   const [loading, setLoading] = useState(true);
@@ -164,10 +169,16 @@ export function HumanReview({ runId }: HumanReviewProps) {
   const [manualUploadMode, setManualUploadMode] = useState<"text" | "file">("text");
   const [manualUploading, setManualUploading] = useState(false);
   const [manualUploadError, setManualUploadError] = useState<string | null>(null);
-  const [copyStatus, setCopyStatus] = useState<string | null>(null);
+  const [copyStatus, setCopyStatus] = useState<{
+    target: PromptCopyTarget;
+    message: string;
+    failed: boolean;
+  } | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
   const requestGenerationRef = useRef(0);
+  const suggestedPromptRef = useRef<HTMLTextAreaElement | null>(null);
+  const pendingPromptRef = useRef<HTMLTextAreaElement | null>(null);
 
   async function fetchPayload() {
     abortRef.current?.abort();
@@ -241,18 +252,25 @@ export function HumanReview({ runId }: HumanReviewProps) {
     }
   }
 
-  async function handleCopyPrompt(prompt: string | null | undefined) {
+  async function handleCopyPrompt(
+    target: PromptCopyTarget,
+    prompt: string | null | undefined,
+  ) {
     if (!prompt) return;
-    if (!navigator.clipboard?.writeText) {
-      setCopyStatus("コピーできませんでした");
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(prompt);
-      setCopyStatus("コピーしました");
-    } catch {
-      setCopyStatus("コピーできませんでした");
-    }
+    const result = await copyTextToClipboard(prompt);
+    setCopyStatus({
+      target,
+      message: result === "failed" ? COPY_FAILED_MESSAGE : "コピーしました",
+      failed: result === "failed",
+    });
+  }
+
+  function selectPromptText(target: PromptCopyTarget) {
+    const element =
+      target === "suggested" ? suggestedPromptRef.current : pendingPromptRef.current;
+    if (!element) return;
+    element.focus();
+    element.select();
   }
 
   function handleManualUploadModeChange(mode: "text" | "file") {
@@ -567,12 +585,19 @@ export function HumanReview({ runId }: HumanReviewProps) {
                   suggestedRerun.query_policy.status}
               </p>
             )}
-            <pre className="prompt-attempt-body">{suggestedRerun.prompt}</pre>
+            <textarea
+              aria-label="Rerun向けプロンプト本文"
+              className="prompt-attempt-body"
+              ref={suggestedPromptRef}
+              readOnly
+              rows={12}
+              value={suggestedRerun.prompt}
+            />
             <div className="form-actions">
               <button
                 type="button"
                 className="btn-secondary"
-                onClick={() => void handleCopyPrompt(suggestedRerun.prompt)}
+                onClick={() => void handleCopyPrompt("suggested", suggestedRerun.prompt)}
               >
                 コピー
               </button>
@@ -583,9 +608,21 @@ export function HumanReview({ runId }: HumanReviewProps) {
               >
                 .md ダウンロード
               </button>
-              {copyStatus && (
-                <span className="char-counter" aria-live="polite">
-                  {copyStatus}
+              {copyStatus?.target === "suggested" && copyStatus.failed && (
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  onClick={() => selectPromptText("suggested")}
+                >
+                  全文を選択
+                </button>
+              )}
+              {copyStatus?.target === "suggested" && (
+                <span
+                  className={`char-counter${copyStatus.failed ? " char-counter--error" : ""}`}
+                  aria-live="polite"
+                >
+                  {copyStatus.message}
                 </span>
               )}
             </div>
@@ -674,12 +711,19 @@ export function HumanReview({ runId }: HumanReviewProps) {
                   : "既存レポートへ追加する差分セクションをアップロードする"}
               </li>
             </ol>
-            <pre className="prompt-attempt-body">{pendingManualRerun.prompt}</pre>
+            <textarea
+              aria-label="ChatGPT手動rerunプロンプト本文"
+              className="prompt-attempt-body"
+              ref={pendingPromptRef}
+              readOnly
+              rows={12}
+              value={pendingManualRerun.prompt}
+            />
             <div className="form-actions">
               <button
                 type="button"
                 className="btn-secondary"
-                onClick={() => void handleCopyPrompt(pendingManualRerun.prompt)}
+                onClick={() => void handleCopyPrompt("pending", pendingManualRerun.prompt)}
               >
                 コピー
               </button>
@@ -690,9 +734,21 @@ export function HumanReview({ runId }: HumanReviewProps) {
               >
                 .md ダウンロード
               </button>
-              {copyStatus && (
-                <span className="char-counter" aria-live="polite">
-                  {copyStatus}
+              {copyStatus?.target === "pending" && copyStatus.failed && (
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  onClick={() => selectPromptText("pending")}
+                >
+                  全文を選択
+                </button>
+              )}
+              {copyStatus?.target === "pending" && (
+                <span
+                  className={`char-counter${copyStatus.failed ? " char-counter--error" : ""}`}
+                  aria-live="polite"
+                >
+                  {copyStatus.message}
                 </span>
               )}
             </div>

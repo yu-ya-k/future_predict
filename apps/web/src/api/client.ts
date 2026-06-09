@@ -13,12 +13,22 @@ import { getResearchApiKey } from "../researchApiKey";
 export class ApiError extends Error {
   readonly status: number;
   readonly detail: string | undefined;
+  readonly code: string | undefined;
+  readonly details: Record<string, unknown> | undefined;
 
-  constructor(status: number, message: string, detail?: string) {
+  constructor(
+    status: number,
+    message: string,
+    detail?: string,
+    code?: string,
+    details?: Record<string, unknown>,
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.detail = detail;
+    this.code = code;
+    this.details = details;
   }
 
   get isUnauthorized(): boolean {
@@ -38,15 +48,19 @@ interface RequestOptions {
   method?: "DELETE" | "GET" | "POST";
   body?: unknown;
   signal?: AbortSignal;
+  idempotencyKey?: string;
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { method = "GET", body, signal } = options;
+  const { method = "GET", body, signal, idempotencyKey } = options;
 
   const headers: Record<string, string> = {};
   const apiKey = getResearchApiKey();
   if (apiKey) {
     headers["X-API-Key"] = apiKey;
+  }
+  if (idempotencyKey?.trim()) {
+    headers["Idempotency-Key"] = idempotencyKey.trim();
   }
   const isFormData = body instanceof FormData;
   if (body !== undefined && !isFormData) {
@@ -68,8 +82,14 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   }
 
   if (!response.ok) {
-    const detail = await readErrorDetail(response);
-    throw new ApiError(response.status, detail ?? `API returned ${response.status}`, detail);
+    const errorDetail = await readErrorDetail(response);
+    throw new ApiError(
+      response.status,
+      errorDetail.message ?? `API returned ${response.status}`,
+      errorDetail.detail,
+      errorDetail.code,
+      errorDetail.details,
+    );
   }
 
   if (response.status === 204) {
@@ -79,15 +99,46 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   return (await response.json()) as T;
 }
 
-async function readErrorDetail(response: Response): Promise<string | undefined> {
+async function readErrorDetail(response: Response): Promise<{
+  message?: string;
+  detail?: string;
+  code?: string;
+  details?: Record<string, unknown>;
+}> {
   try {
     const data = (await response.json()) as { detail?: unknown };
-    if (typeof data.detail === "string") return data.detail;
-    if (data.detail != null) return JSON.stringify(data.detail);
+    if (
+      data.detail &&
+      typeof data.detail === "object" &&
+      "code" in data.detail &&
+      "message" in data.detail
+    ) {
+      const typed = data.detail as {
+        code?: unknown;
+        message?: unknown;
+        details?: unknown;
+      };
+      return {
+        message: typeof typed.message === "string" ? typed.message : undefined,
+        detail: JSON.stringify(data.detail),
+        code: typeof typed.code === "string" ? typed.code : undefined,
+        details:
+          typed.details && typeof typed.details === "object"
+            ? (typed.details as Record<string, unknown>)
+            : undefined,
+      };
+    }
+    if (typeof data.detail === "string") {
+      return { message: data.detail, detail: data.detail };
+    }
+    if (data.detail != null) {
+      const detail = JSON.stringify(data.detail);
+      return { message: detail, detail };
+    }
   } catch {
     /* non-JSON body */
   }
-  return undefined;
+  return {};
 }
 
 export const apiClient = { request };

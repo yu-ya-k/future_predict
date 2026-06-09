@@ -140,6 +140,7 @@ class ResearchRepository:
                     total_tool_calls INTEGER NOT NULL DEFAULT 0,
                     estimated_cost_usd REAL NOT NULL DEFAULT 0,
                     rerun_execution_mode TEXT NOT NULL DEFAULT 'api',
+                    run_origin TEXT NOT NULL DEFAULT 'research',
                     terminal_status TEXT,
                     review_claim_token TEXT,
                     review_claim_operation TEXT,
@@ -386,6 +387,7 @@ class ResearchRepository:
             "review_claim_operation": "TEXT",
             "review_claim_expires_at": "TEXT",
             "rerun_execution_mode": "TEXT NOT NULL DEFAULT 'api'",
+            "run_origin": "TEXT NOT NULL DEFAULT 'research'",
         }
         for name, definition in columns.items():
             if name not in existing:
@@ -453,6 +455,7 @@ class ResearchRepository:
         user_prompt: str,
         options: ResearchRunOptions,
         settings: Settings,
+        run_origin: str = "research",
     ) -> ResearchRunRecord:
         now = utc_now()
         run_id = uuid4()
@@ -467,10 +470,10 @@ class ResearchRepository:
                     max_targeted_rerun_runs, max_full_rerun_runs,
                     max_llm_patch_runs, max_verification_runs, max_total_iterations,
                     max_total_tool_calls,
-                    rerun_execution_mode,
+                    rerun_execution_mode, run_origin,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(run_id),
@@ -492,6 +495,7 @@ class ResearchRepository:
                     options.max_total_iterations or settings.default_max_total_iterations,
                     max_tool_calls,
                     RerunExecutionMode.API.value,
+                    run_origin,
                     now.isoformat(),
                     now.isoformat(),
                 ),
@@ -547,6 +551,9 @@ class ResearchRepository:
         manual_checkpoint_report_hash: str | None,
         human_review_checkpoint_snapshot: dict[str, Any] | None = None,
         human_review_checkpoint_report_hash: str | None = None,
+        final_report: str | None = None,
+        run_origin: str = "research",
+        terminal_status: str | None = None,
     ) -> tuple[ResearchRunRecord, bool]:
         now = utc_now()
         now_text = now.isoformat()
@@ -580,7 +587,7 @@ class ResearchRepository:
             connection.execute(
                 """
                 INSERT INTO research_runs (
-                    id, thread_id, user_prompt, optimized_prompt, status, report,
+                    id, thread_id, user_prompt, optimized_prompt, status, report, final_report,
                     done_reason,
                     needs_human_review, pending_deep_research_response_id,
                     deep_research_status, deep_research_runs,
@@ -588,11 +595,12 @@ class ResearchRepository:
                     max_targeted_rerun_runs, max_full_rerun_runs,
                     max_llm_patch_runs, max_verification_runs, max_total_iterations,
                     max_total_tool_calls, total_tool_calls, estimated_cost_usd,
-                    rerun_execution_mode, warnings, created_at, updated_at
+                    rerun_execution_mode, warnings, run_origin, terminal_status,
+                    created_at, updated_at
                 )
                 VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 1, 0, 0, ?, ?, ?, ?, ?, ?,
-                    0, 0, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 1, 0, 0, ?, ?, ?, ?, ?, ?,
+                    0, 0, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -602,6 +610,7 @@ class ResearchRepository:
                     input_prompt,
                     initial_status.value,
                     report,
+                    final_report,
                     done_reason,
                     int(needs_human_review),
                     "completed",
@@ -621,6 +630,8 @@ class ResearchRepository:
                     max_tool_calls,
                     request_metadata.get("rerun_execution_mode", RerunExecutionMode.API.value),
                     _json_dump([]),
+                    run_origin,
+                    terminal_status,
                     now_text,
                     now_text,
                 ),
@@ -981,6 +992,26 @@ class ResearchRepository:
             )
             return cursor.rowcount == 1
 
+    def is_linked_to_forecast(self, run_id: UUID) -> bool:
+        with self.connect() as connection:
+            table = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'forecast_research_packs'
+                """
+            ).fetchone()
+            if table is None:
+                return False
+            row = connection.execute(
+                """
+                SELECT 1 FROM forecast_research_packs
+                WHERE research_run_id = ?
+                LIMIT 1
+                """,
+                (str(run_id),),
+            ).fetchone()
+        return row is not None
+
     def list_waiting_runs(self, *, timeout_seconds: int) -> list[ResearchRunRecord]:
         with self.connect() as connection:
             rows = connection.execute(
@@ -1249,6 +1280,64 @@ class ResearchRepository:
 
         return [self._row_to_run(row) for row in rows]
 
+    def list_stale_forecast_submit_runs(
+        self,
+        *,
+        stale_seconds: int,
+    ) -> list[ResearchRunRecord]:
+        cutoff = utc_now() - timedelta(seconds=stale_seconds)
+        with self.connect() as connection:
+            table = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'forecast_research_packs'
+                """
+            ).fetchone()
+            if table is None:
+                return []
+            rows = connection.execute(
+                """
+                SELECT r.*
+                FROM research_runs r
+                JOIN forecast_research_packs p
+                  ON p.research_run_id = r.id
+                WHERE p.status = 'submitting'
+                  AND r.run_origin = 'forecast'
+                  AND r.status IN (?, ?)
+                  AND r.pending_deep_research_response_id IS NULL
+                  AND r.updated_at <= ?
+                ORDER BY r.updated_at ASC
+                LIMIT 25
+                """,
+                (
+                    RunStatus.QUEUED.value,
+                    RunStatus.SUBMITTED.value,
+                    cutoff.isoformat(),
+                ),
+            ).fetchall()
+
+        return [self._row_to_run(row) for row in rows]
+
+    def sync_forecast_pack_status_for_run(self, run_id: UUID, *, status: str) -> None:
+        with self.connect() as connection:
+            table = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'forecast_research_packs'
+                """
+            ).fetchone()
+            if table is None:
+                return
+            connection.execute(
+                """
+                UPDATE forecast_research_packs
+                SET status = ?, updated_at = ?
+                WHERE research_run_id = ?
+                  AND status = 'submitting'
+                """,
+                (status, utc_now().isoformat(), str(run_id)),
+            )
+
     def list_stale_reviewing_runs(self, *, timeout_seconds: int) -> list[ResearchRunRecord]:
         cutoff = utc_now() - timedelta(seconds=timeout_seconds)
         now = utc_now()
@@ -1444,6 +1533,115 @@ class ResearchRepository:
                 return None
 
         return self.get_run(run_id)
+
+    def add_attempt_and_update_run_if_status(
+        self,
+        run_id: UUID,
+        allowed_statuses: set[RunStatus],
+        attempt: ResearchAttempt,
+        **fields: Any,
+    ) -> ResearchRunRecord | None:
+        if not allowed_statuses or not fields:
+            return None
+
+        now = utc_now().isoformat()
+        fields["updated_at"] = now
+        columns = ", ".join(f"{key} = ?" for key in fields)
+        status_placeholders = ", ".join("?" for _ in allowed_statuses)
+        update_values = [self._db_value(value) for value in fields.values()]
+        update_values.append(str(run_id))
+        update_values.extend(status.value for status in allowed_statuses)
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run_row = connection.execute(
+                "SELECT status FROM research_runs WHERE id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if run_row is None:
+                raise KeyError(str(run_id))
+            if run_row["status"] not in {status.value for status in allowed_statuses}:
+                return None
+            existing_attempt = connection.execute(
+                """
+                SELECT id
+                FROM research_attempts
+                WHERE run_id = ?
+                  AND attempt_no = ?
+                LIMIT 1
+                """,
+                (str(run_id), attempt.run_no),
+            ).fetchone()
+            if existing_attempt is not None:
+                return None
+
+            attempt_id = str(uuid4())
+            connection.execute(
+                """
+                INSERT INTO research_attempts (
+                    id, run_id, attempt_no, response_id, model, source, prompt,
+                    output_text, status, error, tool_calls, citations,
+                    raw_response_artifact_path, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    str(run_id),
+                    attempt.run_no,
+                    attempt.response_id,
+                    attempt.model,
+                    attempt.source,
+                    attempt.prompt,
+                    attempt.report,
+                    attempt.status,
+                    attempt.error,
+                    attempt.model_dump_json(include={"tool_calls_summary"}),
+                    attempt.model_dump_json(include={"citations"}),
+                    attempt.raw_response_artifact_path,
+                    now,
+                ),
+            )
+            for citation in attempt.citations:
+                self._insert_citation(connection, run_id, citation, attempt_id=attempt_id)
+            for tool_call in attempt.tool_calls_summary:
+                self._insert_tool_call(
+                    connection,
+                    run_id,
+                    response_id=attempt.response_id,
+                    step="deep_research",
+                    tool_call=tool_call,
+                )
+            self.append_history(
+                connection,
+                run_id,
+                {
+                    "step": "attempt_recorded",
+                    "run_no": attempt.run_no,
+                    "status": attempt.status,
+                    "response_id": attempt.response_id,
+                    "source": attempt.source,
+                },
+            )
+            cursor = connection.execute(
+                f"""
+                UPDATE research_runs
+                SET {columns}
+                WHERE id = ?
+                  AND status IN ({status_placeholders})
+                """,
+                update_values,
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("research_run_status_changed")
+            updated_row = connection.execute(
+                "SELECT * FROM research_runs WHERE id = ?",
+                (str(run_id),),
+            ).fetchone()
+
+        if updated_row is None:
+            raise KeyError(str(run_id))
+        return self._row_to_run(updated_row)
 
     def add_attempt(self, run_id: UUID, attempt: ResearchAttempt) -> None:
         now = utc_now().isoformat()
@@ -2713,6 +2911,7 @@ class ResearchRepository:
             rerun_execution_mode=RerunExecutionMode(
                 row["rerun_execution_mode"] if "rerun_execution_mode" in row.keys() else "api"
             ),
+            run_origin=row["run_origin"] if "run_origin" in row.keys() else "research",
             terminal_status=row["terminal_status"],
             review_claim_token=row["review_claim_token"],
             review_claim_operation=row["review_claim_operation"],

@@ -161,7 +161,10 @@ async def test_research_run_api_flow(tmp_path: Path) -> None:
         assert initial_status_response.status_code == 200
         initial_status_json = initial_status_response.json()
         assert initial_status_json["status"] == "waiting_deep_research"
+        assert initial_status_json["created_at"]
+        assert initial_status_json["updated_at"]
         assert initial_status_json["deep_research_submitted_at"] is not None
+        assert initial_status_json["forecast_context"] is None
 
         orchestrator.collect_deep_research(run_id)
 
@@ -1818,6 +1821,10 @@ async def test_checkpoint_fork_submit_failure_preserves_failed_attempt(
             *,
             prompt: str,
             max_tool_calls: int,
+            tool_profile: str = "public",
+            background: bool = True,
+            policy_decision_id: str | None = None,
+            **kwargs: object,
         ) -> dict[str, object]:
             if self.submitted_prompts:
                 self.submitted_prompts.append(prompt)
@@ -1826,6 +1833,10 @@ async def test_checkpoint_fork_submit_failure_preserves_failed_attempt(
             return super().submit_deep_research(
                 prompt=prompt,
                 max_tool_calls=max_tool_calls,
+                tool_profile=tool_profile,
+                background=background,
+                policy_decision_id=policy_decision_id,
+                **kwargs,
             )
 
     fake = ForkSubmitFailingAzure()
@@ -1993,6 +2004,52 @@ async def test_delete_unknown_research_run_returns_404(tmp_path: Path) -> None:
         )
 
     assert response.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_delete_forecast_linked_research_run_returns_typed_409(
+    tmp_path: Path,
+) -> None:
+    orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
+    app = create_app()
+    app.dependency_overrides[get_research_orchestrator] = lambda: orchestrator
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create_response = await client.post(
+            "/research-runs",
+            json={
+                "user_prompt": "市場調査をしてください",
+            },
+        )
+        run_id = create_response.json()["run_id"]
+        orchestrator.collect_deep_research(run_id)
+        with orchestrator.repository.connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE forecast_research_packs (
+                    research_run_id TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO forecast_research_packs (research_run_id) VALUES (?)",
+                (run_id,),
+            )
+
+        response = await client.delete(f"/research-runs/{run_id}")
+        status_response = await client.get(f"/research-runs/{run_id}")
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail == {
+        "code": "forecast_linked_research_run",
+        "message": "Research run is linked to a forecast and cannot be deleted.",
+        "details": {"run_id": run_id},
+    }
+    assert status_response.status_code == 200
 
 
 @pytest.mark.anyio

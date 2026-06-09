@@ -19,6 +19,7 @@ from api.research.repository import ResearchRepository
 from api.research.routing import route_after_review
 from api.research.schemas import (
     REVIEW_RESULT_SCHEMA,
+    CreateResearchRunRequest,
     HumanReviewAction,
     ResearchRunOptions,
     RunStatus,
@@ -157,6 +158,52 @@ def test_delete_run_keeps_database_record_when_artifact_cleanup_fails(
         orchestrator.delete_run(run.id)
 
     assert repository.get_run(run.id).id == run.id
+
+
+def test_forecast_mode_create_run_requires_policy_decision_id(tmp_path: Path) -> None:
+    settings = Settings(
+        research_db_path=tmp_path / "research.sqlite3",
+        research_artifact_dir=tmp_path / "artifacts",
+        research_poller_enabled=False,
+    )
+    orchestrator = ResearchOrchestrator(
+        settings=settings,
+        repository=ResearchRepository(settings.research_db_path),
+        artifacts=ArtifactStore(settings.research_artifact_dir),
+        azure=cast(AzureResponsesClient, object()),
+    )
+
+    with pytest.raises(ValueError, match="policy_decision_id is required"):
+        orchestrator.create_run(
+            CreateResearchRunRequest(user_prompt="Forecast public information."),
+            forecast_mode=True,
+        )
+
+
+def test_forecast_origin_submit_requires_policy_decision_id(tmp_path: Path) -> None:
+    settings = Settings(
+        research_db_path=tmp_path / "research.sqlite3",
+        research_artifact_dir=tmp_path / "artifacts",
+        research_poller_enabled=False,
+    )
+    repository = ResearchRepository(settings.research_db_path)
+    orchestrator = ResearchOrchestrator(
+        settings=settings,
+        repository=repository,
+        artifacts=ArtifactStore(settings.research_artifact_dir),
+        azure=cast(AzureResponsesClient, object()),
+    )
+    run = repository.create_run(
+        user_prompt="Forecast public information.",
+        options=ResearchRunOptions(),
+        settings=settings,
+        run_origin="forecast",
+    )
+
+    with pytest.raises(ValueError, match="policy_decision_id is required"):
+        orchestrator.submit_deep_research(run.id)
+
+    assert repository.get_run(run.id).status == RunStatus.QUEUED
 
 
 def test_route_after_review_prefers_targeted_rerun_for_missing_sources() -> None:

@@ -1,7 +1,8 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,14 +19,20 @@ class Settings(BaseSettings):
     ]
     research_db_path: Path = Path(".data/research.sqlite3")
     research_artifact_dir: Path = Path(".data/research-runs")
+    forecast_enabled: bool = True
+    forecast_artifact_dir: Path = Path(".data/forecast-runs")
+    forecast_max_concurrent_packs: int = Field(default=1, ge=1)
     research_poller_enabled: bool = True
     research_poller_interval_seconds: float = Field(default=5.0, gt=0)
     research_deep_research_timeout_seconds: int = Field(default=7200, gt=0)
+    research_deep_research_submit_timeout_seconds: int = Field(default=120, gt=0)
+    research_deep_research_submit_stale_seconds: int = Field(default=300, gt=0)
     research_deep_research_collecting_stale_seconds: int = Field(default=60, gt=0)
     research_review_timeout_seconds: int = Field(default=180, gt=0)
     research_review_max_report_chars: int = Field(default=50000, ge=1)
     research_review_max_citations: int = Field(default=40, ge=0)
     research_review_web_search_enabled: bool = False
+    research_private_vector_store_allowlist: list[str] = Field(default_factory=list)
     research_manual_import_max_report_chars: int = Field(default=50000, ge=1)
     research_manual_import_max_file_bytes: int = Field(default=1048576, ge=1)
 
@@ -57,6 +64,18 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @model_validator(mode="after")
+    def validate_submit_stale_after_timeout(self) -> Self:
+        if (
+            self.research_deep_research_submit_stale_seconds
+            <= self.research_deep_research_submit_timeout_seconds
+        ):
+            raise ValueError(
+                "research_deep_research_submit_stale_seconds must be greater than "
+                "research_deep_research_submit_timeout_seconds"
+            )
+        return self
 
 
 @lru_cache

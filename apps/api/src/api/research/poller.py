@@ -4,6 +4,7 @@ import asyncio
 import logging
 from contextlib import suppress
 
+from api.research.schemas import RunStatus
 from api.research.service import ResearchOrchestrator
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,36 @@ class ResearchPoller:
                 await asyncio.to_thread(self.orchestrator.mark_timeout, run.id)
             except Exception:
                 logger.exception("Failed to mark research run %s as timed out", run.id)
+
+        stale_forecast_submits = self.orchestrator.repository.list_stale_forecast_submit_runs(
+            stale_seconds=settings.research_deep_research_submit_stale_seconds,
+        )
+        for run in stale_forecast_submits:
+            try:
+                updated = await asyncio.to_thread(
+                    self.orchestrator.mark_submit_stalled,
+                    run.id,
+                )
+                if updated.status.value == "needs_human_review":
+                    await asyncio.to_thread(
+                        self.orchestrator.repository.sync_forecast_pack_status_for_run,
+                        run.id,
+                        status=updated.status.value,
+                    )
+                elif (
+                    updated.status in {
+                        RunStatus.WAITING_DEEP_RESEARCH,
+                        RunStatus.COLLECTING,
+                    }
+                    and updated.pending_deep_research_response_id
+                ):
+                    await asyncio.to_thread(
+                        self.orchestrator.repository.sync_forecast_pack_status_for_run,
+                        run.id,
+                        status="running",
+                    )
+            except Exception:
+                logger.exception("Failed to mark forecast submit run %s as stalled", run.id)
 
         stale_reviews = self.orchestrator.repository.list_stale_reviewing_runs(
             timeout_seconds=settings.research_review_timeout_seconds,

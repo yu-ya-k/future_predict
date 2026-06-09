@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Literal, cast
 
 from openai import APITimeoutError, AzureOpenAI, BadRequestError, OpenAI, OpenAIError
 from pydantic import ValidationError
@@ -106,13 +106,87 @@ class AzureResponsesClient:
         *,
         prompt: str,
         max_tool_calls: int,
+        tool_profile: Literal["public", "private", "synthesis"] = "public",
+        background: bool = True,
+        policy_decision_id: str | None = None,
+        vector_store_ids: list[str] | None = None,
     ) -> Any:
-        return self.deep_research_client.responses.create(
+        tools = _resolve_tools(
+            settings=self.settings,
+            tool_profile=tool_profile,
+            vector_store_ids=vector_store_ids,
+            for_deep_research=True,
+        )
+        request_client = _client_with_timeout(
+            self.deep_research_client,
+            timeout=self.settings.research_deep_research_submit_timeout_seconds,
+        )
+        return request_client.responses.create(
             model=self.deep_research_deployment,
-            background=True,
+            background=background,
+            store=True,
             input=prompt,
-            tools=[{"type": "web_search_preview"}],
+            tools=tools,
             max_tool_calls=max_tool_calls,
+        )
+
+    def parse_structured(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        text_format: Any,
+        tool_profile: Literal["public", "private", "synthesis"],
+        policy_decision_id: str | None = None,
+        vector_store_ids: list[str] | None = None,
+    ) -> tuple[Any, str | None, dict[str, Any]]:
+        tools = _resolve_tools(
+            settings=self.settings,
+            tool_profile=tool_profile,
+            vector_store_ids=vector_store_ids,
+            for_deep_research=False,
+        )
+        if tools and not policy_decision_id:
+            raise ValueError("policy_decision_id is required when structured parse uses tools.")
+
+        request_client = _client_with_timeout(
+            self.reviewer_client,
+            timeout=self.settings.research_review_timeout_seconds,
+        )
+        parse_method = getattr(request_client.responses, "parse", None)
+        request: dict[str, Any] = {
+            "model": model,
+            "input": prompt,
+            "text_format": text_format,
+        }
+        if tools:
+            request["tools"] = tools
+        if callable(parse_method):
+            try:
+                response = parse_method(**request)
+                parsed = getattr(response, "output_parsed", None)
+                if parsed is not None:
+                    return parsed, get_response_id(response), response_to_jsonable(response)
+            except (TypeError, AttributeError, ValidationError):
+                pass
+            except OpenAIError as error:
+                if not _is_parse_request_shape_error(error):
+                    raise RuntimeError("Structured output request failed.") from error
+
+        request = {
+            "model": model,
+            "input": prompt,
+            "text": {
+                "format": _text_format_to_json_schema_format(text_format),
+            },
+        }
+        if tools:
+            request["tools"] = tools
+        response = request_client.responses.create(**request)
+        return (
+            get_response_output_text(response),
+            get_response_id(response),
+            response_to_jsonable(response),
         )
 
     def retrieve_response(self, response_id: str) -> Any:
@@ -411,6 +485,70 @@ def _is_parse_request_shape_error(error: OpenAIError) -> bool:
     return any(
         marker in details for marker in _PARSE_REQUEST_SHAPE_MARKERS
     ) and any(marker in details for marker in _REQUEST_SHAPE_ERROR_MARKERS)
+
+
+def _resolve_tools(
+    *,
+    settings: Settings,
+    tool_profile: Literal["public", "private", "synthesis"],
+    vector_store_ids: list[str] | None = None,
+    for_deep_research: bool,
+) -> list[dict[str, Any]]:
+    if tool_profile == "synthesis":
+        if for_deep_research:
+            raise ValueError("synthesis profile cannot submit Deep Research.")
+        return []
+    if tool_profile == "public":
+        return [{"type": "web_search_preview"}] if for_deep_research else []
+    if tool_profile != "private":
+        raise ValueError(f"Unknown tool_profile: {tool_profile}")
+
+    ids = vector_store_ids or []
+    if len(ids) > 2:
+        raise ValueError("private profile may use at most two vector stores.")
+    if not ids:
+        raise ValueError("private profile requires allowed vector_store_ids.")
+    allowed_ids = set(settings.research_private_vector_store_allowlist)
+    if not allowed_ids:
+        raise ValueError("private profile requires configured vector store allowlist.")
+    unknown_ids = sorted(set(ids) - allowed_ids)
+    if unknown_ids:
+        raise ValueError("private profile vector_store_ids are not allowlisted.")
+    return [{"type": "file_search", "vector_store_ids": ids}]
+
+
+def _text_format_to_json_schema_format(text_format: Any) -> dict[str, Any]:
+    if isinstance(text_format, dict):
+        schema_format = cast(dict[str, Any], text_format)
+        if schema_format.get("type") == "json_schema" and "schema" in schema_format:
+            return schema_format
+        if "schema" in schema_format:
+            return {
+                "type": "json_schema",
+                "name": str(schema_format.get("name") or "structured_response"),
+                "schema": schema_format["schema"],
+                "strict": bool(schema_format.get("strict", True)),
+            }
+        raise ValueError(
+            "Structured parse fallback cannot convert text_format to a strict JSON schema."
+        )
+
+    schema_source = cast(object, text_format)
+    schema_builder = getattr(schema_source, "model_json_schema", None)
+    if callable(schema_builder):
+        model_name = getattr(schema_source, "__name__", "structured_response")
+        if not isinstance(model_name, str):
+            model_name = "structured_response"
+        return {
+            "type": "json_schema",
+            "name": model_name,
+            "schema": schema_builder(),
+            "strict": True,
+        }
+
+    raise ValueError(
+        "Structured parse fallback cannot convert text_format to a strict JSON schema."
+    )
 
 
 def _truncate_text(value: str, *, max_chars: int) -> tuple[str, int]:
