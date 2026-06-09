@@ -48,6 +48,9 @@ import type {
 // jsdom doesn't implement window.scrollTo
 Object.defineProperty(window, "scrollTo", { value: vi.fn(), writable: true });
 
+const ORIGINAL_NAVIGATOR_CLIPBOARD = navigator.clipboard;
+const ORIGINAL_DOCUMENT_EXEC_COMMAND = document.execCommand;
+
 // Notification API stub
 if (!("Notification" in window)) {
   Object.defineProperty(window, "Notification", {
@@ -194,6 +197,14 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: ORIGINAL_NAVIGATOR_CLIPBOARD,
+  });
+  Object.defineProperty(document, "execCommand", {
+    configurable: true,
+    value: ORIGINAL_DOCUMENT_EXEC_COMMAND,
+  });
   cleanup();
   clearStorage();
 });
@@ -4925,6 +4936,11 @@ describe("HumanReview (SCR-4)", () => {
   });
 
   it("shows a suggested rerun prompt during human review", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -4950,9 +4966,62 @@ describe("HumanReview (SCR-4)", () => {
     expect(await screen.findByText("Rerun向けプロンプト")).toBeInTheDocument();
     expect(screen.getByText("Deep Research 2回目")).toBeInTheDocument();
     expect(screen.getByText("RI-001, RI-002")).toBeInTheDocument();
-    expect(screen.getByText(/Rebuild the full report/i)).toBeInTheDocument();
+    expect(
+      screen.getByRole("textbox", { name: "Rerun向けプロンプト本文" }),
+    ).toHaveValue("# Suggested rerun prompt\nRebuild the full report.");
     expect(screen.getByRole("button", { name: "コピー" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: ".md ダウンロード" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "コピー" }));
+    expect(writeText).toHaveBeenCalledWith(
+      "# Suggested rerun prompt\nRebuild the full report.",
+    );
+    expect(await screen.findByText("コピーしました")).toBeInTheDocument();
+  });
+
+  it("shows manual selection guidance when suggested rerun prompt copy fails", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: vi.fn().mockRejectedValue(new Error("blocked")) },
+    });
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: vi.fn().mockReturnValue(false),
+    });
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      jsonResponse(
+        makePayload(["request_full_rerun"], {
+          reason: "review_route_needs_full_rerun",
+          suggested_rerun: {
+            scope: "full_rerun",
+            expected_output_kind: "complete_replacement_report",
+            expected_run_no: 2,
+            prompt: "# Suggested copy failure",
+            target_item_ids: [],
+            query_policy: { status: "allowed", safe_queries: [], blocked_reason: null },
+            base_report_hash: "hash-base",
+          },
+        }),
+      ),
+    );
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "コピー" }));
+    expect(
+      await screen.findByText(
+        "コピーできませんでした。プロンプト欄を選択してコピーするか、.mdをダウンロードしてください。",
+      ),
+    ).toBeInTheDocument();
+
+    const promptTextbox = screen.getByRole("textbox", {
+      name: "Rerun向けプロンプト本文",
+    });
+    await userEvent.click(screen.getByRole("button", { name: "全文を選択" }));
+    expect(promptTextbox).toHaveFocus();
+    expect((promptTextbox as HTMLTextAreaElement).selectionStart).toBe(0);
+    expect((promptTextbox as HTMLTextAreaElement).selectionEnd).toBe(
+      "# Suggested copy failure".length,
+    );
   });
 
   it.each([
@@ -5273,7 +5342,9 @@ describe("HumanReview (SCR-4)", () => {
     render(<App />);
 
     expect(await screen.findByText("ChatGPT手動rerun")).toBeInTheDocument();
-    expect(screen.getByText(/Find better official sources/i)).toBeInTheDocument();
+    expect(
+      screen.getByRole("textbox", { name: "ChatGPT手動rerunプロンプト本文" }),
+    ).toHaveValue("# Manual rerun prompt\nFind better official sources.");
     expect(screen.getByText("プロンプトをコピーまたはダウンロードする")).toBeInTheDocument();
     expect(screen.getByText("ChatGPTのDeep Researchで実行する")).toBeInTheDocument();
     expect(
@@ -5425,9 +5496,8 @@ describe("HumanReview (SCR-4)", () => {
     );
   });
 
-  it("copies pending manual rerun prompt and reports clipboard failures", async () => {
+  it("copies pending manual rerun prompt with Clipboard API", async () => {
     const pending = makePendingManualRerun({ prompt: "# Copy me" });
-    const originalClipboard = navigator.clipboard;
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
@@ -5449,18 +5519,78 @@ describe("HumanReview (SCR-4)", () => {
     expect(writeText).toHaveBeenCalledWith("# Copy me");
     const copyStatus = await screen.findByText("コピーしました");
     expect(copyStatus).toHaveAttribute("aria-live", "polite");
+  });
 
+  it("falls back when pending manual rerun Clipboard API rejects", async () => {
+    const pending = makePendingManualRerun({ prompt: "# Fallback copy" });
+    const writeText = vi.fn().mockRejectedValue(new Error("blocked"));
+    const execCommand = vi.fn().mockReturnValue(true);
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
-      value: undefined,
+      value: { writeText },
     });
-    await userEvent.click(screen.getByRole("button", { name: "コピー" }));
-    expect(await screen.findByText("コピーできませんでした")).toBeInTheDocument();
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommand,
+    });
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      jsonResponse(
+        makePayload([], {
+          reason: "manual_chatgpt_rerun_pending",
+          pending_manual_rerun: pending,
+          allowed_actions: [],
+        }),
+      ),
+    );
 
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "コピー" }));
+    expect(writeText).toHaveBeenCalledWith("# Fallback copy");
+    expect(execCommand).toHaveBeenCalledWith("copy");
+    expect(await screen.findByText("コピーしました")).toBeInTheDocument();
+  });
+
+  it("shows manual selection guidance when pending manual rerun copy fully fails", async () => {
+    const pending = makePendingManualRerun({ prompt: "# Copy me" });
+    const writeText = vi.fn().mockRejectedValue(new Error("blocked"));
+    const execCommand = vi.fn().mockReturnValue(false);
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
-      value: originalClipboard,
+      value: { writeText },
     });
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommand,
+    });
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      jsonResponse(
+        makePayload([], {
+          reason: "manual_chatgpt_rerun_pending",
+          pending_manual_rerun: pending,
+          allowed_actions: [],
+        }),
+      ),
+    );
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "コピー" }));
+    expect(writeText).toHaveBeenCalledWith("# Copy me");
+    expect(execCommand).toHaveBeenCalledWith("copy");
+    expect(
+      await screen.findByText(
+        "コピーできませんでした。プロンプト欄を選択してコピーするか、.mdをダウンロードしてください。",
+      ),
+    ).toBeInTheDocument();
+
+    const promptTextbox = screen.getByRole("textbox", {
+      name: "ChatGPT手動rerunプロンプト本文",
+    });
+    await userEvent.click(screen.getByRole("button", { name: "全文を選択" }));
+    expect(promptTextbox).toHaveFocus();
+    expect((promptTextbox as HTMLTextAreaElement).selectionStart).toBe(0);
+    expect((promptTextbox as HTMLTextAreaElement).selectionEnd).toBe("# Copy me".length);
   });
 
   it("downloads pending manual rerun prompt as markdown", async () => {

@@ -23,6 +23,9 @@ import type {
 
 Object.defineProperty(window, "scrollTo", { value: vi.fn(), writable: true });
 
+const ORIGINAL_NAVIGATOR_CLIPBOARD = navigator.clipboard;
+const ORIGINAL_DOCUMENT_EXEC_COMMAND = document.execCommand;
+
 const NON_BINARY_OUTCOMES = [
   "Launch by 2026 Q4",
   "Delayed beyond 2026 Q4",
@@ -232,6 +235,14 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: ORIGINAL_NAVIGATOR_CLIPBOARD,
+  });
+  Object.defineProperty(document, "execCommand", {
+    configurable: true,
+    value: ORIGINAL_DOCUMENT_EXEC_COMMAND,
+  });
   cleanup();
   localStorage.clear();
 });
@@ -1337,6 +1348,16 @@ describe("Forecast UI", () => {
   it("imports manual public information and advances to evidence extraction", async () => {
     window.location.hash = "#/forecasts/forecast-1";
     let imported = false;
+    const writeText = vi.fn().mockRejectedValue(new Error("blocked"));
+    const execCommand = vi.fn().mockReturnValue(true);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommand,
+    });
     const fetchMock = vi.fn(
       async (url: string | URL | Request, init?: RequestInit) => {
         const path = String(url).replace("http://localhost:8000", "");
@@ -1427,6 +1448,10 @@ describe("Forecast UI", () => {
         name: "ChatGPT Deep Researchへ渡すPrompt",
       }),
     ).toHaveValue("Manual Deep Research prompt");
+    await userEvent.click(screen.getByRole("button", { name: "Promptをコピー" }));
+    expect(writeText).toHaveBeenCalledWith("Manual Deep Research prompt");
+    expect(execCommand).toHaveBeenCalledWith("copy");
+    expect(await screen.findByText("コピーしました")).toBeInTheDocument();
     await userEvent.type(
       screen.getByLabelText("結果を貼り付け"),
       "Manual report from ChatGPT Deep Research.",
@@ -2234,6 +2259,14 @@ describe("Forecast UI", () => {
     window.location.hash = "#/forecasts/forecast-1";
     let imported = false;
     const recoveryPromptHash = "a".repeat(64);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: vi.fn().mockRejectedValue(new Error("blocked")) },
+    });
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: vi.fn().mockReturnValue(false),
+    });
     const fetchMock = vi.fn(
       async (url: string | URL | Request, init?: RequestInit) => {
         const path = String(url).replace("http://localhost:8000", "");
@@ -2324,11 +2357,22 @@ describe("Forecast UI", () => {
         name: "ChatGPT Deep Researchで手動収集に切り替え",
       }),
     );
+    const promptTextbox = await screen.findByRole("textbox", {
+      name: "ChatGPT Deep Researchへ渡すPrompt",
+    });
+    expect(promptTextbox).toHaveValue("Recovery Deep Research prompt");
+    await userEvent.click(screen.getByRole("button", { name: "Promptをコピー" }));
     expect(
-      await screen.findByRole("textbox", {
-        name: "ChatGPT Deep Researchへ渡すPrompt",
-      }),
-    ).toHaveValue("Recovery Deep Research prompt");
+      await screen.findByText(
+        "コピーできませんでした。Prompt欄を選択してコピーするか、Markdownでダウンロードしてください。",
+      ),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "全文を選択" }));
+    expect(promptTextbox).toHaveFocus();
+    expect((promptTextbox as HTMLTextAreaElement).selectionStart).toBe(0);
+    expect((promptTextbox as HTMLTextAreaElement).selectionEnd).toBe(
+      "Recovery Deep Research prompt".length,
+    );
     expect(screen.getByText("既存の公開情報パックを手動レポートで復旧します。"))
       .toBeInTheDocument();
     await userEvent.type(screen.getByLabelText("結果を貼り付け"), "Recovered manual report.");

@@ -13,6 +13,7 @@ import {
   resolveForecast,
   reviewForecast,
 } from "../../api/forecast";
+import { copyTextToClipboard } from "../../lib/clipboard";
 import { Link, routes } from "../../router";
 import { formatElapsed, useElapsed } from "../../hooks/useElapsed";
 import type {
@@ -49,6 +50,8 @@ type CurrentStepAction =
   | null;
 
 const PACK_SUBMISSION_POLL_MS = 1_000;
+const MANUAL_PROMPT_COPY_FAILED =
+  "コピーできませんでした。Prompt欄を選択してコピーするか、Markdownでダウンロードしてください。";
 
 interface CurrentStepModel {
   title: string;
@@ -655,8 +658,13 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   const [manualPromptLoading, setManualPromptLoading] = useState(false);
   const [manualReportText, setManualReportText] = useState("");
   const [manualReportFile, setManualReportFile] = useState<File | null>(null);
+  const [manualPromptCopyStatus, setManualPromptCopyStatus] = useState<{
+    message: string;
+    failed: boolean;
+  } | null>(null);
   const manualPromptRequestId = useRef(0);
   const manualReportFileInputRef = useRef<HTMLInputElement | null>(null);
+  const manualPromptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const idempotencyKeys = useRef<Record<Command, string>>({
     pack: stableKey(forecastId, "pack"),
     manualPack: stableKey(forecastId, "manualPack"),
@@ -677,6 +685,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     setManualPromptLoading(false);
     setManualReportText("");
     setManualReportFile(null);
+    setManualPromptCopyStatus(null);
     if (manualReportFileInputRef.current) {
       manualReportFileInputRef.current.value = "";
     }
@@ -922,6 +931,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       const prompt = await getManualResearchPackPrompt(forecastId);
       if (manualPromptRequestId.current === requestId) {
         setManualPrompt(prompt);
+        setManualPromptCopyStatus(null);
       }
     } catch (err) {
       if (manualPromptRequestId.current === requestId) {
@@ -949,11 +959,16 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
 
   async function copyManualPrompt() {
     if (!manualPrompt) return;
-    try {
-      await navigator.clipboard.writeText(manualPrompt.prompt);
-    } catch (err) {
-      setError(formatForecastError(err));
-    }
+    const result = await copyTextToClipboard(manualPrompt.prompt);
+    setManualPromptCopyStatus({
+      message: result === "failed" ? MANUAL_PROMPT_COPY_FAILED : "コピーしました",
+      failed: result === "failed",
+    });
+  }
+
+  function selectManualPrompt() {
+    manualPromptTextareaRef.current?.focus();
+    manualPromptTextareaRef.current?.select();
   }
 
   function downloadManualPrompt() {
@@ -1311,6 +1326,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
                 <textarea
                   className="forecast-manual-pack__prompt"
                   aria-label="ChatGPT Deep Researchへ渡すPrompt"
+                  ref={manualPromptTextareaRef}
                   value={manualPrompt.prompt}
                   readOnly
                   rows={8}
@@ -1323,6 +1339,15 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
                   >
                     Promptをコピー
                   </button>
+                  {manualPromptCopyStatus?.failed && (
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      onClick={selectManualPrompt}
+                    >
+                      全文を選択
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="btn-secondary"
@@ -1331,6 +1356,14 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
                     PromptをMarkdownでダウンロード
                   </button>
                 </div>
+                {manualPromptCopyStatus && (
+                  <p
+                    className={`char-counter${manualPromptCopyStatus.failed ? " char-counter--error" : ""}`}
+                    aria-live="polite"
+                  >
+                    {manualPromptCopyStatus.message}
+                  </p>
+                )}
               </>
             )}
             <label className="field">
