@@ -121,14 +121,24 @@ class HumanReviewAuditSummary(BaseModel):
     estimated_cost_usd: float = 0.0
 
 
+class ForecastRunContext(BaseModel):
+    forecast_id: UUID
+    pack_id: UUID
+    pack_role: str
+    tool_profile: str
+
+
 class ResearchRunStatusResponse(BaseModel):
     run_id: UUID
     status: RunStatus
     terminal_status: str | None = None
     done_reason: str | None
     needs_human_review: bool
+    created_at: datetime
+    updated_at: datetime
     deep_research_submitted_at: datetime | None = None
     progress: RunProgress
+    forecast_context: ForecastRunContext | None = None
 
 
 class ReportResponse(BaseModel):

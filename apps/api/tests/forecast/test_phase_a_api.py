@@ -1583,6 +1583,14 @@ async def test_phase_a_forecast_lifecycle_and_forecast_research_mode(
         assert pack_detail["done_reason"] is None
         assert pack_detail["needs_human_review"] is False
 
+        run_status = await client.get(f"/research-runs/{run_id}")
+        assert run_status.status_code == 200
+        forecast_context = run_status.json()["forecast_context"]
+        assert forecast_context["forecast_id"] == forecast_id
+        assert forecast_context["pack_id"] == pack_json["pack_id"]
+        assert forecast_context["pack_role"] == "current_state"
+        assert forecast_context["tool_profile"] == "public"
+
         completed_run = research.collect_deep_research(run_id)
         assert completed_run.status == "completed"
         assert completed_run.done_reason == "forecast_raw_report_collected"
@@ -1599,6 +1607,11 @@ async def test_phase_a_forecast_lifecycle_and_forecast_research_mode(
         assert collected_pack_detail["research_run_status"] == "completed"
         assert collected_pack_detail["done_reason"] == "forecast_raw_report_collected"
         assert collected_pack_detail["needs_human_review"] is False
+        completed_run_status = await client.get(f"/research-runs/{run_id}")
+        assert completed_run_status.status_code == 200
+        completed_forecast_context = completed_run_status.json()["forecast_context"]
+        assert completed_forecast_context["forecast_id"] == forecast_id
+        assert completed_forecast_context["pack_id"] == pack_json["pack_id"]
 
         delete_response = await client.delete(f"/research-runs/{run_id}")
         assert delete_response.status_code == 409

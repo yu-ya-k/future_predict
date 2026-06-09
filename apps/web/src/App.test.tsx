@@ -33,6 +33,7 @@ import { App } from "./App";
 import { Markdown } from "./components";
 import type {
   AuditResponse,
+  ForecastRunContext,
   HumanReviewPayload,
   ItemAssessment,
   ResearchAttempt,
@@ -1532,18 +1533,24 @@ describe("RunMonitor (SCR-3)", () => {
     status = "completed",
     doneReason = null,
     needsHumanReview = false,
+    createdAt = "2026-06-06T03:00:00.000Z",
+    updatedAt = "2026-06-06T03:00:00.000Z",
     attempts = [makeResearchAttempt(1)],
     reviews = [],
     history = [],
     progress = makeRunProgress({ deep_research_runs: attempts.length }),
+    forecastContext = null,
   }: {
     status?: RunStatus;
     doneReason?: string | null;
     needsHumanReview?: boolean;
+    createdAt?: string;
+    updatedAt?: string;
     attempts?: ResearchAttempt[];
     reviews?: ReviewRecord[];
     history?: AuditResponse["history"];
     progress?: ResearchRunStatusResponse["progress"];
+    forecastContext?: ForecastRunContext | null;
   }) {
     globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
@@ -1592,11 +1599,60 @@ describe("RunMonitor (SCR-3)", () => {
             status,
             done_reason: doneReason,
             needs_human_review: needsHumanReview,
+            created_at: createdAt,
+            updated_at: updatedAt,
             progress,
+            forecast_context: forecastContext,
           }),
       } as Response);
     });
   }
+
+  it("links back to the source Forecast when the run belongs to a forecast pack", async () => {
+    mockRunMonitorFetch({
+      forecastContext: {
+        forecast_id: "forecast-1",
+        pack_id: "pack-1",
+        pack_role: "current_state",
+        tool_profile: "public",
+      },
+    });
+
+    render(<App />);
+
+    const forecastLink = await screen.findByRole("link", { name: "Forecastへ戻る" });
+    expect(forecastLink).toHaveAttribute("href", "#/forecasts/forecast-1");
+    expect(screen.getByRole("link", { name: "ダッシュボードへ戻る" })).toBeInTheDocument();
+  });
+
+  it("uses API run timestamps for elapsed time when opened from a forecast", async () => {
+    localStorage.setItem("dro.trackedRuns", "[]");
+    vi.spyOn(Date, "now").mockReturnValue(
+      new Date("2026-06-06T04:15:00.000Z").getTime(),
+    );
+    mockRunMonitorFetch({
+      status: "waiting_deep_research",
+      createdAt: "2026-06-06T03:00:00.000Z",
+      updatedAt: "2026-06-06T03:05:00.000Z",
+      forecastContext: {
+        forecast_id: "forecast-1",
+        pack_id: "pack-1",
+        pack_role: "current_state",
+        tool_profile: "public",
+      },
+      progress: makeRunProgress({
+        deep_research_runs: 1,
+        total_tool_calls: 3,
+      }),
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("link", { name: "Forecastへ戻る" })).toBeInTheDocument();
+    expect(screen.getByText("トータル経過時間")).toBeInTheDocument();
+    expect(screen.getByText("75:00")).toBeInTheDocument();
+    expect(screen.getByText(/今回の経過時間: 75分/)).toBeInTheDocument();
+  });
 
   it("unwraps ResearchItem API wrapper responses in the monitor", async () => {
     globalThis.fetch = vi.fn((input: RequestInfo | URL) => {

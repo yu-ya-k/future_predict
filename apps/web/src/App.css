@@ -1891,6 +1891,13 @@ body {
   border-bottom: var(--border);
 }
 
+.monitor-back-links {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
 .monitor-header-top {
   display: flex;
   align-items: flex-start;

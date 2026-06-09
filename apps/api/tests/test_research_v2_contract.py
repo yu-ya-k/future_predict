@@ -191,6 +191,9 @@ async def test_v2_status_response_includes_item_progress_schema() -> None:
     progress_properties = schemas["RunProgress"]["properties"]
 
     assert "terminal_status" in status_properties
+    assert "created_at" in status_properties
+    assert "updated_at" in status_properties
+    assert "forecast_context" in status_properties
 
     for field in [
         "items_total",

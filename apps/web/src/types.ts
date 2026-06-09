@@ -169,14 +169,24 @@ export interface RunProgress {
   estimated_cost_usd: number;
 }
 
+export interface ForecastRunContext {
+  forecast_id: string;
+  pack_id: string;
+  pack_role: string;
+  tool_profile: string;
+}
+
 export interface ResearchRunStatusResponse {
   run_id: string;
   status: RunStatus;
   terminal_status?: string | null;
   done_reason: string | null;
   needs_human_review: boolean;
+  created_at: string;
+  updated_at: string;
   deep_research_submitted_at?: string | null;
   progress: RunProgress;
+  forecast_context: ForecastRunContext | null;
 }
 
 export interface AcceptanceCriterion {

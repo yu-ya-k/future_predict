@@ -1486,6 +1486,7 @@ export function RunMonitor({ runId }: RunMonitorProps) {
 
   const status = runStatus?.status ?? (tracked?.last_status ?? "queued");
   const progress = runStatus?.progress;
+  const forecastContext = runStatus?.forecast_context ?? null;
   const sortedReviews = useMemo(
     () =>
       Array.isArray(audit?.reviews)
@@ -1540,9 +1541,10 @@ export function RunMonitor({ runId }: RunMonitorProps) {
     }
   }, [preferredDagNode, selectedDagNodeById, selectedDagNodeId]);
 
-  const elapsed = useElapsed(tracked?.created_at, !isTerminal(status));
+  const runStartedAt = tracked?.created_at ?? runStatus?.created_at;
+  const elapsed = useElapsed(runStartedAt, !isTerminal(status));
   const currentDeepResearchStartedAt =
-    runStatus?.deep_research_submitted_at ?? tracked?.created_at;
+    runStatus?.deep_research_submitted_at ?? runStartedAt;
   const currentDeepResearchElapsed = useElapsed(
     currentDeepResearchStartedAt,
     !isTerminal(status),
@@ -1659,7 +1661,15 @@ export function RunMonitor({ runId }: RunMonitorProps) {
     <div className="screen-monitor">
       {/* ── Header ───────────────────────────────────── */}
       <header className="monitor-header">
-        <BackLink to={routes().dashboard} label="ダッシュボードへ戻る" />
+        <nav className="monitor-back-links" aria-label="戻り先">
+          <BackLink to={routes().dashboard} label="ダッシュボードへ戻る" />
+          {forecastContext && (
+            <BackLink
+              to={routes().forecastDetail(forecastContext.forecast_id)}
+              label="Forecastへ戻る"
+            />
+          )}
+        </nav>
         <div className="monitor-header-top">
           <div className="monitor-title-row">
             <StatusPill status={status} />

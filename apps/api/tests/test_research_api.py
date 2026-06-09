@@ -161,7 +161,10 @@ async def test_research_run_api_flow(tmp_path: Path) -> None:
         assert initial_status_response.status_code == 200
         initial_status_json = initial_status_response.json()
         assert initial_status_json["status"] == "waiting_deep_research"
+        assert initial_status_json["created_at"]
+        assert initial_status_json["updated_at"]
         assert initial_status_json["deep_research_submitted_at"] is not None
+        assert initial_status_json["forecast_context"] is None
 
         orchestrator.collect_deep_research(run_id)
 

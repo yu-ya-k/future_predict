@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from typing import Annotated
 from uuid import UUID
 
@@ -23,6 +24,7 @@ from api.research.schemas import (
     CostEvent,
     CreateResearchRunRequest,
     CreateResearchRunResponse,
+    ForecastRunContext,
     ForkPreviewRequest,
     ForkPreviewResponse,
     ForkSubmitRequest,
@@ -215,6 +217,8 @@ def _status_response(
         terminal_status=run.terminal_status,
         done_reason=run.done_reason,
         needs_human_review=run.needs_human_review,
+        created_at=run.created_at,
+        updated_at=run.updated_at,
         deep_research_submitted_at=orchestrator.repository.get_deep_research_submitted_at(
             run.id
         ),
@@ -231,6 +235,48 @@ def _status_response(
             total_tool_calls=run.total_tool_calls,
             estimated_cost_usd=estimated_cost_usd,
         ),
+        forecast_context=_forecast_run_context(orchestrator, run.id),
+    )
+
+
+def _forecast_run_context(
+    orchestrator: ResearchOrchestrator,
+    run_id: UUID,
+) -> ForecastRunContext | None:
+    required_columns = {"forecast_id", "pack_id", "pack_role", "tool_profile", "research_run_id"}
+    with sqlite3.connect(orchestrator.settings.research_db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        has_forecast_packs = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'forecast_research_packs'
+            """
+        ).fetchone()
+        if has_forecast_packs is None:
+            return None
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(forecast_research_packs)")
+        }
+        if not required_columns.issubset(columns):
+            return None
+        pack = connection.execute(
+            """
+            SELECT forecast_id, pack_id, pack_role, tool_profile
+            FROM forecast_research_packs
+            WHERE research_run_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (str(run_id),),
+        ).fetchone()
+    if pack is None:
+        return None
+    return ForecastRunContext(
+        forecast_id=pack["forecast_id"],
+        pack_id=pack["pack_id"],
+        pack_role=pack["pack_role"],
+        tool_profile=pack["tool_profile"],
     )
 
 
