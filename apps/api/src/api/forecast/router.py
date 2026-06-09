@@ -554,6 +554,28 @@ def _run_idempotent[T](
                         response=encoded,
                     )
                     return cast(T, encoded)
+            payload_map = cast(dict[str, object], payload) if isinstance(payload, dict) else None
+            report_sha256 = (
+                payload_map.get("report_sha256") if payload_map is not None else None
+            )
+            if (
+                scope == "forecast:research_pack_manual_import"
+                and isinstance(report_sha256, str)
+            ):
+                repaired = orchestrator.existing_manual_research_pack_response(
+                    UUID(resource_id),
+                    report_sha256=report_sha256,
+                )
+                if repaired is not None:
+                    encoded = jsonable_encoder(repaired)
+                    orchestrator.repository.complete_idempotency_record(
+                        command_scope=scope,
+                        resource_id=resource_id,
+                        idempotency_key=idempotency_key,
+                        request_hash=request_hash,
+                        response=encoded,
+                    )
+                    return cast(T, encoded)
             raise forecast_http_error(
                 ForecastConflict(
                     "idempotency_in_progress",

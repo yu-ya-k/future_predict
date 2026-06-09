@@ -53,6 +53,16 @@ export function formatForecastError(error: unknown): string {
     const validationMessage = formatValidationIssues(parseValidationIssues(error));
     if (validationMessage) return validationMessage;
 
+    if (error.code === "prompt_stale") {
+      return "Promptが古くなっています。Promptを再取得してから取り込んでください。";
+    }
+    if (error.code === "research_pack_manual_recovery_not_allowed") {
+      return "この状態では手動収集に切り替えられません。最新状態を確認してください。";
+    }
+    if (error.code === "research_pack_already_exists") {
+      return "すでに公開情報パックがあります。最新状態を再読み込みしてください。";
+    }
+
     const message = error.code ? `${error.code}: ${error.message}` : error.message;
     if (!error.details || Object.keys(error.details).length === 0) return message;
     return `${message}\nDetails: ${JSON.stringify(error.details)}`;

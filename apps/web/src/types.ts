@@ -736,6 +736,10 @@ export interface ManualResearchPackPromptResponse {
   tool_profile: "public";
   max_report_chars: number;
   max_file_bytes: number;
+  pack_id?: string | null;
+  research_run_id?: string | null;
+  recovering_existing_pack?: boolean;
+  recoverable_status?: string | null;
 }
 
 export interface ForecastSource {

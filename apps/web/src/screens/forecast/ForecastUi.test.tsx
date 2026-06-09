@@ -2230,6 +2230,124 @@ describe("Forecast UI", () => {
     ).toBeNull();
   });
 
+  it("recovers a blocked research pack with manual ChatGPT import", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    let imported = false;
+    const recoveryPromptHash = "a".repeat(64);
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: "pack_running",
+              approved_framing_version: 1,
+              current_research_pack: imported
+                ? currentResearchPack({
+                    pack_status: "completed",
+                    effective_status: "completed",
+                    research_run_status: "completed",
+                    total_tool_calls: 0,
+                    needs_human_review: false,
+                  })
+                : currentResearchPack({
+                    pack_status: "needs_human_review",
+                    effective_status: "needs_human_review",
+                    research_run_status: "needs_human_review",
+                    done_reason: "deep_research_submit_failed",
+                    last_error: "APITimeoutError('Request timed out.')",
+                    needs_human_review: true,
+                  }),
+              current_research_pack_status: imported ? "completed" : "needs_human_review",
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/research-packs/manual-prompt" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse({
+            forecast_id: "forecast-1",
+            framing_version: 1,
+            prompt: "Recovery Deep Research prompt",
+            prompt_sha256: recoveryPromptHash,
+            prompt_version: "current_state_pack_v1",
+            pack_role: "current_state",
+            tool_profile: "public",
+            max_report_chars: 50000,
+            max_file_bytes: 1048576,
+            pack_id: "pack-1",
+            research_run_id: "run-1",
+            recovering_existing_pack: true,
+            recoverable_status: "needs_human_review",
+          });
+        }
+        if (
+          path === "/forecasts/forecast-1/research-packs/manual-import" &&
+          init?.method === "POST"
+        ) {
+          expect(init.body).toBeInstanceOf(FormData);
+          const body = init.body as FormData;
+          expect(body.get("prompt_sha256")).toBe(recoveryPromptHash);
+          expect(body.get("report_text")).toBe("Recovered manual report.");
+          imported = true;
+          return jsonResponse({
+            pack_id: "pack-1",
+            forecast_id: "forecast-1",
+            research_run_id: "run-1",
+            pack_role: "current_state",
+            tool_profile: "public",
+            status: "completed",
+            policy_decision_id: "policy-1",
+          });
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    const currentStep = await screen.findByRole("region", {
+      name: "公開情報の収集に確認が必要です",
+    });
+    expect(
+      within(currentStep).getByRole("link", { name: "Research run詳細" }),
+    ).toHaveAttribute("href", "#/runs/run-1");
+    expect(screen.queryByRole("group", { name: "公開情報の収集方法" })).toBeNull();
+
+    await userEvent.click(
+      within(currentStep).getByRole("button", {
+        name: "ChatGPT Deep Researchで手動収集に切り替え",
+      }),
+    );
+    expect(
+      await screen.findByRole("textbox", {
+        name: "ChatGPT Deep Researchへ渡すPrompt",
+      }),
+    ).toHaveValue("Recovery Deep Research prompt");
+    expect(screen.getByText("既存の公開情報パックを手動レポートで復旧します。"))
+      .toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("結果を貼り付け"), "Recovered manual report.");
+    await userEvent.click(screen.getByRole("button", { name: "結果を取り込む" }));
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "公開情報の収集が完了しました",
+        level: 2,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "証拠を抽出" })).toBeEnabled();
+    expect(
+      screen.queryByRole("button", {
+        name: "ChatGPT Deep Researchで手動収集に切り替え",
+      }),
+    ).toBeNull();
+  });
+
   it.each([
     {
       effectiveStatus: "failed",

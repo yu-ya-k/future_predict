@@ -1815,6 +1815,124 @@ async def test_research_pack_submit_failure_remains_visible_on_forecast(
 
 
 @pytest.mark.anyio
+async def test_manual_research_pack_import_recovers_failed_existing_pack(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure(submit_raises=RuntimeError("remote submit failed"))
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+    report = (
+        "Public source A reports adoption grew in 2028.\n"
+        "Public source B says support-ticket automation exceeded the threshold.\n"
+        "Public benchmarks support the result."
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        forecast_id = await _create_approved_forecast(
+            client,
+            question="Will AI agents handle 30% of support tickets by 2029?",
+        )
+
+        failed_pack = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={"pack_role": "current_state", "tool_profile": "public"},
+        )
+        assert failed_pack.status_code == 200
+        failed_pack_json = failed_pack.json()
+        assert failed_pack_json["status"] == "needs_human_review"
+        run_id = failed_pack_json["research_run_id"]
+
+        prompt = await client.get(
+            f"/forecasts/{forecast_id}/research-packs/manual-prompt"
+        )
+        assert prompt.status_code == 200
+        prompt_json = prompt.json()
+        assert prompt_json["recovering_existing_pack"] is True
+        assert prompt_json["pack_id"] == failed_pack_json["pack_id"]
+        assert prompt_json["research_run_id"] == run_id
+        assert prompt_json["recoverable_status"] == "needs_human_review"
+        failed_pack_row = forecast.repository.list_packs(UUID(forecast_id))[-1]
+        assert prompt_json["prompt_version"] == failed_pack_row["prompt_version"]
+
+        imported = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            headers={"Idempotency-Key": "manual-recover-pack"},
+            data={
+                "prompt_sha256": prompt_json["prompt_sha256"],
+                "report_text": report,
+            },
+        )
+        assert imported.status_code == 200
+        imported_json = imported.json()
+        assert imported_json["pack_id"] == failed_pack_json["pack_id"]
+        assert imported_json["research_run_id"] == run_id
+        assert imported_json["status"] == "completed"
+
+        replay = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            headers={"Idempotency-Key": "manual-recover-pack"},
+            data={
+                "prompt_sha256": prompt_json["prompt_sha256"],
+                "report_text": report,
+            },
+        )
+        assert replay.status_code == 200
+        assert replay.json() == imported_json
+
+        same_report_retry = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            headers={"Idempotency-Key": "manual-recover-same-report-new-key"},
+            data={
+                "prompt_sha256": prompt_json["prompt_sha256"],
+                "report_text": report,
+            },
+        )
+        assert same_report_retry.status_code == 200
+        assert same_report_retry.json() == imported_json
+
+        detail = await client.get(f"/forecasts/{forecast_id}")
+        assert detail.status_code == 200
+        detail_json = detail.json()
+        assert detail_json["current_research_pack_status"] == "completed"
+        pack_detail = detail_json["current_research_pack"]
+        assert pack_detail["pack_status"] == "completed"
+        assert pack_detail["effective_status"] == "completed"
+        assert pack_detail["research_run_status"] == "completed"
+        assert pack_detail["done_reason"] is None
+        assert pack_detail["needs_human_review"] is False
+
+        attempts = research.repository.get_attempts(UUID(run_id))
+        assert [attempt.source for attempt in attempts] == ["api", "manual_upload"]
+        assert attempts[0].status == "failed_to_submit"
+        assert attempts[1].status == "completed"
+        run = research.repository.get_run(UUID(run_id))
+        assert run.status == RunStatus.COMPLETED
+        assert run.terminal_status == "completed_manual_import"
+        assert run.final_report == report
+
+        evidence = await client.post(f"/forecasts/{forecast_id}/evidence/extract")
+        assert evidence.status_code == 200
+        assert evidence.json()["sources"]
+        assert evidence.json()["claims"]
+
+        duplicate = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            headers={"Idempotency-Key": "manual-recover-other-report"},
+            data={
+                "prompt_sha256": prompt_json["prompt_sha256"],
+                "report_text": f"{report}\nDifferent line.",
+            },
+        )
+        assert duplicate.status_code == 409
+        assert _typed_code(duplicate.json()) == "research_pack_already_exists"
+
+
+@pytest.mark.anyio
 async def test_research_pack_completed_hides_old_attempt_error(
     tmp_path: Path,
 ) -> None:
@@ -2029,8 +2147,19 @@ async def test_manual_research_pack_import_links_completed_pack_and_evidence(
                 "report_text": report,
             },
         )
-        assert duplicate.status_code == 409
-        assert _typed_code(duplicate.json()) == "research_pack_already_exists"
+        assert duplicate.status_code == 200
+        assert duplicate.json() == imported_json
+
+        duplicate_changed_report = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/manual-import",
+            headers={"Idempotency-Key": "manual-pack-3"},
+            data={
+                "prompt_sha256": prompt_json["prompt_sha256"],
+                "report_text": f"{report}\nDifferent line.",
+            },
+        )
+        assert duplicate_changed_report.status_code == 409
+        assert _typed_code(duplicate_changed_report.json()) == "research_pack_already_exists"
 
 
 @pytest.mark.anyio

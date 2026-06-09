@@ -333,6 +333,10 @@ class ManualResearchPackPromptResponse(BaseModel):
     tool_profile: ToolProfile
     max_report_chars: int
     max_file_bytes: int
+    pack_id: UUID | None = None
+    research_run_id: UUID | None = None
+    recovering_existing_pack: bool = False
+    recoverable_status: str | None = None
 
 
 class SourceRecord(BaseModel):

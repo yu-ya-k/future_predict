@@ -433,6 +433,127 @@ class ResearchOrchestrator:
             self.artifacts.delete_run(run_id)
         return run
 
+    def complete_existing_forecast_manual_import_run(
+        self,
+        run_id: UUID,
+        *,
+        input_prompt: str,
+        report: str,
+        metadata: dict[str, Any],
+    ) -> ResearchRunRecord:
+        run = self.repository.get_run(run_id)
+        if run.run_origin != "forecast":
+            raise ValueError("Only forecast-linked research runs can be recovered.")
+        allowed_statuses = {
+            RunStatus.NEEDS_HUMAN_REVIEW,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+        }
+        if run.status not in allowed_statuses:
+            raise ValueError(f"Run status {run.status.value} cannot be manually recovered.")
+
+        imported_at = utc_now()
+        attempts = self.repository.get_attempts(run_id)
+        next_attempt_no = max(
+            [run.deep_research_runs, *(attempt.run_no for attempt in attempts)],
+            default=0,
+        ) + 1
+        prompt_sha256 = hashlib.sha256(input_prompt.encode("utf-8")).hexdigest()
+        report_sha256 = hashlib.sha256(report.encode("utf-8")).hexdigest()
+        request_metadata = {
+            **metadata,
+            "prompt_sha256": prompt_sha256,
+            "report_sha256": report_sha256,
+            "prompt_chars": len(input_prompt),
+            "report_chars": len(report),
+            "imported_at": imported_at.isoformat(),
+            "run_origin": "forecast",
+            "manual_recovery": True,
+            "recovered_from_status": run.status.value,
+            "recovered_from_done_reason": run.done_reason,
+        }
+        prompt_path, _ = self.artifacts.save_text(
+            run_id,
+            f"prompts/forecast_manual_recovery_prompt_{next_attempt_no:03d}.txt",
+            input_prompt,
+        )
+        report_path, _ = self.artifacts.save_text(
+            run_id,
+            f"reports/report_attempt_{next_attempt_no:03d}.md",
+            report,
+        )
+        raw_path, _ = self.artifacts.save_json(
+            run_id,
+            f"raw-responses/forecast_manual_recovery_{next_attempt_no:03d}.json",
+            {
+                **request_metadata,
+                "source": "manual_upload",
+                "prompt_path": prompt_path,
+                "report_path": report_path,
+            },
+        )
+        citations = _manual_upload_citations(report, retrieved_at=imported_at.isoformat())
+        updated = self.repository.add_attempt_and_update_run_if_status(
+            run_id,
+            allowed_statuses,
+            ResearchAttempt(
+                run_no=next_attempt_no,
+                response_id=None,
+                status="completed",
+                model="chatgpt-deep-research-manual",
+                source="manual_upload",
+                prompt=input_prompt,
+                report=report,
+                citations=citations,
+                raw_response_artifact_path=raw_path,
+            ),
+            optimized_prompt=input_prompt,
+            status=RunStatus.COMPLETED,
+            report=report,
+            final_report=report,
+            done_reason=None,
+            needs_human_review=False,
+            pending_deep_research_response_id=None,
+            deep_research_status="completed",
+            deep_research_runs=next_attempt_no,
+            terminal_status="completed_manual_import",
+            review_claim_token=None,
+            review_claim_operation=None,
+            review_claim_expires_at=None,
+        )
+        if updated is None:
+            raise ValueError("Research run is no longer recoverable.")
+        self.repository.append_history_event(
+            run_id,
+            {
+                "step": "forecast_manual_research_pack_recovered",
+                "source": "manual_upload",
+                "run_no": next_attempt_no,
+                "prompt_path": prompt_path,
+                "report_path": report_path,
+                "citations_count": len(citations),
+                "report_sha256": report_sha256,
+                "recovered_from_status": run.status.value,
+                "recovered_from_done_reason": run.done_reason,
+            },
+        )
+        self._save_checkpoint(
+            updated,
+            kind="deep_research_collected",
+            node_anchor=f"deep_research:{next_attempt_no}",
+            source_attempt_no=next_attempt_no,
+            report_override=report,
+            snapshot_extra={
+                "source": "manual_upload",
+                "prompt_path": prompt_path,
+                "report_path": report_path,
+                "citations_count": len(citations),
+                "forecast_manual_import": True,
+                "forecast_manual_recovery": True,
+            },
+        )
+        return self.repository.get_run(run_id)
+
     def submit_deep_research(
         self,
         run_id: UUID,

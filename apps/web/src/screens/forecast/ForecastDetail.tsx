@@ -649,6 +649,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   const [busyStartedAt, setBusyStartedAt] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [collectionMode, setCollectionMode] = useState<CollectionMode>("auto");
+  const [manualRecoveryOpen, setManualRecoveryOpen] = useState(false);
   const [manualPrompt, setManualPrompt] =
     useState<ManualResearchPackPromptResponse | null>(null);
   const [manualPromptLoading, setManualPromptLoading] = useState(false);
@@ -671,6 +672,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   useEffect(() => {
     manualPromptRequestId.current += 1;
     setCollectionMode("auto");
+    setManualRecoveryOpen(false);
     setManualPrompt(null);
     setManualPromptLoading(false);
     setManualReportText("");
@@ -786,13 +788,20 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   }, [busy, currentResearchPack]);
 
   useEffect(() => {
-    if (!currentResearchPack) return;
+    const resetPackStatus =
+      forecast?.current_research_pack?.effective_status ??
+      forecast?.current_research_pack_status;
+    if (resetPackStatus !== "completed") return;
+    setManualRecoveryOpen(false);
     setManualReportText("");
     setManualReportFile(null);
     if (manualReportFileInputRef.current) {
       manualReportFileInputRef.current.value = "";
     }
-  }, [currentResearchPack]);
+  }, [
+    forecast?.current_research_pack?.effective_status,
+    forecast?.current_research_pack_status,
+  ]);
 
   useEffect(() => {
     if (!selectedOutcomeId && forecast?.outcomes[0]) {
@@ -932,6 +941,12 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     }
   }
 
+  function openManualRecovery() {
+    setManualRecoveryOpen(true);
+    setManualPrompt(null);
+    void loadManualPrompt();
+  }
+
   async function copyManualPrompt() {
     if (!manualPrompt) return;
     try {
@@ -979,6 +994,14 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   }
 
   const canDispatch = approvedFraming && status === "framing_approved";
+  const canRecoverManualPack =
+    Boolean(currentResearchPack) &&
+    (currentResearchPackStatus === "needs_human_review" ||
+      currentResearchPackStatus === "failed" ||
+      currentResearchPackStatus === "cancelled");
+  const showManualPackPanel =
+    (canDispatch && collectionMode === "manual") ||
+    (canRecoverManualPack && manualRecoveryOpen);
   const manualReportReady = manualReportFile !== null || manualReportText.trim().length > 0;
   const canExtract = status === "pack_running" && researchPackCompleted;
   const canGenerate = status === "evidence_ready";
@@ -1203,6 +1226,18 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
             )}
           </div>
         )}
+        {canRecoverManualPack && (
+          <div className="forecast-current-step__action">
+            <button
+              type="button"
+              className="btn-secondary"
+              disabled={manualPromptLoading}
+              onClick={openManualRecovery}
+            >
+              ChatGPT Deep Researchで手動収集に切り替え
+            </button>
+          </div>
+        )}
         {canDispatch && (
           <div className="forecast-collection-choice">
             <div
@@ -1243,106 +1278,112 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
                   公開情報の収集を開始
                 </button>
               </div>
-            ) : (
-              <div className="forecast-manual-pack">
-                <div className="forecast-manual-pack__header">
-                  <div>
-                    <h3>ChatGPT Deep Researchへ渡すPrompt</h3>
-                    <p>
-                      このPromptを手動で実行し、得られたレポートを貼り付けるか
-                      md/txtでアップロードします。
-                    </p>
-                  </div>
+            ) : null}
+          </div>
+        )}
+        {showManualPackPanel && (
+          <div className="forecast-manual-pack">
+            <div className="forecast-manual-pack__header">
+              <div>
+                <h3>ChatGPT Deep Researchへ渡すPrompt</h3>
+                <p>
+                  このPromptを手動で実行し、得られたレポートを貼り付けるか
+                  md/txtでアップロードします。
+                </p>
+              </div>
+              <button
+                type="button"
+                className="btn-secondary"
+                disabled={manualPromptLoading}
+                onClick={() => void loadManualPrompt()}
+              >
+                {manualPrompt ? "Promptを再取得" : "Promptを取得"}
+              </button>
+            </div>
+            {manualPrompt?.recovering_existing_pack && (
+              <p className="muted">
+                既存の公開情報パックを手動レポートで復旧します。
+              </p>
+            )}
+            {manualPromptLoading && <p className="muted">Promptを取得しています。</p>}
+            {manualPrompt && (
+              <>
+                <textarea
+                  className="forecast-manual-pack__prompt"
+                  aria-label="ChatGPT Deep Researchへ渡すPrompt"
+                  value={manualPrompt.prompt}
+                  readOnly
+                  rows={8}
+                />
+                <div className="forecast-manual-pack__tools">
                   <button
                     type="button"
                     className="btn-secondary"
-                    disabled={manualPromptLoading}
-                    onClick={() => void loadManualPrompt()}
+                    onClick={() => void copyManualPrompt()}
                   >
-                    {manualPrompt ? "Promptを再取得" : "Promptを取得"}
+                    Promptをコピー
                   </button>
-                </div>
-                {manualPromptLoading && <p className="muted">Promptを取得しています。</p>}
-                {manualPrompt && (
-                  <>
-                    <textarea
-                      className="forecast-manual-pack__prompt"
-                      aria-label="ChatGPT Deep Researchへ渡すPrompt"
-                      value={manualPrompt.prompt}
-                      readOnly
-                      rows={8}
-                    />
-                    <div className="forecast-manual-pack__tools">
-                      <button
-                        type="button"
-                        className="btn-secondary"
-                        onClick={() => void copyManualPrompt()}
-                      >
-                        Promptをコピー
-                      </button>
-                      <button
-                        type="button"
-                        className="btn-secondary"
-                        onClick={downloadManualPrompt}
-                      >
-                        PromptをMarkdownでダウンロード
-                      </button>
-                    </div>
-                  </>
-                )}
-                <label className="field">
-                  <span>結果を貼り付け</span>
-                  <textarea
-                    value={manualReportText}
-                    onChange={(event) => {
-                      setManualReportText(event.target.value);
-                      if (event.target.value.length > 0) {
-                        setManualReportFile(null);
-                        if (manualReportFileInputRef.current) {
-                          manualReportFileInputRef.current.value = "";
-                        }
-                      }
-                    }}
-                    rows={6}
-                    placeholder="ChatGPT Deep Researchの最終レポートを貼り付け"
-                  />
-                </label>
-                <label className="field">
-                  <span>md/txtをアップロード</span>
-                  <input
-                    ref={manualReportFileInputRef}
-                    type="file"
-                    accept=".md,.txt,text/markdown,text/plain"
-                    onChange={(event) => {
-                      setManualReportFile(event.target.files?.[0] ?? null);
-                      if (event.target.files?.[0]) setManualReportText("");
-                    }}
-                  />
-                </label>
-                {manualReportFile && (
-                  <p className="muted">選択中: {manualReportFile.name}</p>
-                )}
-                <div className="forecast-collection-choice__action">
-                  <p>
-                    手動レポートは未検証の公開情報として保存され、次の証拠抽出で
-                    Forecast用の主張とソースに分解します。
-                  </p>
                   <button
                     type="button"
-                    className="btn-primary"
-                    disabled={
-                      !!busy ||
-                      manualPromptLoading ||
-                      !manualPrompt ||
-                      !manualReportReady
-                    }
-                    onClick={() => void importManualPack()}
+                    className="btn-secondary"
+                    onClick={downloadManualPrompt}
                   >
-                    結果を取り込む
+                    PromptをMarkdownでダウンロード
                   </button>
                 </div>
-              </div>
+              </>
             )}
+            <label className="field">
+              <span>結果を貼り付け</span>
+              <textarea
+                value={manualReportText}
+                onChange={(event) => {
+                  setManualReportText(event.target.value);
+                  if (event.target.value.length > 0) {
+                    setManualReportFile(null);
+                    if (manualReportFileInputRef.current) {
+                      manualReportFileInputRef.current.value = "";
+                    }
+                  }
+                }}
+                rows={6}
+                placeholder="ChatGPT Deep Researchの最終レポートを貼り付け"
+              />
+            </label>
+            <label className="field">
+              <span>md/txtをアップロード</span>
+              <input
+                ref={manualReportFileInputRef}
+                type="file"
+                accept=".md,.txt,text/markdown,text/plain"
+                onChange={(event) => {
+                  setManualReportFile(event.target.files?.[0] ?? null);
+                  if (event.target.files?.[0]) setManualReportText("");
+                }}
+              />
+            </label>
+            {manualReportFile && (
+              <p className="muted">選択中: {manualReportFile.name}</p>
+            )}
+            <div className="forecast-collection-choice__action">
+              <p>
+                手動レポートは未検証の公開情報として保存され、次の証拠抽出で
+                Forecast用の主張とソースに分解します。
+              </p>
+              <button
+                type="button"
+                className="btn-primary"
+                disabled={
+                  !!busy ||
+                  manualPromptLoading ||
+                  !manualPrompt ||
+                  !manualReportReady
+                }
+                onClick={() => void importManualPack()}
+              >
+                結果を取り込む
+              </button>
+            </div>
           </div>
         )}
         <dl className="forecast-current-step__details">
