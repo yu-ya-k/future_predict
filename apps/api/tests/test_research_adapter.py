@@ -127,6 +127,8 @@ def test_deep_research_submit_always_includes_public_web_search_tool() -> None:
 
     tools_by_call = [call["tools"] for call in fake_client.responses.create_calls]
     assert tools_by_call == [[{"type": "web_search_preview"}]] * 2
+    assert fake_client.with_options_calls == [{"timeout": 120}, {"timeout": 120}]
+    assert all(call["store"] is True for call in fake_client.responses.create_calls)
 
 
 def test_private_deep_research_requires_allowlisted_vector_stores() -> None:

@@ -145,7 +145,7 @@ function currentResearchPack(
     pack_updated_at: "2026-06-08T00:00:00Z",
     research_run_created_at: "2026-06-08T00:00:00Z",
     research_run_updated_at: "2026-06-08T00:00:00Z",
-    deep_research_started_at: null,
+    deep_research_started_at: "2026-06-08T00:05:00Z",
     total_tool_calls: 0,
     estimated_cost_usd: 0,
     done_reason: null,
@@ -1701,7 +1701,7 @@ describe("Forecast UI", () => {
     expect(within(packItem).getByText("登録中")).toBeInTheDocument();
     expect(within(packItem).getByText("サーバーに登録中")).toBeInTheDocument();
     expect(within(packItem).queryByText("実行中")).not.toBeInTheDocument();
-    expect(screen.getAllByText("登録中").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText("サーバーに登録中").length).toBeGreaterThanOrEqual(2);
     expect(
       screen.getByRole("heading", { name: "公開情報をサーバーに登録中" }),
     ).toBeInTheDocument();
@@ -1883,7 +1883,7 @@ describe("Forecast UI", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows a submitting current research pack as server registration", async () => {
+  it("shows a submitting current research pack as Deep Research submit waiting", async () => {
     window.location.hash = "#/forecasts/forecast-1";
     const fetchMock = vi.fn(
       async (url: string | URL | Request, init?: RequestInit) => {
@@ -1933,13 +1933,14 @@ describe("Forecast UI", () => {
       .getAllByRole("listitem")
       .filter((item) => item.parentElement === flowList);
     const packItem = flowItems[1];
-    expect(within(packItem).getByText("登録中")).toBeInTheDocument();
-    expect(within(packItem).getByText("サーバーに登録中")).toBeInTheDocument();
+    expect(within(packItem).getAllByText("Deep Research送信待ち").length).toBeGreaterThan(1);
+    expect(within(packItem).queryByText("登録中")).not.toBeInTheDocument();
     expect(within(packItem).queryByText("実行中")).not.toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "公開情報をサーバーに登録中" }),
+      screen.getByRole("heading", { name: "Deep Researchへの送信を待っています" }),
     ).toBeInTheDocument();
-    expect(screen.getAllByText("サーバーに登録中").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Deep Research送信待ち").length).toBeGreaterThan(1);
+    expect(screen.getByText("run-1")).toBeInTheDocument();
     expect(
       screen.queryByRole("heading", { name: "公開情報を収集中です" }),
     ).not.toBeInTheDocument();
@@ -1969,6 +1970,10 @@ describe("Forecast UI", () => {
                   effectiveStatus === "submitting"
                     ? "queued"
                     : "waiting_deep_research",
+                deep_research_started_at:
+                  effectiveStatus === "submitting"
+                    ? null
+                    : "2026-06-08T00:05:00Z",
               }),
               current_research_pack_status: effectiveStatus,
             }),
@@ -1986,7 +1991,7 @@ describe("Forecast UI", () => {
       await Promise.resolve();
     });
     expect(
-      screen.getByRole("heading", { name: "公開情報をサーバーに登録中" }),
+      screen.getByRole("heading", { name: "Deep Researchへの送信を待っています" }),
     ).toBeInTheDocument();
     expect(forecastGetCount).toBe(1);
 
@@ -2028,6 +2033,10 @@ describe("Forecast UI", () => {
                   effectiveStatus === "submitting"
                     ? "queued"
                     : "waiting_deep_research",
+                deep_research_started_at:
+                  effectiveStatus === "submitting"
+                    ? null
+                    : "2026-06-08T00:05:00Z",
               }),
               current_research_pack_status: effectiveStatus,
             }),
@@ -2045,7 +2054,7 @@ describe("Forecast UI", () => {
       await Promise.resolve();
     });
     expect(
-      screen.getByRole("heading", { name: "公開情報をサーバーに登録中" }),
+      screen.getByRole("heading", { name: "Deep Researchへの送信を待っています" }),
     ).toBeInTheDocument();
 
     await act(async () => {
@@ -2337,6 +2346,12 @@ describe("Forecast UI", () => {
     expect(
       await screen.findByRole("link", { name: "Research run詳細" }),
     ).toHaveAttribute("href", "#/runs/run-1");
+    expect(
+      screen.getByRole("heading", { name: "Deep Researchへの送信を待っています" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "公開情報を収集中です" }),
+    ).not.toBeInTheDocument();
   });
 
   it("does not show the running wait banner after the current research pack is completed", async () => {

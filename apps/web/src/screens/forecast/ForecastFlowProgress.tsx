@@ -20,6 +20,7 @@ export interface ForecastFlowNode {
   title: string;
   meta: string;
   status: ForecastFlowStatus;
+  statusLabel?: string;
   tone: ForecastFlowTone;
 }
 
@@ -52,11 +53,13 @@ export function ForecastFlowProgress({
   const submittingNode = nodes.find((node) => node.status === "submitting");
   const blockedNode = nodes.find((node) => node.status === "blocked");
   const availableNode = nodes.find((node) => node.status === "available");
+  const statusLabelFor = (node: ForecastFlowNode) =>
+    node.statusLabel ?? FORECAST_FLOW_STATUS_LABEL[node.status];
   const statusText = `${heading}。${doneCount}/${nodes.length}完了。${
     currentNode
       ? `現在実行中: ${currentNode.title}。`
       : submittingNode
-        ? `登録中: ${submittingNode.title}。`
+        ? `${statusLabelFor(submittingNode)}: ${submittingNode.title}。`
         : blockedNode
           ? `対応が必要: ${blockedNode.title}。`
       : availableNode
@@ -103,7 +106,7 @@ export function ForecastFlowProgress({
                 <div className="execution-dag-node-topline">
                   <span className="execution-dag-dot" aria-hidden="true" />
                   <span className="execution-dag-state">
-                    {FORECAST_FLOW_STATUS_LABEL[node.status]}
+                    {statusLabelFor(node)}
                   </span>
                 </div>
                 <h4 className="execution-dag-title">{node.title}</h4>

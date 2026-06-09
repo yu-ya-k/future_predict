@@ -104,7 +104,7 @@ async def test_phase_a_forecast_research_pack_completes_through_poller(
         assert pack_json["tool_profile"] == "public"
         assert policy_decision_id
         assert stack.fake_azure.submit_calls[-1]["tool_profile"] == "public"
-        assert stack.fake_azure.submit_calls[-1]["background"] is False
+        assert stack.fake_azure.submit_calls[-1]["background"] is True
         assert stack.fake_azure.submit_calls[-1]["policy_decision_id"] == policy_decision_id
 
         policy_rows = _policy_decision_rows(stack, forecast_id)

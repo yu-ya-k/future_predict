@@ -228,11 +228,40 @@ class ForecastOrchestrator:
     def _current_research_pack_status(self, pack: Any) -> str | None:
         return self._current_research_pack_summary(pack).effective_status
 
+    def existing_research_pack_response(
+        self,
+        forecast_id: UUID,
+        *,
+        include_fresh_submitting: bool = True,
+    ) -> ResearchPackResponse | None:
+        packs = self.repository.list_packs(forecast_id)
+        if not packs:
+            return None
+        pack = self._reconcile_research_pack(packs[-1])
+        if not include_fresh_submitting and pack["status"] == "submitting":
+            return None
+        return _pack_response(pack)
+
     def _reconcile_research_pack(self, pack: Any) -> Any:
         pack_status = pack["status"]
         if pack_status == "completed":
             return pack
         run = self.research.repository.get_run(UUID(pack["research_run_id"]))
+        if (
+            pack_status == "submitting"
+            and run.status in {RunStatus.QUEUED, RunStatus.SUBMITTED}
+            and run.pending_deep_research_response_id is None
+            and _is_stale_timestamp(
+                pack["updated_at"],
+                seconds=self.settings.research_deep_research_submit_stale_seconds,
+            )
+        ):
+            run = self.research.mark_submit_stalled(run.id)
+            if run.status == RunStatus.NEEDS_HUMAN_REVIEW:
+                return self.repository.update_research_pack_status(
+                    pack_id=UUID(pack["pack_id"]),
+                    status=run.status.value,
+                )
         if (
             run.status == RunStatus.WAITING_DEEP_RESEARCH
             and run.pending_deep_research_response_id is None
@@ -267,6 +296,15 @@ class ForecastOrchestrator:
             return self.repository.update_research_pack_status(
                 pack_id=UUID(pack["pack_id"]),
                 status=run.status.value,
+            )
+        if (
+            pack_status == "submitting"
+            and run.status in {RunStatus.WAITING_DEEP_RESEARCH, RunStatus.COLLECTING}
+            and run.pending_deep_research_response_id
+        ):
+            return self.repository.update_research_pack_status(
+                pack_id=UUID(pack["pack_id"]),
+                status="running",
             )
         return pack
 
@@ -451,7 +489,7 @@ class ForecastOrchestrator:
         submitted = self.research.submit_deep_research(
             run.id,
             tool_profile="public",
-            background=self.settings.forecast_background_mode_enabled,
+            background=True,
             policy_decision_id=str(policy_decision_id),
         )
         if submitted.status == RunStatus.WAITING_DEEP_RESEARCH:
@@ -1521,6 +1559,10 @@ def _parse_dt_required(value: str) -> Any:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed
+
+
+def _is_stale_timestamp(value: str, *, seconds: int) -> bool:
+    return (utc_now() - _parse_dt_required(value)).total_seconds() >= seconds
 
 
 def _json_load(value: str | None) -> Any:

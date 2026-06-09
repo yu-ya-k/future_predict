@@ -165,6 +165,7 @@ interface ExecutionDagNode {
   title: string;
   meta: string;
   status: DagNodeStatus;
+  statusLabel?: string;
   tone: DagNodeTone;
   lane: number;
   col: number;
@@ -524,6 +525,7 @@ function buildExecutionDag({
   runId,
   checkpoints,
   lineage,
+  deepResearchSubmitWaiting,
 }: {
   status: RunStatus;
   attempts: ResearchAttempt[];
@@ -533,6 +535,7 @@ function buildExecutionDag({
   runId: string;
   checkpoints: ResearchCheckpoint[];
   lineage: ResearchRunLineage | null;
+  deepResearchSubmitWaiting: boolean;
 }): { nodes: ExecutionDagNode[]; edges: ExecutionDagEdge[] } {
   const nodes: ExecutionDagNode[] = [];
   const edges: ExecutionDagEdge[] = [];
@@ -598,13 +601,17 @@ function buildExecutionDag({
       } satisfies ResearchAttempt);
     nextResearchRunNo += 1;
     const researchId = `research-${attempt.run_no}`;
+    const researchSubmitWaiting =
+      deepResearchSubmitWaiting &&
+      attempt.run_no === Math.max(maxAttemptRunNo, progress?.deep_research_runs ?? 0, 1);
     const researchStatus =
-      activeId === researchId ? "active" : existingAttempt ? "done" : "pending";
+      researchSubmitWaiting ? "active" : activeId === researchId ? "active" : existingAttempt ? "done" : "pending";
     nodes.push({
       id: researchId,
       title: `Deep Research ${attempt.run_no}回目`,
-      meta: `status: ${attempt.status}`,
+      meta: researchSubmitWaiting ? "Deep Research送信待ち" : `status: ${attempt.status}`,
       status: researchStatus,
+      statusLabel: researchSubmitWaiting ? "Deep Research送信待ち" : undefined,
       tone: "research",
       lane: 1,
       col,
@@ -896,7 +903,9 @@ function ExecutionDag({
               >
                 <div className="execution-dag-node-topline">
                   <span className="execution-dag-dot" aria-hidden="true" />
-                  <span className="execution-dag-state">{DAG_STATUS_LABEL[node.status]}</span>
+                  <span className="execution-dag-state">
+                    {node.statusLabel ?? DAG_STATUS_LABEL[node.status]}
+                  </span>
                 </div>
                 <h3 className="execution-dag-title">{node.title}</h3>
                 <p className="execution-dag-meta">{node.meta}</p>
@@ -1502,6 +1511,25 @@ export function RunMonitor({ runId }: RunMonitorProps) {
     () => (Array.isArray(dagAttempts) ? dagAttempts : []),
     [dagAttempts],
   );
+  const runStartedAt = runStatus?.created_at ?? tracked?.created_at;
+  const elapsed = useElapsed(runStartedAt, !isTerminal(status));
+  const currentDeepResearchStartedAt =
+    runStatus?.deep_research_submitted_at ?? undefined;
+  const currentDeepResearchElapsed = useElapsed(
+    currentDeepResearchStartedAt,
+    Boolean(currentDeepResearchStartedAt) && !isTerminal(status),
+  );
+
+  const isWaiting =
+    Boolean(currentDeepResearchStartedAt) &&
+    (status === "waiting_deep_research" || status === "collecting");
+  const isSubmitWaiting =
+    !isTerminal(status) &&
+    !currentDeepResearchStartedAt &&
+    (status === "queued" ||
+      status === "submitted" ||
+      status === "waiting_deep_research" ||
+      status === "collecting");
   const dagData = useMemo(
     () =>
       buildExecutionDag({
@@ -1513,8 +1541,19 @@ export function RunMonitor({ runId }: RunMonitorProps) {
         runId,
         checkpoints: checkpoints ?? [],
         lineage: lineage ?? null,
+        deepResearchSubmitWaiting: isSubmitWaiting,
       }),
-    [auditHistory, checkpoints, lineage, progress, runId, sortedAttempts, sortedReviews, status],
+    [
+      auditHistory,
+      checkpoints,
+      isSubmitWaiting,
+      lineage,
+      progress,
+      runId,
+      sortedAttempts,
+      sortedReviews,
+      status,
+    ],
   );
   const selectedDagNodeById = dagData.nodes.find((node) => node.id === selectedDagNodeId);
   const preferredDagNode =
@@ -1540,18 +1579,6 @@ export function RunMonitor({ runId }: RunMonitorProps) {
       setSelectedDagNodeId(preferredDagNode.id);
     }
   }, [preferredDagNode, selectedDagNodeById, selectedDagNodeId]);
-
-  const runStartedAt = tracked?.created_at ?? runStatus?.created_at;
-  const elapsed = useElapsed(runStartedAt, !isTerminal(status));
-  const currentDeepResearchStartedAt =
-    runStatus?.deep_research_submitted_at ?? runStartedAt;
-  const currentDeepResearchElapsed = useElapsed(
-    currentDeepResearchStartedAt,
-    !isTerminal(status),
-  );
-
-  const isWaiting =
-    status === "waiting_deep_research" || status === "collecting";
 
   const showHumanReviewBanner = status === "needs_human_review";
   const showNoProgressNote =
@@ -1992,6 +2019,13 @@ export function RunMonitor({ runId }: RunMonitorProps) {
           startedAt={currentDeepResearchStartedAt}
           totalToolCalls={progress?.total_tool_calls ?? 0}
         />
+      )}
+      {isSubmitWaiting && (
+        <div className="alert" role="status">
+          Deep Researchへの送信を待っています。Research runは作成済みですが、
+          Deep Research開始時刻はまだ記録されていません。トータル経過時間:{" "}
+          {formatElapsed(elapsed)}
+        </div>
       )}
 
       {/* ── Review history ───────────────────────────── */}

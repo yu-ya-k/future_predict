@@ -83,7 +83,6 @@ def forecast_research_integration_stack_factory(
             research_artifact_dir=stack_path / "research-artifacts",
             forecast_enabled=True,
             forecast_artifact_dir=stack_path / "forecast-artifacts",
-            forecast_background_mode_enabled=False,
             research_poller_enabled=False,
             research_review_web_search_enabled=False,
         )

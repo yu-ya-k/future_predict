@@ -30,7 +30,12 @@ from api.main import create_app
 from api.research.artifacts import ArtifactStore
 from api.research.dependencies import get_research_orchestrator
 from api.research.repository import ResearchRepository
-from api.research.schemas import CreateResearchRunRequest, ResearchRunOptions, RunStatus
+from api.research.schemas import (
+    CreateResearchRunRequest,
+    ResearchAttempt,
+    ResearchRunOptions,
+    RunStatus,
+)
 from api.research.service import ResearchOrchestrator
 from research_fakes import IntegrationFakeAzure
 
@@ -1497,6 +1502,261 @@ async def test_forecast_detail_reconciles_legacy_missing_response_id_pack(
 
 
 @pytest.mark.anyio
+async def test_forecast_detail_marks_stale_submit_without_response_id(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    settings = forecast.settings.model_copy(
+        update={"research_deep_research_submit_stale_seconds": 0}
+    )
+    forecast.settings = settings
+    research.settings = settings
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will stale submit packs become visible as review?",
+                "resolution_criteria": "Resolve from public evidence.",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+        assert create.status_code == 202
+        forecast_id = UUID(create.json()["forecast_id"])
+        approve = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={"action": "approve_framing"},
+        )
+        assert approve.status_code == 200
+
+        run = research.create_run_record(
+            CreateResearchRunRequest(
+                user_prompt="stale submit prompt",
+                options=ResearchRunOptions(max_total_tool_calls=3),
+            ),
+            forecast_mode=True,
+        )
+        submitted_run = research.repository.update_run_if_status(
+            run.id,
+            {RunStatus.QUEUED},
+            status=RunStatus.SUBMITTED,
+            needs_human_review=False,
+            pending_deep_research_response_id=None,
+            done_reason=None,
+        )
+        assert submitted_run is not None
+        policy_decision_id = forecast.repository.add_policy_decision(
+            forecast_id=forecast_id,
+            profile="public",
+            status="allowed",
+            reason=None,
+            prompt_hash="stale-submit-prompt-hash",
+        )
+        forecast.repository.add_research_pack(
+            forecast_id=forecast_id,
+            research_run_id=run.id,
+            pack_role="current_state",
+            tool_profile="public",
+            status="submitting",
+            model_deployment="test-deployment",
+            prompt_version="stale-submit-test",
+            max_tool_calls=3,
+            policy_decision_id=policy_decision_id,
+        )
+
+        detail = await client.get(f"/forecasts/{forecast_id}")
+        assert detail.status_code == 200
+        detail_json = detail.json()
+        assert detail_json["current_research_pack_status"] == "needs_human_review"
+        pack_detail = detail_json["current_research_pack"]
+        assert pack_detail["pack_status"] == "needs_human_review"
+        assert pack_detail["effective_status"] == "needs_human_review"
+        assert pack_detail["research_run_status"] == "needs_human_review"
+        assert pack_detail["done_reason"] == "deep_research_submit_stalled"
+
+
+@pytest.mark.anyio
+async def test_forecast_detail_recovers_stale_submit_with_recorded_response_id(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will recorded response ids recover stale submits?",
+                "resolution_criteria": "Resolve from public evidence.",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+        assert create.status_code == 202
+        forecast_id = UUID(create.json()["forecast_id"])
+        approve = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={"action": "approve_framing"},
+        )
+        assert approve.status_code == 200
+
+        run = research.create_run_record(
+            CreateResearchRunRequest(
+                user_prompt="stale submit accepted prompt",
+                options=ResearchRunOptions(max_total_tool_calls=3),
+            ),
+            forecast_mode=True,
+        )
+        submitted_run = research.repository.update_run_if_status(
+            run.id,
+            {RunStatus.QUEUED},
+            status=RunStatus.SUBMITTED,
+            needs_human_review=False,
+            pending_deep_research_response_id=None,
+            done_reason=None,
+        )
+        assert submitted_run is not None
+        research.repository.add_attempt(
+            run.id,
+            ResearchAttempt(
+                run_no=1,
+                response_id="resp_recoverable",
+                status="queued",
+                model="test-deployment",
+                prompt="stale submit accepted prompt",
+            ),
+        )
+        policy_decision_id = forecast.repository.add_policy_decision(
+            forecast_id=forecast_id,
+            profile="public",
+            status="allowed",
+            reason=None,
+            prompt_hash="stale-submit-recoverable-prompt-hash",
+        )
+        pack = forecast.repository.add_research_pack(
+            forecast_id=forecast_id,
+            research_run_id=run.id,
+            pack_role="current_state",
+            tool_profile="public",
+            status="submitting",
+            model_deployment="test-deployment",
+            prompt_version="stale-submit-recoverable-test",
+            max_tool_calls=3,
+            policy_decision_id=policy_decision_id,
+        )
+        old_timestamp = "2000-01-01T00:00:00+00:00"
+        with research.repository.connect() as connection:
+            connection.execute(
+                "UPDATE research_runs SET updated_at = ? WHERE id = ?",
+                (old_timestamp, str(run.id)),
+            )
+            connection.execute(
+                "UPDATE forecast_research_packs SET updated_at = ? WHERE pack_id = ?",
+                (old_timestamp, pack["pack_id"]),
+            )
+
+        detail = await client.get(f"/forecasts/{forecast_id}")
+        assert detail.status_code == 200
+        detail_json = detail.json()
+        assert detail_json["current_research_pack_status"] == "running"
+        pack_detail = detail_json["current_research_pack"]
+        assert pack_detail["pack_status"] == "running"
+        assert pack_detail["effective_status"] == "running"
+        assert pack_detail["research_run_status"] == "waiting_deep_research"
+        assert pack_detail["done_reason"] is None
+        recovered_run = research.repository.get_run(run.id)
+        assert recovered_run.pending_deep_research_response_id == "resp_recoverable"
+
+
+@pytest.mark.anyio
+async def test_forecast_detail_does_not_mark_fresh_submit_stale(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will fresh submit packs stay pending?",
+                "resolution_criteria": "Resolve from public evidence.",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+        assert create.status_code == 202
+        forecast_id = UUID(create.json()["forecast_id"])
+        approve = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={"action": "approve_framing"},
+        )
+        assert approve.status_code == 200
+
+        run = research.create_run_record(
+            CreateResearchRunRequest(
+                user_prompt="fresh submit prompt",
+                options=ResearchRunOptions(max_total_tool_calls=3),
+            ),
+            forecast_mode=True,
+        )
+        submitted_run = research.repository.update_run_if_status(
+            run.id,
+            {RunStatus.QUEUED},
+            status=RunStatus.SUBMITTED,
+            needs_human_review=False,
+            pending_deep_research_response_id=None,
+            done_reason=None,
+        )
+        assert submitted_run is not None
+        policy_decision_id = forecast.repository.add_policy_decision(
+            forecast_id=forecast_id,
+            profile="public",
+            status="allowed",
+            reason=None,
+            prompt_hash="fresh-submit-prompt-hash",
+        )
+        forecast.repository.add_research_pack(
+            forecast_id=forecast_id,
+            research_run_id=run.id,
+            pack_role="current_state",
+            tool_profile="public",
+            status="submitting",
+            model_deployment="test-deployment",
+            prompt_version="fresh-submit-test",
+            max_tool_calls=3,
+            policy_decision_id=policy_decision_id,
+        )
+
+        detail = await client.get(f"/forecasts/{forecast_id}")
+        assert detail.status_code == 200
+        detail_json = detail.json()
+        assert detail_json["current_research_pack_status"] == "submitting"
+        pack_detail = detail_json["current_research_pack"]
+        assert pack_detail["pack_status"] == "submitting"
+        assert pack_detail["effective_status"] == "submitting"
+        assert pack_detail["research_run_status"] == "submitted"
+        assert pack_detail["done_reason"] is None
+
+
+@pytest.mark.anyio
 async def test_research_pack_submit_failure_remains_visible_on_forecast(
     tmp_path: Path,
 ) -> None:
@@ -1996,8 +2256,22 @@ async def test_phase_a_forecast_lifecycle_and_forecast_research_mode(
         run_id = pack_json["research_run_id"]
         assert pack_json["policy_decision_id"]
         assert fake.submit_calls[-1]["tool_profile"] == "public"
-        assert fake.submit_calls[-1]["background"] is False
+        assert fake.submit_calls[-1]["background"] is True
         assert fake.submit_calls[-1]["policy_decision_id"] == pack_json["policy_decision_id"]
+        with research.repository.connect() as connection:
+            attempt_rows = connection.execute(
+                """
+                SELECT attempt_no, status, response_id
+                FROM research_attempts
+                WHERE run_id = ?
+                ORDER BY created_at ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        assert len(attempt_rows) == 1
+        assert attempt_rows[0]["attempt_no"] == 1
+        assert attempt_rows[0]["status"] == "queued"
+        assert attempt_rows[0]["response_id"]
         detail_after_pack = await client.get(f"/forecasts/{forecast_id}")
         assert detail_after_pack.status_code == 200
         pack_detail = detail_after_pack.json()["current_research_pack"]
@@ -2372,6 +2646,138 @@ async def test_forecast_idempotency_in_progress_blocks_duplicate_side_effects(
         assert duplicate.status_code == 409
         assert _typed_code(duplicate.json()) == "idempotency_in_progress"
         assert fake.submit_calls == []
+
+
+@pytest.mark.anyio
+async def test_forecast_idempotency_in_progress_does_not_replay_fresh_submitting_pack(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        forecast_id = await _create_approved_forecast(
+            client,
+            question="Will fresh submitting packs keep idempotency in progress?",
+        )
+        payload = {"pack_role": "current_state", "tool_profile": "public"}
+        canonical_payload = {**payload, "max_tool_calls": 40}
+        existing = forecast.repository.reserve_idempotency_record(
+            command_scope="forecast:research_pack",
+            resource_id=forecast_id,
+            idempotency_key="fresh-pack-key",
+            request_hash=_request_hash(canonical_payload),
+        )
+        assert existing is None
+        run = research.create_run_record(
+            CreateResearchRunRequest(
+                user_prompt="fresh submit prompt",
+                options=ResearchRunOptions(max_total_tool_calls=3),
+            ),
+            forecast_mode=True,
+        )
+        submitted_run = research.repository.update_run_if_status(
+            run.id,
+            {RunStatus.QUEUED},
+            status=RunStatus.SUBMITTED,
+            needs_human_review=False,
+            pending_deep_research_response_id=None,
+            done_reason=None,
+        )
+        assert submitted_run is not None
+        policy_decision_id = forecast.repository.add_policy_decision(
+            forecast_id=UUID(forecast_id),
+            profile="public",
+            status="allowed",
+            reason=None,
+            prompt_hash="fresh-idempotency-submit-prompt-hash",
+        )
+        forecast.repository.add_research_pack(
+            forecast_id=UUID(forecast_id),
+            research_run_id=run.id,
+            pack_role="current_state",
+            tool_profile="public",
+            status="submitting",
+            model_deployment="test-deployment",
+            prompt_version="fresh-idempotency-submit-test",
+            max_tool_calls=3,
+            policy_decision_id=policy_decision_id,
+        )
+
+        duplicate = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            headers={"Idempotency-Key": "fresh-pack-key"},
+            json=payload,
+        )
+
+    assert duplicate.status_code == 409
+    assert _typed_code(duplicate.json()) == "idempotency_in_progress"
+    with forecast.repository.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT response_json
+            FROM forecast_idempotency_keys
+            WHERE command_scope = ? AND resource_id = ? AND idempotency_key = ?
+            """,
+            ("forecast:research_pack", forecast_id, "fresh-pack-key"),
+        ).fetchone()
+    assert row is not None
+    assert row["response_json"] == forecast_router.IDEMPOTENCY_IN_PROGRESS
+    assert fake.submit_calls == []
+
+
+@pytest.mark.anyio
+async def test_forecast_idempotency_in_progress_replays_existing_pack(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        forecast_id = await _create_approved_forecast(
+            client,
+            question="Will stale idempotency replay an existing pack?",
+        )
+        payload = {"pack_role": "current_state", "tool_profile": "public"}
+        first = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json=payload,
+        )
+        assert first.status_code == 200
+        first_json = first.json()
+
+        canonical_payload = {**payload, "max_tool_calls": 40}
+        existing = forecast.repository.reserve_idempotency_record(
+            command_scope="forecast:research_pack",
+            resource_id=forecast_id,
+            idempotency_key="stale-pack-key",
+            request_hash=_request_hash(canonical_payload),
+        )
+        assert existing is None
+
+        replay = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            headers={"Idempotency-Key": "stale-pack-key"},
+            json=payload,
+        )
+
+    assert replay.status_code == 200
+    replay_json = replay.json()
+    assert replay_json["pack_id"] == first_json["pack_id"]
+    assert replay_json["research_run_id"] == first_json["research_run_id"]
+    assert len(fake.submit_calls) == 1
 
 
 @pytest.mark.anyio

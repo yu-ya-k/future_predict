@@ -17,6 +17,7 @@ import { Link, routes } from "../../router";
 import { formatElapsed, useElapsed } from "../../hooks/useElapsed";
 import type {
   EstimateSetResponse,
+  ForecastCurrentResearchPack,
   ForecastDetail as ForecastDetailType,
   ManualResearchPackPromptResponse,
   ForecastStatus,
@@ -153,20 +154,50 @@ function packStatusLabel(status: string | null | undefined): string {
   }
 }
 
+function isRemoteResearchRunning(
+  pack: ForecastCurrentResearchPack | null,
+  effectiveStatus: string | null | undefined,
+): boolean {
+  return (
+    effectiveStatus === "running" &&
+    Boolean(pack?.deep_research_started_at) &&
+    (pack?.research_run_status === "waiting_deep_research" ||
+      pack?.research_run_status === "collecting")
+  );
+}
+
+function isWaitingForRemoteSubmit(
+  pack: ForecastCurrentResearchPack | null,
+  effectiveStatus: string | null | undefined,
+): boolean {
+  return (
+    Boolean(pack) &&
+    !pack?.deep_research_started_at &&
+    (effectiveStatus === "submitting" || effectiveStatus === "running") &&
+    (pack?.research_run_status === "queued" ||
+      pack?.research_run_status === "submitted" ||
+      pack?.research_run_status === "waiting_deep_research" ||
+      pack?.research_run_status === "collecting")
+  );
+}
+
 function packFlowMeta({
   currentResearchPackStatus,
   researchPackCompleted,
   researchPackRunning,
   researchPackSubmitting,
+  researchPackSubmitWaiting,
   packSubmissionPending,
 }: {
   currentResearchPackStatus: string | null | undefined;
   researchPackCompleted: boolean;
   researchPackRunning: boolean;
   researchPackSubmitting: boolean;
+  researchPackSubmitWaiting: boolean;
   packSubmissionPending: boolean;
 }): string {
   if (researchPackRunning) return "公開情報を収集中";
+  if (researchPackSubmitWaiting) return "Deep Research送信待ち";
   if (researchPackSubmitting || packSubmissionPending) return "サーバーに登録中";
   if (researchPackCompleted) return "収集完了";
   switch (currentResearchPackStatus) {
@@ -201,6 +232,8 @@ function deriveCurrentStep({
   packSubmissionPending,
   packSubmissionIsSlow,
   researchPackSubmitting,
+  researchPackSubmitWaiting,
+  researchPackSubmitStalled,
   researchPackRunning,
   researchPackCompleted,
   researchPackBlocked,
@@ -221,6 +254,8 @@ function deriveCurrentStep({
   packSubmissionPending: boolean;
   packSubmissionIsSlow: boolean;
   researchPackSubmitting: boolean;
+  researchPackSubmitWaiting: boolean;
+  researchPackSubmitStalled: boolean;
   researchPackRunning: boolean;
   researchPackCompleted: boolean;
   researchPackBlocked: boolean;
@@ -272,6 +307,18 @@ function deriveCurrentStep({
     };
   }
 
+  if (researchPackSubmitWaiting) {
+    return {
+      title: "Deep Researchへの送信を待っています",
+      description:
+        "Research runは作成済みです。Deep Researchへの投入完了を待っており、状態は自動で確認しています。",
+      stateLabel: "Deep Research送信待ち",
+      tone: "running",
+      action: "researchRun",
+      actionLabel: "Research runを開く",
+    };
+  }
+
   if (status === "pack_running" && !currentResearchPackPresent) {
     return {
       title: "公開情報の状態確認が必要です",
@@ -285,6 +332,17 @@ function deriveCurrentStep({
   }
 
   if (researchPackBlocked) {
+    if (researchPackSubmitStalled) {
+      return {
+        title: "Deep Research送信が開始されていません",
+        description:
+          "Research runは作成されましたが、Deep Researchへの投入開始を確認できません。Research run詳細で理由を確認してください。",
+        stateLabel: "要確認",
+        tone: "blocked",
+        action: "researchRun",
+        actionLabel: "Research runを開く",
+      };
+    }
     const title =
       currentResearchPackStatus === "needs_human_review"
         ? "公開情報の収集に確認が必要です"
@@ -441,6 +499,7 @@ function forecastExecutionNodes({
   researchPackRunning,
   researchPackBlocked,
   researchPackSubmitting,
+  researchPackSubmitWaiting,
   currentResearchPackStatus,
   claimTargetsApproved,
   hasEstimate,
@@ -454,6 +513,7 @@ function forecastExecutionNodes({
   researchPackRunning: boolean;
   researchPackBlocked: boolean;
   researchPackSubmitting: boolean;
+  researchPackSubmitWaiting: boolean;
   currentResearchPackStatus: string | null | undefined;
   claimTargetsApproved: boolean;
   hasEstimate: boolean;
@@ -482,15 +542,17 @@ function forecastExecutionNodes({
         researchPackCompleted,
         researchPackRunning,
         researchPackSubmitting,
+        researchPackSubmitWaiting,
         packSubmissionPending,
       }),
       status: flowStatus({
         done: researchPackCompleted || statusAtLeast(status, "evidence_ready"),
         active: researchPackRunning,
-        submitting: researchPackSubmitting || packSubmissionPending,
+        submitting: researchPackSubmitting || researchPackSubmitWaiting || packSubmissionPending,
         blocked: researchPackBlocked,
         available: status === "framing_approved",
       }),
+      statusLabel: researchPackSubmitWaiting ? "Deep Research送信待ち" : undefined,
       tone: "research",
     },
     {
@@ -654,22 +716,36 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     currentResearchPackStatus === "failed" ||
     currentResearchPackStatus === "cancelled" ||
     currentResearchPackStatus === "needs_human_review";
-  const researchPackSubmitting = currentResearchPackStatus === "submitting";
+  const researchPackSubmitWaiting = isWaitingForRemoteSubmit(
+    currentResearchPack,
+    currentResearchPackStatus,
+  );
+  const researchPackSubmitting =
+    currentResearchPackStatus === "submitting" && !researchPackSubmitWaiting;
+  const researchPackSubmitStalled =
+    researchPackBlocked &&
+    currentResearchPack?.done_reason === "deep_research_submit_stalled";
   const researchPackRunning =
-    status === "pack_running" && currentResearchPackStatus === "running";
+    status === "pack_running" &&
+    isRemoteResearchRunning(currentResearchPack, currentResearchPackStatus);
   const packSubmissionPending = busy === "pack" && !currentResearchPack;
   const packSubmissionElapsed = useElapsed(
     packSubmissionPending ? (busyStartedAt ?? undefined) : undefined,
     packSubmissionPending,
   );
   const packSubmissionIsSlow = packSubmissionElapsed >= 0.5;
-  const researchPackStartedAt =
-    currentResearchPack?.deep_research_started_at ??
+  const researchPackStartedAt = currentResearchPack?.deep_research_started_at ?? undefined;
+  const researchPackSubmitStartedAt =
     currentResearchPack?.research_run_created_at ??
     currentResearchPack?.pack_created_at ??
     undefined;
   const researchPackElapsed = useElapsed(researchPackStartedAt, researchPackRunning);
+  const researchPackSubmitElapsed = useElapsed(
+    researchPackSubmitStartedAt,
+    researchPackSubmitWaiting,
+  );
   const researchPackStartedLabel = formatStartedAt(researchPackStartedAt);
+  const researchPackSubmitStartedLabel = formatStartedAt(researchPackSubmitStartedAt);
   const researchRunPath = currentResearchPack?.research_run_id
     ? routes().monitor(currentResearchPack.research_run_id)
     : null;
@@ -679,15 +755,21 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       ? "取り込み記録"
       : "Research run詳細";
 
-  const shouldPollCurrentResearchPack = researchPackRunning || researchPackSubmitting;
+  const shouldPollCurrentResearchPack =
+    researchPackRunning || researchPackSubmitting || researchPackSubmitWaiting;
 
   useEffect(() => {
     if (!shouldPollCurrentResearchPack) return undefined;
     const interval = window.setInterval(() => {
       void load().catch((err) => setError(formatForecastError(err)));
-    }, researchPackSubmitting ? PACK_SUBMISSION_POLL_MS : 3_000);
+    }, researchPackSubmitting || researchPackSubmitWaiting ? PACK_SUBMISSION_POLL_MS : 3_000);
     return () => window.clearInterval(interval);
-  }, [shouldPollCurrentResearchPack, researchPackSubmitting, load]);
+  }, [
+    shouldPollCurrentResearchPack,
+    researchPackSubmitting,
+    researchPackSubmitWaiting,
+    load,
+  ]);
 
   useEffect(() => {
     if (busy !== "pack" || currentResearchPack) return undefined;
@@ -924,6 +1006,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     researchPackRunning,
     researchPackBlocked,
     researchPackSubmitting,
+    researchPackSubmitWaiting,
     currentResearchPackStatus,
     claimTargetsApproved: effectiveClaimTargetsApproved,
     hasEstimate: Boolean(estimate),
@@ -938,6 +1021,8 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     packSubmissionPending,
     packSubmissionIsSlow,
     researchPackSubmitting,
+    researchPackSubmitWaiting,
+    researchPackSubmitStalled,
     researchPackRunning,
     researchPackCompleted,
     researchPackBlocked,
@@ -958,14 +1043,22 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       undefined,
   );
   const forecastDisplayStatus = forecastStatusLabel(status);
+  const currentResearchPackDisplayStatus = researchPackSubmitWaiting
+    ? "Deep Research送信待ち"
+    : packSubmissionPending
+      ? "サーバーに登録中"
+      : packStatusLabel(currentResearchPackStatus);
   const currentStepDetails = [
     { label: "Forecast本体状態", value: forecastDisplayStatus },
     {
       label: "公開情報パック状態",
-      value: packSubmissionPending ? "登録中" : packStatusLabel(currentResearchPackStatus),
+      value: currentResearchPackDisplayStatus,
     },
     currentResearchPack?.research_run_id
       ? { label: "Research run ID", value: currentResearchPack.research_run_id }
+      : null,
+    currentResearchPack?.pack_id
+      ? { label: "Pack ID", value: currentResearchPack.pack_id }
       : null,
     currentResearchPack?.research_run_status
       ? { label: "Research run状態", value: currentResearchPack.research_run_status }
@@ -973,8 +1066,13 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     researchPackStartedLabel
       ? { label: "開始時刻", value: researchPackStartedLabel }
       : null,
+    researchPackSubmitWaiting && researchPackSubmitStartedLabel
+      ? { label: "Run作成時刻", value: researchPackSubmitStartedLabel }
+      : null,
     packSubmissionPending
       ? { label: "経過時間", value: formatElapsed(packSubmissionElapsed) }
+      : researchPackSubmitWaiting
+        ? { label: "経過時間", value: formatElapsed(researchPackSubmitElapsed) }
       : researchPackRunning
         ? { label: "経過時間", value: `${Math.round(researchPackElapsed)}分` }
         : null,
@@ -1056,9 +1154,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
         </div>
         <div className="metric-card">
           <span className="metric-label">公開情報パック</span>
-          <strong>
-            {packSubmissionPending ? "登録中" : packStatusLabel(currentResearchPackStatus)}
-          </strong>
+          <strong>{currentResearchPackDisplayStatus}</strong>
         </div>
         <div className="metric-card">
           <span className="metric-label">確率エンジン</span>

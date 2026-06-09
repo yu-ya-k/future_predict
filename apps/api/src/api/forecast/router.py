@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
-from typing import Annotated
+from typing import Annotated, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
@@ -539,6 +539,21 @@ def _run_idempotent[T](
                 )
             )
         if existing["response_json"] == IDEMPOTENCY_IN_PROGRESS:
+            if scope == "forecast:research_pack":
+                repaired = orchestrator.existing_research_pack_response(
+                    UUID(resource_id),
+                    include_fresh_submitting=False,
+                )
+                if repaired is not None:
+                    encoded = jsonable_encoder(repaired)
+                    orchestrator.repository.complete_idempotency_record(
+                        command_scope=scope,
+                        resource_id=resource_id,
+                        idempotency_key=idempotency_key,
+                        request_hash=request_hash,
+                        response=encoded,
+                    )
+                    return cast(T, encoded)
             raise forecast_http_error(
                 ForecastConflict(
                     "idempotency_in_progress",

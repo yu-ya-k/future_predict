@@ -1280,6 +1280,64 @@ class ResearchRepository:
 
         return [self._row_to_run(row) for row in rows]
 
+    def list_stale_forecast_submit_runs(
+        self,
+        *,
+        stale_seconds: int,
+    ) -> list[ResearchRunRecord]:
+        cutoff = utc_now() - timedelta(seconds=stale_seconds)
+        with self.connect() as connection:
+            table = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'forecast_research_packs'
+                """
+            ).fetchone()
+            if table is None:
+                return []
+            rows = connection.execute(
+                """
+                SELECT r.*
+                FROM research_runs r
+                JOIN forecast_research_packs p
+                  ON p.research_run_id = r.id
+                WHERE p.status = 'submitting'
+                  AND r.run_origin = 'forecast'
+                  AND r.status IN (?, ?)
+                  AND r.pending_deep_research_response_id IS NULL
+                  AND r.updated_at <= ?
+                ORDER BY r.updated_at ASC
+                LIMIT 25
+                """,
+                (
+                    RunStatus.QUEUED.value,
+                    RunStatus.SUBMITTED.value,
+                    cutoff.isoformat(),
+                ),
+            ).fetchall()
+
+        return [self._row_to_run(row) for row in rows]
+
+    def sync_forecast_pack_status_for_run(self, run_id: UUID, *, status: str) -> None:
+        with self.connect() as connection:
+            table = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'forecast_research_packs'
+                """
+            ).fetchone()
+            if table is None:
+                return
+            connection.execute(
+                """
+                UPDATE forecast_research_packs
+                SET status = ?, updated_at = ?
+                WHERE research_run_id = ?
+                  AND status = 'submitting'
+                """,
+                (status, utc_now().isoformat(), str(run_id)),
+            )
+
     def list_stale_reviewing_runs(self, *, timeout_seconds: int) -> list[ResearchRunRecord]:
         cutoff = utc_now() - timedelta(seconds=timeout_seconds)
         now = utc_now()

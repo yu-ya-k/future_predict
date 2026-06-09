@@ -117,9 +117,14 @@ class AzureResponsesClient:
             vector_store_ids=vector_store_ids,
             for_deep_research=True,
         )
-        return self.deep_research_client.responses.create(
+        request_client = _client_with_timeout(
+            self.deep_research_client,
+            timeout=self.settings.research_deep_research_submit_timeout_seconds,
+        )
+        return request_client.responses.create(
             model=self.deep_research_deployment,
             background=background,
+            store=True,
             input=prompt,
             tools=tools,
             max_tool_calls=max_tool_calls,

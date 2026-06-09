@@ -537,6 +537,36 @@ class ResearchOrchestrator:
                 optimized_prompt=optimized_prompt,
             )
 
+        self.repository.add_attempt(
+            run.id,
+            ResearchAttempt(
+                run_no=run_no,
+                response_id=None,
+                status="submitting",
+                model=self.azure.deep_research_deployment,
+                prompt=prompt,
+            ),
+        )
+        self.repository.append_history_event(
+            run.id,
+            {
+                "step": "deep_research_submit_started",
+                "run_no": run_no,
+                "background": background,
+            },
+        )
+        run = (
+            self.repository.update_run_if_status(
+                run.id,
+                {RunStatus.QUEUED, RunStatus.REVIEWING, RunStatus.SUBMITTED},
+                optimized_prompt=optimized_prompt,
+                status=RunStatus.SUBMITTED,
+                needs_human_review=False,
+                done_reason=None,
+            )
+            or self.repository.get_run(run.id)
+        )
+
         response_id: str | None = None
         try:
             response = self.azure.submit_deep_research(
@@ -603,7 +633,14 @@ class ResearchOrchestrator:
             done_reason = (
                 "deep_research_submitted_but_persistence_failed"
                 if response_id
-                else "deep_research_submit_failed"
+                else (
+                    "deep_research_submit_timeout"
+                    if (
+                        isinstance(error, TimeoutError)
+                        or error.__class__.__name__ == "APITimeoutError"
+                    )
+                    else "deep_research_submit_failed"
+                )
             )
             return self._enter_human_review(
                 run.id,
@@ -897,6 +934,69 @@ class ResearchOrchestrator:
                     "original_error": repr(error),
                 },
             )
+
+    def mark_submit_stalled(self, run_id: UUID) -> ResearchRunRecord:
+        run = self.repository.get_run(run_id)
+        if (
+            run.run_origin != "forecast"
+            or run.status not in {RunStatus.QUEUED, RunStatus.SUBMITTED}
+            or run.pending_deep_research_response_id is not None
+        ):
+            return run
+        recovered = self._recover_recorded_submit_response(run)
+        if recovered is not None:
+            return recovered
+        self.repository.append_history_event(
+            run.id,
+            {
+                "step": "deep_research_submit_stalled",
+                "timeout_seconds": self.settings.research_deep_research_submit_stale_seconds,
+            },
+        )
+        return self._enter_human_review(
+            run.id,
+            done_reason="deep_research_submit_stalled",
+            allowed_statuses={RunStatus.QUEUED, RunStatus.SUBMITTED},
+            deep_research_status="submit_stalled",
+        )
+
+    def _recover_recorded_submit_response(
+        self,
+        run: ResearchRunRecord,
+    ) -> ResearchRunRecord | None:
+        attempts = self.repository.get_attempts(run.id)
+        recoverable = [
+            attempt
+            for attempt in attempts
+            if attempt.response_id
+            and attempt.status
+            not in {"failed_to_submit", "submitted_but_persistence_failed"}
+        ]
+        if not recoverable:
+            return None
+        attempt = recoverable[-1]
+        updated = self.repository.update_run_if_status(
+            run.id,
+            {RunStatus.QUEUED, RunStatus.SUBMITTED},
+            status=RunStatus.WAITING_DEEP_RESEARCH,
+            needs_human_review=False,
+            pending_deep_research_response_id=attempt.response_id,
+            deep_research_status=attempt.status or "queued",
+            deep_research_runs=max(run.deep_research_runs, attempt.run_no),
+            done_reason=None,
+        )
+        if updated is None:
+            return self.repository.get_run(run.id)
+        self.repository.append_history_event(
+            run.id,
+            {
+                "step": "deep_research_submit_recovered",
+                "run_no": attempt.run_no,
+                "response_id": attempt.response_id,
+                "status": attempt.status,
+            },
+        )
+        return updated
 
     def collect_deep_research(self, run_id: UUID) -> ResearchRunRecord:
         run = self.repository.get_run(run_id)

@@ -1651,7 +1651,8 @@ describe("RunMonitor (SCR-3)", () => {
     expect(await screen.findByRole("link", { name: "Forecastへ戻る" })).toBeInTheDocument();
     expect(screen.getByText("トータル経過時間")).toBeInTheDocument();
     expect(screen.getByText("75:00")).toBeInTheDocument();
-    expect(screen.getByText(/今回の経過時間: 75分/)).toBeInTheDocument();
+    expect(screen.getByText(/Deep Researchへの送信を待っています/)).toBeInTheDocument();
+    expect(screen.queryByText(/今回の経過時間/)).not.toBeInTheDocument();
   });
 
   it("unwraps ResearchItem API wrapper responses in the monitor", async () => {
@@ -3454,7 +3455,9 @@ describe("RunMonitor (SCR-3)", () => {
       expect(screen.getByRole("button", { name: "Deep Research 2回目を選択" }))
         .toHaveAttribute("aria-pressed", "true"),
     );
-    expect(within(activeResearchNode).getByText("実行中")).toBeInTheDocument();
+    expect(
+      within(activeResearchNode).getAllByText("Deep Research送信待ち").length,
+    ).toBeGreaterThan(1);
     expect(screen.getByRole("link", { name: "結果を開く" }))
       .toHaveAttribute("href", `#/runs/${runId}/report?tab=research&attempt=2`);
   });
