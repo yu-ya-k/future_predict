@@ -115,7 +115,7 @@ class IntegrationFakeAzure:
         tool_profile: str = "public",
         background: bool = True,
         policy_decision_id: str | None = None,
-        **_: object,
+        **kwargs: object,
     ) -> dict[str, object]:
         if self.submit_raises is not None:
             raise self.submit_raises
@@ -127,6 +127,7 @@ class IntegrationFakeAzure:
                 "tool_profile": tool_profile,
                 "background": background,
                 "policy_decision_id": policy_decision_id,
+                "vector_store_ids": kwargs.get("vector_store_ids"),
             }
         )
         return {

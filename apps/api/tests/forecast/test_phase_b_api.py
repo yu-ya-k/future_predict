@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 from pathlib import Path
@@ -108,6 +109,273 @@ async def test_default_phase_b_pack_dispatch_creates_five_active_packs(
     assert listed.status_code == 200
     assert len(listed.json()) == 5
     assert len(fake.submit_calls) == 5
+
+
+@pytest.mark.anyio
+async def test_default_phase_b_pack_dispatch_replays_idempotently(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        forecast_id = await _create_approved_forecast(client)
+        first = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/defaults",
+            headers={"Idempotency-Key": "phase-b-defaults-1"},
+        )
+        replay = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/defaults",
+            headers={"Idempotency-Key": "phase-b-defaults-1"},
+        )
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    first_ids = [pack["pack_id"] for pack in first.json()["packs"]]
+    replay_ids = [pack["pack_id"] for pack in replay.json()["packs"]]
+    assert replay_ids == first_ids
+    assert len(fake.submit_calls) == 5
+    with forecast.repository.connect() as connection:
+        assert (
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM forecast_research_packs
+                WHERE forecast_id = ? AND is_active = 1
+                """,
+                (forecast_id,),
+            ).fetchone()[0]
+            == 5
+        )
+        assert (
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM research_runs
+                WHERE run_origin = 'forecast'
+                """,
+            ).fetchone()[0]
+            == 5
+        )
+
+
+@pytest.mark.anyio
+async def test_private_pack_success_records_tools_without_pack_request(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    forecast.repository.upsert_trusted_source(
+        identifier="trusted-private",
+        status="approved",
+        allowed_profiles=["private"],
+        allowed_pack_roles=["current_state"],
+        allowed_tool_names=["file_search"],
+    )
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        forecast_id = await _create_approved_forecast(client)
+        response = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={
+                "pack_role": "current_state",
+                "tool_profile": "private",
+                "data_classification": "internal",
+                "background": False,
+                "vector_store_ids": ["vs_1"],
+                "trusted_source_identifiers": ["trusted-private"],
+            },
+        )
+
+    assert response.status_code == 200
+    pack = response.json()
+    assert pack["tool_profile"] == "private"
+    assert pack["data_classification"] == "internal"
+    assert research.repository.get_run(UUID(pack["research_run_id"])).run_origin == (
+        "forecast"
+    )
+    assert fake.submit_calls == [
+        {
+            "prompt": fake.submit_calls[0]["prompt"],
+            "max_tool_calls": 40,
+            "tool_profile": "private",
+            "background": False,
+            "policy_decision_id": pack["policy_decision_id"],
+            "vector_store_ids": ["vs_1"],
+        }
+    ]
+    with forecast.repository.connect() as connection:
+        policy = connection.execute(
+            """
+            SELECT * FROM forecast_policy_decisions
+            WHERE policy_decision_id = ?
+            """,
+            (pack["policy_decision_id"],),
+        ).fetchone()
+        assert policy is not None
+        assert policy["data_classification"] == "internal"
+        assert json.loads(policy["resolved_tools_json"]) == [
+            {"type": "file_search", "vector_store_ids": ["vs_1"]}
+        ]
+        assert json.loads(policy["vector_store_ids_json"]) == ["vs_1"]
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM forecast_pack_requests WHERE forecast_id = ?",
+                (forecast_id,),
+            ).fetchone()[0]
+            == 0
+        )
+
+
+@pytest.mark.anyio
+async def test_phase_b_lifecycle_e2e_with_default_packs(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        forecast_id = await _create_approved_forecast(client)
+        defaults = await client.post(f"/forecasts/{forecast_id}/research-packs/defaults")
+        assert defaults.status_code == 200
+        default_packs = defaults.json()["packs"]
+
+        for pack in default_packs:
+            completed = research.collect_deep_research(UUID(pack["research_run_id"]))
+            assert completed.status == RunStatus.COMPLETED
+            assert completed.run_origin == "forecast"
+
+        evidence = await client.post(f"/forecasts/{forecast_id}/evidence/extract")
+        assert evidence.status_code == 200
+        evidence_json = evidence.json()
+        assert len(evidence_json["sources"]) == 5
+        assert len(evidence_json["claims"]) >= 5
+
+        scenarios = await client.post(f"/forecasts/{forecast_id}/scenarios/generate")
+        assert scenarios.status_code == 200
+        assert scenarios.json()["scenarios"]
+
+        link_approval = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={"action": "approve_claim_target_links"},
+        )
+        assert link_approval.status_code == 200
+
+        estimate = await client.post(
+            f"/forecasts/{forecast_id}/probabilities/compute",
+            json={"engine_version": "phase_b_v1"},
+        )
+        assert estimate.status_code == 200
+        estimate_json = cast(dict[str, Any], estimate.json())
+        assert estimate_json["engine_version"] == "phase_b_v1"
+        assert estimate_json["estimates"]
+
+        publication_approval = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={
+                "action": "approve_probability_publication",
+                "estimate_set_id": estimate_json["estimate_set_id"],
+                "reviewer": "analyst-1",
+                "review_reason": "Phase B draft is ready.",
+            },
+        )
+        assert publication_approval.status_code == 200
+        assert publication_approval.json()["estimate_set_id"] == (
+            estimate_json["estimate_set_id"]
+        )
+
+        commit = await client.post(
+            f"/forecasts/{forecast_id}/versions/commit",
+            json={
+                "estimate_set_id": estimate_json["estimate_set_id"],
+                "expected_input_snapshot_hash": estimate_json["input_snapshot_hash"],
+            },
+        )
+        assert commit.status_code == 200
+        commit_json = commit.json()
+        snapshot_path = Path(commit_json["snapshot_artifact_path"])
+        assert snapshot_path.exists()
+        snapshot = json.loads(snapshot_path.read_text())
+        assert snapshot["engine_version"] == "phase_b_v1"
+        assert len(snapshot["packs"]) == 5
+
+        detail = await client.get(f"/forecasts/{forecast_id}")
+        assert detail.status_code == 200
+        outcome_id = detail.json()["outcomes"][0]["outcome_id"]
+        resolve = await client.post(
+            f"/forecasts/{forecast_id}/resolve",
+            json={"outcome_id": outcome_id, "resolution_notes": "resolved"},
+        )
+        assert resolve.status_code == 200
+        assert resolve.json()["scorer_version"] == "phase_b_scorer_v1"
+
+        audit = await client.get(f"/forecasts/{forecast_id}/audit")
+        assert audit.status_code == 200
+
+    forecast_uuid = UUID(forecast_id)
+    with forecast.repository.connect() as connection:
+        assert (
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM forecast_research_packs
+                WHERE forecast_id = ? AND is_active = 1
+                """,
+                (forecast_id,),
+            ).fetchone()[0]
+            == 5
+        )
+        assert (
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM research_runs
+                WHERE run_origin = 'forecast'
+                """,
+            ).fetchone()[0]
+            == 5
+        )
+        assert (
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM forecast_policy_decisions
+                WHERE forecast_id = ?
+                """,
+                (forecast_id,),
+            ).fetchone()[0]
+            == 5
+        )
+    assert len(forecast.repository.get_sources(forecast_uuid)) == 5
+    assert len(forecast.repository.get_claims(forecast_uuid)) >= 5
+    assert len(forecast.repository.get_analog_events(forecast_uuid)) >= 2
+    assert forecast.repository.get_drivers(forecast_uuid)
+    assert forecast.repository.get_scenarios(forecast_uuid)
+    audit_json = audit.json()
+    assert len(audit_json["policy_decisions"]) == 5
+    event_types = {event["event_type"] for event in audit_json["events"]}
+    assert {
+        "research_pack_dispatched",
+        "evidence_extracted",
+        "scenarios_upserted",
+        "probabilities_computed",
+        "review_recorded",
+        "version_committed",
+        "forecast_resolved",
+    }.issubset(event_types)
 
 
 @pytest.mark.anyio
