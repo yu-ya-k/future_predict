@@ -95,6 +95,9 @@ class ForecastOrchestrator:
         if not self.settings.forecast_enabled:
             raise ForecastConflict("forecast_disabled", "Forecast API is disabled.")
 
+    def ensure_enabled(self) -> None:
+        self._ensure_enabled()
+
     @staticmethod
     def _ensure_not_resolved(forecast: ForecastDetail) -> None:
         if forecast.resolved_at is not None or forecast.status == ForecastStatus.RESOLVED:
@@ -209,12 +212,14 @@ class ForecastOrchestrator:
         )
 
     def list_forecasts(self) -> list[ForecastSummary]:
+        self._ensure_enabled()
         return [
             ForecastSummary(**ForecastRepository.forecast_row_to_dict(row))
             for row in self.repository.list_forecasts()
         ]
 
     def get_forecast(self, forecast_id: UUID) -> ForecastDetail:
+        self._ensure_enabled()
         row = self.repository.get_forecast(forecast_id)
         base = ForecastRepository.forecast_row_to_dict(row)
         outcomes = [
@@ -243,7 +248,10 @@ class ForecastOrchestrator:
                 self._current_research_pack_summary(pack) for pack in reconciled_packs
             ],
             approved_claim_target_link_count=len(
-                self.repository.get_approved_target_links(forecast_id)
+                self.repository.get_approved_target_links(
+                    forecast_id,
+                    active_claims_only=True,
+                )
             ),
         )
 
@@ -577,6 +585,7 @@ class ForecastOrchestrator:
         )
 
     def list_research_packs(self, forecast_id: UUID) -> list[ResearchPackResponse]:
+        self._ensure_enabled()
         self.repository.get_forecast(forecast_id)
         return [
             _pack_response(self._reconcile_research_pack(pack))
@@ -644,6 +653,30 @@ class ForecastOrchestrator:
                 },
             )
 
+    def _ensure_private_vector_store_ids_allowed(
+        self,
+        forecast: ForecastDetail,
+        request: ResearchPackRequest,
+    ) -> None:
+        if request.tool_profile != ToolProfile.PRIVATE:
+            return
+        allowed_ids = set(self.settings.research_private_vector_store_allowlist)
+        requested_ids = set(request.vector_store_ids)
+        if not allowed_ids or not requested_ids.issubset(allowed_ids):
+            self._record_blocked_pack_request(
+                forecast,
+                request,
+                reason="private_vector_store_not_allowlisted",
+            )
+            raise ForecastConflict(
+                "private_vector_store_not_allowlisted",
+                "Private Forecast pack vector_store_ids must be allowlisted.",
+                {
+                    "requested_vector_store_ids": sorted(requested_ids),
+                    "allowed_vector_store_ids": sorted(allowed_ids),
+                },
+            )
+
     def _dispatch_research_pack_after_gates(
         self,
         forecast: ForecastDetail,
@@ -678,6 +711,7 @@ class ForecastOrchestrator:
                 "private_vector_store_required",
                 "Private Forecast packs require allowlisted vector_store_ids.",
             )
+        self._ensure_private_vector_store_ids_allowed(forecast, request)
         self._check_pack_timeout_and_cost(forecast, request)
         try:
             ensure_trusted_sources_allowed(
@@ -690,6 +724,8 @@ class ForecastOrchestrator:
                     for tool in resolved_tools.tools
                     if tool.get("type")
                 ],
+                vector_store_ids=resolved_tools.vector_store_ids,
+                mcp_server_ids=resolved_tools.mcp_server_ids,
             )
         except ForecastConflict as error:
             self._record_blocked_pack_request(
@@ -1615,11 +1651,14 @@ class ForecastOrchestrator:
         forecast = self.get_forecast(forecast_id)
         self._ensure_mutable(forecast)
         _ensure_forecast_has_outcomes(forecast)
-        if not self.repository.get_claims(forecast.forecast_id):
+        if not self.repository.get_active_claims(forecast.forecast_id):
             raise ForecastConflict("evidence_not_ready", "Extract evidence first.")
         if not self.repository.get_scenarios(forecast.forecast_id):
             raise ForecastConflict("scenarios_not_ready", "Generate scenarios first.")
-        approved_links = self.repository.get_approved_target_links(forecast.forecast_id)
+        approved_links = self.repository.get_approved_target_links(
+            forecast.forecast_id,
+            active_claims_only=True,
+        )
         if not approved_links:
             raise ForecastConflict(
                 "claim_targets_not_approved",
@@ -1628,11 +1667,13 @@ class ForecastOrchestrator:
         engine = probability.get_engine(request.engine_version if request else None)
         snapshot = self._canonical_snapshot(forecast, engine_version=engine.engine_version)
         input_hash = engine.snapshot_hash(snapshot)
+        engine_code_hash = engine.engine_code_hash()
         existing = self.repository.get_draft_estimate_set(forecast.forecast_id)
         if existing is not None:
             if (
                 existing["input_snapshot_hash"] == input_hash
                 and existing["engine_version"] == engine.engine_version
+                and existing["engine_code_hash"] == engine_code_hash
             ):
                 return self.estimate_set_response(UUID(existing["estimate_set_id"]))
             raise ForecastConflict(
@@ -1644,19 +1685,47 @@ class ForecastOrchestrator:
                     "new_input_snapshot_hash": input_hash,
                     "existing_engine_version": existing["engine_version"],
                     "new_engine_version": engine.engine_version,
+                    "existing_engine_code_hash": existing["engine_code_hash"],
+                    "new_engine_code_hash": engine_code_hash,
                 },
             )
         estimates = engine.compute(snapshot=snapshot)
-        estimate_set = self.repository.create_draft_estimate_set(
-            forecast_id=forecast.forecast_id,
-            engine_version=engine.engine_version,
-            input_snapshot_hash=input_hash,
-            engine_code_hash=engine.engine_code_hash(),
-            random_seed=engine.random_seed,
-            normalization_group_id=forecast.outcomes[0].normalization_group_id,
-            snapshot=snapshot,
-            estimates=estimates,
-        )
+        try:
+            estimate_set = self.repository.create_draft_estimate_set(
+                forecast_id=forecast.forecast_id,
+                engine_version=engine.engine_version,
+                input_snapshot_hash=input_hash,
+                engine_code_hash=engine_code_hash,
+                random_seed=engine.random_seed,
+                normalization_group_id=forecast.outcomes[0].normalization_group_id,
+                snapshot=snapshot,
+                estimates=estimates,
+            )
+        except ValueError as error:
+            if str(error) == "draft_estimate_set_exists":
+                existing = self.repository.get_draft_estimate_set(forecast.forecast_id)
+                raise ForecastConflict(
+                    "draft_estimate_set_exists",
+                    "A draft estimate set already exists for different inputs.",
+                    {
+                        "estimate_set_id": (
+                            existing["estimate_set_id"] if existing is not None else None
+                        ),
+                        "existing_input_snapshot_hash": (
+                            existing["input_snapshot_hash"] if existing is not None else None
+                        ),
+                        "new_input_snapshot_hash": input_hash,
+                        "existing_engine_version": (
+                            existing["engine_version"] if existing is not None else None
+                        ),
+                        "new_engine_version": engine.engine_version,
+                        "existing_engine_code_hash": (
+                            existing["engine_code_hash"] if existing is not None else None
+                        ),
+                        "new_engine_code_hash": engine_code_hash,
+                    },
+                ) from error
+            raise
         return self.estimate_set_response(UUID(estimate_set["estimate_set_id"]))
 
     def estimate_set_response(self, estimate_set_id: UUID) -> dict[str, Any]:
@@ -1695,6 +1764,7 @@ class ForecastOrchestrator:
         }
 
     def current_estimate_set_response(self, forecast_id: UUID) -> dict[str, Any]:
+        self._ensure_enabled()
         self.repository.get_forecast(forecast_id)
         estimate_set = self.repository.get_current_estimate_set(forecast_id)
         if estimate_set is None:
@@ -1743,9 +1813,15 @@ class ForecastOrchestrator:
                 "classification_mismatch",
                 "Public Forecast versions cannot include internal or restricted evidence.",
             )
+        artifact_profile = (
+            "private"
+            if forecast.confidentiality_class != "public"
+            or _snapshot_has_non_public_evidence(snapshot)
+            else "public"
+        )
         path, digest, _bytes = self.artifacts.save_bytes(
             forecast_id,
-            "public",
+            artifact_profile,
             f"versions/{estimate_set_id}.snapshot.json",
             probability.canonical_json_bytes(
                 snapshot,
@@ -1823,7 +1899,14 @@ class ForecastOrchestrator:
                 "approval_required",
                 "Committed snapshot artifact hash does not match the version record.",
             )
-        estimates = engine.compute(snapshot=snapshot)
+        if estimate_set["engine_code_hash"] != snapshot.get("engine_code_hash"):
+            raise ForecastConflict(
+                "approval_required",
+                "Committed snapshot engine hash does not match the estimate set.",
+            )
+        estimates = self.repository.get_estimate_dicts(
+            UUID(estimate_set["estimate_set_id"])
+        )
         brier, log, scorer_version = probability.score(
             estimates=estimates,
             actual_outcome_id=str(outcome_id),
@@ -1856,6 +1939,7 @@ class ForecastOrchestrator:
         )
 
     def get_audit(self, forecast_id: UUID) -> ForecastAuditResponse:
+        self._ensure_enabled()
         self.repository.get_forecast(forecast_id)
         audit = self.repository.get_audit(forecast_id)
         return ForecastAuditResponse(
@@ -1945,9 +2029,10 @@ class ForecastOrchestrator:
                 "extraction_batch_id": row["extraction_batch_id"],
                 "report_artifact_hash": row["report_artifact_hash"],
             }
-            for row in self.repository.get_claims(forecast.forecast_id)
+            for row in self.repository.get_active_claims(forecast.forecast_id)
         ]
         claims = sorted(claims, key=lambda item: item["claim_id"])
+        active_claim_ids = {str(claim["claim_id"]) for claim in claims}
         sources = [
             {
                 "source_id": row["source_id"],
@@ -1960,9 +2045,16 @@ class ForecastOrchestrator:
                 "origin_tool_profile": row["origin_tool_profile"],
                 "reliability_score": row["reliability_score"],
             }
-            for row in self.repository.get_sources(forecast.forecast_id)
+            for row in self.repository.get_active_sources(forecast.forecast_id)
         ]
         sources = sorted(sources, key=lambda item: item["source_id"])
+        active_source_ids = {str(source["source_id"]) for source in sources}
+        for claim in claims:
+            claim["source_ids"] = [
+                source_id
+                for source_id in claim["source_ids"]
+                if source_id in active_source_ids
+            ]
         links = [
             {
                 "claim_id": row["claim_id"],
@@ -1972,8 +2064,11 @@ class ForecastOrchestrator:
                 "relevance_weight": row["relevance_weight"],
                 "review_status": row["review_status"],
             }
-            for row in self.repository.get_approved_target_links(forecast.forecast_id)
-            if row["target_kind"] == "outcome"
+            for row in self.repository.get_approved_target_links(
+                forecast.forecast_id,
+                active_claims_only=True,
+            )
+            if row["target_kind"] == "outcome" and row["claim_id"] in active_claim_ids
         ]
         links = sorted(
             links,

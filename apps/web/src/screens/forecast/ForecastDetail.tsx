@@ -900,8 +900,11 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     failed: boolean;
   } | null>(null);
   const manualPromptRequestId = useRef(0);
+  const loadRequestId = useRef(0);
+  const currentForecastIdRef = useRef(forecastId);
   const manualReportFileInputRef = useRef<HTMLInputElement | null>(null);
   const manualPromptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  currentForecastIdRef.current = forecastId;
   const idempotencyKeys = useRef<Record<Command, string>>({
     pack: stableKey(forecastId, "pack"),
     manualPack: stableKey(forecastId, "manualPack"),
@@ -916,6 +919,16 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
 
   useEffect(() => {
     manualPromptRequestId.current += 1;
+    setForecast(null);
+    setEstimate(null);
+    setClaimTargetsApproved(false);
+    setPhaseAApprovedEstimateId(null);
+    setResolution(null);
+    setSelectedOutcomeId("");
+    setResolutionNotes("");
+    setBusy(null);
+    setBusyStartedAt(null);
+    setError(null);
     setCollectionMode("auto");
     setManualRecoveryOpen(false);
     setManualPrompt(null);
@@ -940,14 +953,30 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   }, [forecastId]);
 
   const load = useCallback(async () => {
-    const nextForecast = await getForecast(forecastId);
-    setForecast(nextForecast);
-    if (hasEstimateSet(nextForecast.status)) {
-      setEstimate(await getForecastEstimateSet(forecastId));
-    } else {
-      setEstimate(null);
+    const requestId = loadRequestId.current + 1;
+    loadRequestId.current = requestId;
+    const requestForecastId = forecastId;
+    const isCurrentRequest = () =>
+      loadRequestId.current === requestId &&
+      currentForecastIdRef.current === requestForecastId;
+
+    try {
+      const nextForecast = await getForecast(requestForecastId);
+      if (!isCurrentRequest()) return;
+
+      setForecast(nextForecast);
+      if (hasEstimateSet(nextForecast.status)) {
+        const nextEstimate = await getForecastEstimateSet(requestForecastId);
+        if (!isCurrentRequest()) return;
+        setEstimate(nextEstimate);
+      } else {
+        setEstimate(null);
+      }
+
+      setError(null);
+    } catch (err) {
+      if (isCurrentRequest()) throw err;
     }
-    setError(null);
   }, [forecastId]);
 
   useEffect(() => {
@@ -1036,8 +1065,14 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   }, [researchPackCompleted]);
 
   useEffect(() => {
-    if (!selectedOutcomeId && forecast?.outcomes[0]) {
-      setSelectedOutcomeId(forecast.outcomes[0].outcome_id);
+    if (!forecast) return;
+    const outcomeIds = forecast.outcomes.map((outcome) => outcome.outcome_id);
+    if (outcomeIds.length === 0) {
+      if (selectedOutcomeId) setSelectedOutcomeId("");
+      return;
+    }
+    if (!selectedOutcomeId || !outcomeIds.includes(selectedOutcomeId)) {
+      setSelectedOutcomeId(outcomeIds[0]);
     }
   }, [forecast, selectedOutcomeId]);
 

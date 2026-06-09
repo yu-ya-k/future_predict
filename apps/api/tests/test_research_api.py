@@ -18,9 +18,11 @@ from api.research.schemas import (
     CreateResearchRunRequest,
     FailureMode,
     HumanReviewAction,
+    HumanReviewResumeRequest,
     ItemAssessment,
     ItemStatus,
     RecommendedAction,
+    RerunExecutionMode,
     ResearchRunOptions,
     ReviewResult,
     RunStatus,
@@ -1173,6 +1175,84 @@ def test_manual_import_artifact_failure_does_not_persist_idempotency(
     assert run.status == RunStatus.NEEDS_HUMAN_REVIEW
 
 
+def test_manual_chatgpt_rerun_artifact_failure_keeps_request_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = V2FakeAzure(verdicts=[Verdict.NEEDS_TARGETED_RERUN, Verdict.PASS])
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    run, dispatch_review = orchestrator.create_manual_import_run(
+        input_prompt="公開情報だけで調べてください。",
+        report="Base report section.",
+        options=ResearchRunOptions(),
+        allow_remote_review=True,
+        allow_api_reruns=True,
+        rerun_execution_mode=RerunExecutionMode.MANUAL_CHATGPT,
+        idempotency_key=None,
+        metadata={"input_prompt": {"source": "text"}, "report": {"source": "text"}},
+    )
+    assert dispatch_review is True
+    pending_run = orchestrator.review_run(run.id)
+    assert pending_run.status == RunStatus.NEEDS_HUMAN_REVIEW
+    pending = orchestrator.repository.get_active_manual_rerun_request(run.id)
+    assert pending is not None
+
+    original_save_text = orchestrator.artifacts.save_text
+
+    def fail_merged_report(
+        run_id: UUID,
+        relative_path: str,
+        text: str,
+    ) -> tuple[str, str]:
+        if relative_path.startswith("reports/report_attempt_002_"):
+            raise OSError("disk full")
+        return original_save_text(run_id, relative_path, text)
+
+    monkeypatch.setattr(orchestrator.artifacts, "save_text", fail_merged_report)
+    with pytest.raises(OSError, match="disk full"):
+        orchestrator.accept_manual_rerun_result(
+            run.id,
+            rerun_id=pending.rerun_id,
+            report_text="Delta with [Source](https://example.com/new).",
+        )
+
+    row = orchestrator.repository.get_manual_rerun_request_row(run.id, pending.rerun_id)
+    assert row is not None
+    assert row["status"] == "pending"
+    assert row["result_sha256"] is None
+    assert [attempt.source for attempt in orchestrator.repository.get_attempts(run.id)] == [
+        "manual_upload",
+    ]
+    checkpoints_after_failure = orchestrator.repository.list_checkpoints(run.id)
+    assert [
+        checkpoint.kind
+        for checkpoint in checkpoints_after_failure
+        if checkpoint.kind == "deep_research_collected"
+    ] == ["deep_research_collected"]
+    assert all(
+        checkpoint.source_attempt_no != 2 for checkpoint in checkpoints_after_failure
+    )
+
+    monkeypatch.setattr(orchestrator.artifacts, "save_text", original_save_text)
+    completed = orchestrator.accept_manual_rerun_result(
+        run.id,
+        rerun_id=pending.rerun_id,
+        report_text="Delta with [Source](https://example.com/new).",
+    )
+
+    assert completed.status == RunStatus.COMPLETED
+    assert [attempt.source for attempt in orchestrator.repository.get_attempts(run.id)] == [
+        "manual_upload",
+        "manual_chatgpt_rerun",
+    ]
+    accepted_row = orchestrator.repository.get_manual_rerun_request_row(
+        run.id,
+        pending.rerun_id,
+    )
+    assert accepted_row is not None
+    assert accepted_row["status"] == "accepted"
+
+
 @pytest.mark.anyio
 async def test_manual_import_metadata_omits_prompt_and_report_bodies(
     tmp_path: Path,
@@ -1405,6 +1485,101 @@ async def test_submit_persistence_failure_cancels_remote_response(
     history_steps = [event["step"] for event in audit_json["history"]]
     assert "deep_research_submit_persistence_remote_cancel_succeeded" in history_steps
     assert "deep_research_submit_persistence_failed" in history_steps
+
+
+def test_deep_research_collect_report_artifact_failure_does_not_persist_audit_children(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator = make_v2_orchestrator(tmp_path, V2FakeAzure())
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="市場調査をしてください")
+    )
+    original_save_text = orchestrator.artifacts.save_text
+
+    def fail_report_artifact(
+        run_id: UUID,
+        relative_path: str,
+        text: str,
+    ) -> tuple[str, str]:
+        if relative_path == "reports/report_attempt_001.md":
+            raise OSError("disk full")
+        return original_save_text(run_id, relative_path, text)
+
+    monkeypatch.setattr(orchestrator.artifacts, "save_text", fail_report_artifact)
+    with pytest.raises(OSError, match="disk full"):
+        orchestrator.collect_deep_research(run.id)
+
+    failed_run = orchestrator.repository.get_run(run.id)
+    assert failed_run.status == RunStatus.COLLECTING
+    assert failed_run.total_tool_calls == 0
+    assert failed_run.estimated_cost_usd == 0
+    attempts_after_failure = orchestrator.repository.get_attempts(run.id)
+    assert [attempt.status for attempt in attempts_after_failure] == ["queued"]
+    assert attempts_after_failure[0].response_id == "resp_deep_1"
+    assert orchestrator.get_cost_events(run.id) == []
+    assert orchestrator.repository.get_citations(run.id) == []
+    assert orchestrator.repository.get_tool_calls(run.id) == []
+    assert "deep_research_collected" not in [
+        checkpoint.kind for checkpoint in orchestrator.repository.list_checkpoints(run.id)
+    ]
+
+    monkeypatch.setattr(orchestrator.artifacts, "save_text", original_save_text)
+    completed = orchestrator.collect_deep_research(run.id)
+
+    assert completed.status == RunStatus.COMPLETED
+    assert completed.total_tool_calls == 1
+    assert [attempt.response_id for attempt in orchestrator.repository.get_attempts(run.id)] == [
+        "resp_deep_1",
+    ]
+    assert [
+        event.response_id
+        for event in orchestrator.get_cost_events(run.id)
+        if event.step == "deep_research"
+    ] == ["resp_deep_1"]
+    assert [
+        call.response_id
+        for call in orchestrator.repository.get_tool_calls(run.id)
+        if call.step == "deep_research"
+    ] == ["resp_deep_1"]
+
+
+def test_human_review_verification_resume_holds_review_operation_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = V2FakeAzure(
+        verdict=Verdict.NEEDS_VERIFICATION,
+        reviewer_confidence=60,
+    )
+    orchestrator = make_v2_orchestrator(tmp_path, fake)
+    run = orchestrator.create_run(
+        CreateResearchRunRequest(user_prompt="市場調査をしてください")
+    )
+    needs_human = orchestrator.collect_deep_research(run.id)
+    assert needs_human.status == RunStatus.NEEDS_HUMAN_REVIEW
+
+    observed_claims: list[tuple[str | None, str | None]] = []
+    original_verify_report = fake.verify_report
+
+    def verify_report_with_claim_probe(**kwargs: Any) -> tuple[str, str, dict[str, object]]:
+        current = orchestrator.repository.get_run(run.id)
+        observed_claims.append(
+            (current.review_claim_operation, current.review_claim_token)
+        )
+        return original_verify_report(**kwargs)
+
+    monkeypatch.setattr(fake, "verify_report", verify_report_with_claim_probe)
+    resumed = orchestrator.resume_run(
+        run.id,
+        HumanReviewResumeRequest(action=HumanReviewAction.REQUEST_VERIFICATION),
+    )
+
+    assert observed_claims
+    assert observed_claims[0][0] == "verify_items"
+    assert observed_claims[0][1]
+    assert resumed.review_claim_token is None
+    assert orchestrator.repository.get_run(run.id).review_claim_token is None
 
 
 @pytest.mark.anyio

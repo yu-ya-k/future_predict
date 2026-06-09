@@ -20,8 +20,9 @@ import { navigate, routes } from "../router";
 import { trackRun } from "../runStore";
 import { OPTION_BOUNDS, type RerunExecutionMode } from "../types";
 
-const MAX_PROMPT_CHARS = 50_000;
-const MAX_REPORT_CHARS = 50_000;
+const MAX_API_PROMPT_CHARS = 120_000;
+const MAX_MANUAL_PROMPT_CHARS = 50_000;
+const MAX_MANUAL_REPORT_CHARS = 50_000;
 const MAX_MANUAL_FILE_BYTES = 1_048_576;
 
 type ResearchMode = "api" | "manual";
@@ -107,26 +108,26 @@ export function NewResearch() {
   }, []);
 
   const apiPromptTrimmed = apiPrompt.trim();
-  const apiOverLimit = apiPrompt.length > MAX_PROMPT_CHARS;
+  const apiOverLimit = apiPrompt.length > MAX_API_PROMPT_CHARS;
   const manualPromptError = activeManualError(
     manualPromptSource,
     manualPromptText,
     manualPromptFile,
-    MAX_PROMPT_CHARS,
+    MAX_MANUAL_PROMPT_CHARS,
   );
   const manualReportError = activeManualError(
     manualReportSource,
     manualReportText,
     manualReportFile,
-    MAX_REPORT_CHARS,
+    MAX_MANUAL_REPORT_CHARS,
   );
   const manualPromptBlockingError =
     manualPromptSource === "text"
-      ? manualPromptText.length > MAX_PROMPT_CHARS
+      ? manualPromptText.length > MAX_MANUAL_PROMPT_CHARS
       : fileError(manualPromptFile);
   const manualReportBlockingError =
     manualReportSource === "text"
-      ? manualReportText.length > MAX_REPORT_CHARS
+      ? manualReportText.length > MAX_MANUAL_REPORT_CHARS
       : fileError(manualReportFile);
   const manualPromptVisibleError = manualPromptValidationVisible ? manualPromptError : null;
   const manualReportVisibleError = manualReportValidationVisible ? manualReportError : null;
@@ -235,9 +236,9 @@ export function NewResearch() {
     }
   }
 
-  const apiRemaining = MAX_PROMPT_CHARS - apiPrompt.length;
-  const manualPromptRemaining = MAX_PROMPT_CHARS - manualPromptText.length;
-  const manualReportRemaining = MAX_REPORT_CHARS - manualReportText.length;
+  const apiRemaining = MAX_API_PROMPT_CHARS - apiPrompt.length;
+  const manualPromptRemaining = MAX_MANUAL_PROMPT_CHARS - manualPromptText.length;
+  const manualReportRemaining = MAX_MANUAL_REPORT_CHARS - manualReportText.length;
 
   return (
     <div className="screen-new">

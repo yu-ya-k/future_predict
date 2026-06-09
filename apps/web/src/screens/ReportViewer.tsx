@@ -158,7 +158,7 @@ export function ReportViewer({
       : researchVersions.find((version) => version.run_no === selectedAttemptNo) ?? null;
 
   const finalReportText = report?.final_report || report?.report || null;
-  const displayMode = initialAttemptNo === null ? "final" : "attempt";
+  const displayMode = selectedAttemptNo === null ? "final" : "attempt";
   const displayText =
     displayMode === "final" ? finalReportText : selectedAttempt?.report || null;
   const displayLoading =
@@ -185,6 +185,12 @@ export function ReportViewer({
     setSelectedAttemptNo(runNo);
     setAttemptSelectionMode("manual");
     navigate(routes().report(runId, { attempt: runNo }));
+  }
+
+  function handleFinalReportSelect() {
+    setSelectedAttemptNo(null);
+    setAttemptSelectionMode("latest");
+    navigate(routes().report(runId));
   }
 
   function handleCitationClick(index: number) {
@@ -314,6 +320,10 @@ export function ReportViewer({
         <aside className="report-sources" aria-label="Deep Research履歴一覧">
           <h2 className="sources-title">Deep Research履歴</h2>
           <VersionList
+            finalTitle="最終レポート"
+            finalMeta={finalReportText ? "現在のレポート" : "生成待ち"}
+            finalSelected={displayMode === "final"}
+            onSelectFinal={handleFinalReportSelect}
             versions={researchVersions.map((version) => ({
               id: version.run_no,
               title:
@@ -418,6 +428,10 @@ function SourcesAside({
 }
 
 interface VersionListProps {
+  finalTitle: string;
+  finalMeta: string;
+  finalSelected: boolean;
+  onSelectFinal: () => void;
   versions: Array<{ id: number; title: string; meta: string }>;
   selectedId: number | null;
   onSelect: (id: number) => void;
@@ -426,18 +440,29 @@ interface VersionListProps {
 }
 
 function VersionList({
+  finalTitle,
+  finalMeta,
+  finalSelected,
+  onSelectFinal,
   versions,
   selectedId,
   onSelect,
   emptyTitle,
   emptyDescription,
 }: VersionListProps) {
-  if (versions.length === 0) {
-    return <EmptyState title={emptyTitle} description={emptyDescription} />;
-  }
-
   return (
     <div className="report-version-list">
+      <button
+        type="button"
+        className={`report-version-button${finalSelected ? " report-version-button--active" : ""}`}
+        onClick={onSelectFinal}
+      >
+        <span>{finalTitle}</span>
+        <span>{finalMeta}</span>
+      </button>
+      {versions.length === 0 && (
+        <EmptyState title={emptyTitle} description={emptyDescription} />
+      )}
       {[...versions].reverse().map((version) => (
         <button
           key={version.id}

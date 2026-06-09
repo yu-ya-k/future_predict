@@ -310,6 +310,8 @@ class ForecastRepository:
                     allowed_profiles_json TEXT NOT NULL DEFAULT '[]',
                     allowed_pack_roles_json TEXT NOT NULL DEFAULT '[]',
                     allowed_tool_names_json TEXT NOT NULL DEFAULT '[]',
+                    allowed_vector_store_ids_json TEXT NOT NULL DEFAULT '[]',
+                    allowed_mcp_server_ids_json TEXT NOT NULL DEFAULT '[]',
                     owner_team_id TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -601,6 +603,16 @@ class ForecastRepository:
                 _ensure_column(
                     connection,
                     table_name="forecast_reviews",
+                    column_name=column_name,
+                    ddl=ddl,
+                )
+            for column_name, ddl in {
+                "allowed_vector_store_ids_json": "allowed_vector_store_ids_json TEXT NOT NULL DEFAULT '[]'",
+                "allowed_mcp_server_ids_json": "allowed_mcp_server_ids_json TEXT NOT NULL DEFAULT '[]'",
+            }.items():
+                _ensure_column(
+                    connection,
+                    table_name="forecast_trusted_sources",
                     column_name=column_name,
                     ddl=ddl,
                 )
@@ -1277,6 +1289,8 @@ class ForecastRepository:
         allowed_profiles: list[str] | None = None,
         allowed_pack_roles: list[str] | None = None,
         allowed_tool_names: list[str] | None = None,
+        allowed_vector_store_ids: list[str] | None = None,
+        allowed_mcp_server_ids: list[str] | None = None,
         owner_team_id: str | None = None,
     ) -> sqlite3.Row:
         now = utc_now().isoformat()
@@ -1287,9 +1301,10 @@ class ForecastRepository:
                 INSERT INTO forecast_trusted_sources (
                     trusted_source_id, identifier, status, approved_by, approved_at,
                     expires_at, allowed_profiles_json, allowed_pack_roles_json,
-                    allowed_tool_names_json, owner_team_id, created_at, updated_at
+                    allowed_tool_names_json, allowed_vector_store_ids_json,
+                    allowed_mcp_server_ids_json, owner_team_id, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(identifier) DO UPDATE SET
                     status = excluded.status,
                     approved_by = excluded.approved_by,
@@ -1298,6 +1313,8 @@ class ForecastRepository:
                     allowed_profiles_json = excluded.allowed_profiles_json,
                     allowed_pack_roles_json = excluded.allowed_pack_roles_json,
                     allowed_tool_names_json = excluded.allowed_tool_names_json,
+                    allowed_vector_store_ids_json = excluded.allowed_vector_store_ids_json,
+                    allowed_mcp_server_ids_json = excluded.allowed_mcp_server_ids_json,
                     owner_team_id = excluded.owner_team_id,
                     updated_at = excluded.updated_at
                 """,
@@ -1311,6 +1328,8 @@ class ForecastRepository:
                     _dump(allowed_profiles or []),
                     _dump(allowed_pack_roles or []),
                     _dump(allowed_tool_names or []),
+                    _dump(allowed_vector_store_ids or []),
+                    _dump(allowed_mcp_server_ids or []),
                     owner_team_id,
                     now,
                     now,
@@ -1502,7 +1521,73 @@ class ForecastRepository:
         now = utc_now().isoformat()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            active_pack_ids = {
+                row["pack_id"]
+                for row in connection.execute(
+                    """
+                    SELECT pack_id FROM forecast_research_packs
+                    WHERE forecast_id = ? AND is_active = 1
+                    """,
+                    (str(forecast_id),),
+                ).fetchall()
+            }
+            connection.execute(
+                """
+                DELETE FROM forecast_claim_target_links
+                WHERE forecast_id = ?
+                  AND claim_id IN (
+                    SELECT claim_id FROM forecast_claims
+                    WHERE forecast_id = ?
+                      AND origin != 'manual'
+                      AND manual_locked = 0
+                      AND (
+                        pack_id IS NULL
+                        OR pack_id NOT IN (
+                          SELECT pack_id FROM forecast_research_packs
+                          WHERE forecast_id = ? AND is_active = 1
+                        )
+                      )
+                  )
+                """,
+                (str(forecast_id), str(forecast_id), str(forecast_id)),
+            )
+            connection.execute(
+                """
+                DELETE FROM forecast_claims
+                WHERE forecast_id = ?
+                  AND origin != 'manual'
+                  AND manual_locked = 0
+                  AND (
+                    pack_id IS NULL
+                    OR pack_id NOT IN (
+                      SELECT pack_id FROM forecast_research_packs
+                      WHERE forecast_id = ? AND is_active = 1
+                    )
+                  )
+                """,
+                (str(forecast_id), str(forecast_id)),
+            )
+            connection.execute(
+                """
+                DELETE FROM forecast_sources
+                WHERE forecast_id = ?
+                  AND (
+                    pack_id IS NULL
+                    OR pack_id NOT IN (
+                      SELECT pack_id FROM forecast_research_packs
+                      WHERE forecast_id = ? AND is_active = 1
+                    )
+                  )
+                  AND source_id NOT IN (
+                    SELECT source_id FROM forecast_claim_source_links
+                  )
+                """,
+                (str(forecast_id), str(forecast_id)),
+            )
             for source in sources:
+                source_pack_id = str(source.get("pack_id", pack_id))
+                if source_pack_id not in active_pack_ids:
+                    continue
                 data_classification = source.get(
                     "data_classification",
                     source.get("source_classification", "public"),
@@ -1534,7 +1619,7 @@ class ForecastRepository:
                     (
                         source["source_id"],
                         str(forecast_id),
-                        str(source.get("pack_id", pack_id)),
+                        source_pack_id,
                         source["title"],
                         source.get("publisher"),
                         source.get("url"),
@@ -1548,6 +1633,9 @@ class ForecastRepository:
                     ),
                 )
             for claim in claims:
+                claim_pack_id = str(claim.get("pack_id", pack_id))
+                if claim_pack_id not in active_pack_ids:
+                    continue
                 existing = connection.execute(
                     """
                     SELECT manual_locked, origin FROM forecast_claims
@@ -1610,7 +1698,7 @@ class ForecastRepository:
                         claim.get("source_classification", data_classification),
                         data_classification,
                         origin_tool_profile,
-                        str(claim.get("pack_id", pack_id)),
+                        claim_pack_id,
                         extraction_batch_id,
                         claim.get("report_artifact_hash", report_artifact_hash),
                         int(claim.get("manual_locked", 0)),
@@ -1630,6 +1718,15 @@ class ForecastRepository:
                         (claim["claim_id"], source_id),
                     )
             for link in links:
+                claim_exists = connection.execute(
+                    """
+                    SELECT 1 FROM forecast_claims
+                    WHERE forecast_id = ? AND claim_id = ?
+                    """,
+                    (str(forecast_id), link["claim_id"]),
+                ).fetchone()
+                if claim_exists is None:
+                    continue
                 connection.execute(
                     """
                     INSERT INTO forecast_claim_target_links (
@@ -1692,6 +1789,20 @@ class ForecastRepository:
                 (str(forecast_id),),
             ).fetchall()
 
+    def get_active_sources(self, forecast_id: UUID) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT sources.* FROM forecast_sources AS sources
+                LEFT JOIN forecast_research_packs AS packs
+                  ON packs.pack_id = sources.pack_id
+                WHERE sources.forecast_id = ?
+                  AND (sources.pack_id IS NULL OR packs.is_active = 1)
+                ORDER BY sources.created_at, sources.title
+                """,
+                (str(forecast_id),),
+            ).fetchall()
+
     def get_claims(self, forecast_id: UUID) -> list[sqlite3.Row]:
         with self.connect() as connection:
             return connection.execute(
@@ -1699,6 +1810,20 @@ class ForecastRepository:
                 SELECT * FROM forecast_claims
                 WHERE forecast_id = ?
                 ORDER BY created_at, text
+                """,
+                (str(forecast_id),),
+            ).fetchall()
+
+    def get_active_claims(self, forecast_id: UUID) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT claims.* FROM forecast_claims AS claims
+                LEFT JOIN forecast_research_packs AS packs
+                  ON packs.pack_id = claims.pack_id
+                WHERE claims.forecast_id = ?
+                  AND (claims.pack_id IS NULL OR packs.is_active = 1)
+                ORDER BY claims.created_at, claims.text
                 """,
                 (str(forecast_id),),
             ).fetchall()
@@ -2045,8 +2170,28 @@ class ForecastRepository:
                 (str(forecast_id),),
             ).fetchall()
 
-    def get_approved_target_links(self, forecast_id: UUID) -> list[sqlite3.Row]:
+    def get_approved_target_links(
+        self,
+        forecast_id: UUID,
+        *,
+        active_claims_only: bool = False,
+    ) -> list[sqlite3.Row]:
         with self.connect() as connection:
+            if active_claims_only:
+                return connection.execute(
+                    """
+                    SELECT links.* FROM forecast_claim_target_links AS links
+                    JOIN forecast_claims AS claims
+                      ON claims.claim_id = links.claim_id
+                    LEFT JOIN forecast_research_packs AS packs
+                      ON packs.pack_id = claims.pack_id
+                    WHERE links.forecast_id = ?
+                      AND links.review_status = 'approved'
+                      AND (claims.pack_id IS NULL OR packs.is_active = 1)
+                    ORDER BY links.target_kind, links.target_id, links.claim_id
+                    """,
+                    (str(forecast_id),),
+                ).fetchall()
             return connection.execute(
                 """
                 SELECT * FROM forecast_claim_target_links
@@ -2080,7 +2225,13 @@ class ForecastRepository:
                 (str(forecast_id),),
             ).fetchone()
             if existing is not None:
-                return existing
+                if (
+                    existing["engine_version"] == engine_version
+                    and existing["input_snapshot_hash"] == input_snapshot_hash
+                    and existing["engine_code_hash"] == engine_code_hash
+                ):
+                    return existing
+                raise ValueError("draft_estimate_set_exists")
             connection.execute(
                 """
                 INSERT INTO forecast_estimate_sets (
@@ -2206,6 +2357,24 @@ class ForecastRepository:
                 """,
                 (str(estimate_set_id),),
             ).fetchall()
+
+    def get_estimate_dicts(self, estimate_set_id: UUID) -> list[dict[str, Any]]:
+        return [
+            {
+                "target_kind": row["target_kind"],
+                "target_id": row["target_id"],
+                "prior": row["prior"],
+                "evidence_update": row["evidence_update"],
+                "cross_impact_adjustment": row["cross_impact_adjustment"],
+                "simulation_adjustment": row["simulation_adjustment"],
+                "calibration_adjustment": row["calibration_adjustment"],
+                "human_adjustment": row["human_adjustment"],
+                "final_probability": row["final_probability"],
+                "uncertainty_range": _load(row["uncertainty_range_json"], {}),
+                "components": _load(row["components_json"], {}),
+            }
+            for row in self.get_estimates(estimate_set_id)
+        ]
 
     def approve_estimate_set(
         self,

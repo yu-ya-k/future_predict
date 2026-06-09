@@ -169,12 +169,16 @@ async def test_private_pack_success_records_tools_without_pack_request(
 ) -> None:
     fake = IntegrationFakeAzure()
     forecast, research = _make_orchestrators(tmp_path, fake)
+    forecast.settings = forecast.settings.model_copy(
+        update={"research_private_vector_store_allowlist": ["vs_1"]}
+    )
     forecast.repository.upsert_trusted_source(
         identifier="trusted-private",
         status="approved",
         allowed_profiles=["private"],
         allowed_pack_roles=["current_state"],
         allowed_tool_names=["file_search"],
+        allowed_vector_store_ids=["vs_1"],
     )
     app = create_app()
     app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
@@ -234,6 +238,173 @@ async def test_private_pack_success_records_tools_without_pack_request(
                 (forecast_id,),
             ).fetchone()[0]
             == 0
+        )
+
+
+@pytest.mark.anyio
+async def test_private_pack_rejects_disallowed_vector_store_before_run(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    forecast.settings = forecast.settings.model_copy(
+        update={"research_private_vector_store_allowlist": ["vs_allowed"]}
+    )
+    forecast.repository.upsert_trusted_source(
+        identifier="trusted-private",
+        status="approved",
+        allowed_profiles=["private"],
+        allowed_pack_roles=["current_state"],
+        allowed_tool_names=["file_search"],
+        allowed_vector_store_ids=["vs_allowed"],
+    )
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        forecast_id = await _create_approved_forecast(client)
+        response = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={
+                "pack_role": "current_state",
+                "tool_profile": "private",
+                "data_classification": "internal",
+                "background": False,
+                "vector_store_ids": ["vs_denied"],
+                "trusted_source_identifiers": ["trusted-private"],
+            },
+        )
+
+    assert response.status_code == 409
+    assert _typed_code(response.json()) == "private_vector_store_not_allowlisted"
+    assert fake.submit_calls == []
+    with forecast.repository.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM research_runs").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM forecast_research_packs").fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM forecast_pack_requests WHERE reason = ?",
+                ("private_vector_store_not_allowlisted",),
+            ).fetchone()[0]
+            == 1
+        )
+
+
+@pytest.mark.anyio
+async def test_private_pack_rejects_trusted_source_vector_store_mismatch_before_run(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    forecast.settings = forecast.settings.model_copy(
+        update={"research_private_vector_store_allowlist": ["vs_1"]}
+    )
+    forecast.repository.upsert_trusted_source(
+        identifier="trusted-private",
+        status="approved",
+        allowed_profiles=["private"],
+        allowed_pack_roles=["current_state"],
+        allowed_tool_names=["file_search"],
+        allowed_vector_store_ids=["vs_other"],
+    )
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        forecast_id = await _create_approved_forecast(client)
+        response = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={
+                "pack_role": "current_state",
+                "tool_profile": "private",
+                "data_classification": "internal",
+                "background": False,
+                "vector_store_ids": ["vs_1"],
+                "trusted_source_identifiers": ["trusted-private"],
+            },
+        )
+
+    assert response.status_code == 409
+    assert _typed_code(response.json()) == "trusted_source_vector_store_not_allowed"
+    assert fake.submit_calls == []
+    with forecast.repository.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM research_runs").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM forecast_research_packs").fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM forecast_pack_requests WHERE reason = ?",
+                ("trusted_source_vector_store_not_allowed",),
+            ).fetchone()[0]
+            == 1
+        )
+
+
+@pytest.mark.anyio
+async def test_private_pack_rejects_trusted_source_without_vector_store_allowlist(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    forecast.settings = forecast.settings.model_copy(
+        update={"research_private_vector_store_allowlist": ["vs_1"]}
+    )
+    forecast.repository.upsert_trusted_source(
+        identifier="trusted-private",
+        status="approved",
+        allowed_profiles=["private"],
+        allowed_pack_roles=["current_state"],
+        allowed_tool_names=["file_search"],
+    )
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        forecast_id = await _create_approved_forecast(client)
+        response = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={
+                "pack_role": "current_state",
+                "tool_profile": "private",
+                "data_classification": "internal",
+                "background": False,
+                "vector_store_ids": ["vs_1"],
+                "trusted_source_identifiers": ["trusted-private"],
+            },
+        )
+
+    assert response.status_code == 409
+    assert _typed_code(response.json()) == "trusted_source_vector_store_not_allowed"
+    assert fake.submit_calls == []
+    with forecast.repository.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM research_runs").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM forecast_research_packs").fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM forecast_pack_requests WHERE reason = ?",
+                ("trusted_source_vector_store_not_allowed",),
+            ).fetchone()[0]
+            == 1
         )
 
 
@@ -420,6 +591,9 @@ async def test_private_pack_rejects_trusted_source_tool_mismatch_before_run(
 ) -> None:
     fake = IntegrationFakeAzure()
     forecast, research = _make_orchestrators(tmp_path, fake)
+    forecast.settings = forecast.settings.model_copy(
+        update={"research_private_vector_store_allowlist": ["vs_1"]}
+    )
     forecast.repository.upsert_trusted_source(
         identifier="trusted-private",
         status="approved",
@@ -710,6 +884,70 @@ async def test_phase_b_evidence_preserves_pack_provenance(tmp_path: Path) -> Non
     assert claim_pack_ids == expected_pack_ids
 
 
+@pytest.mark.anyio
+async def test_phase_b_evidence_rerun_removes_inactive_pack_rows(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        forecast_id = await _create_approved_forecast(client)
+        original = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={"pack_role": "current_state", "tool_profile": "public"},
+        )
+        assert original.status_code == 200
+        original_pack_id = original.json()["pack_id"]
+        research.repository.update_run(
+            UUID(original.json()["research_run_id"]),
+            status=RunStatus.COMPLETED,
+            final_report="Original report line one.\nOriginal report line two.",
+        )
+        forecast.extract_evidence(UUID(forecast_id))
+
+        rerun = await client.post(
+            f"/forecasts/{forecast_id}/research-packs/{original_pack_id}/rerun",
+            json={"expected_active_pack_id": original_pack_id},
+        )
+        assert rerun.status_code == 200
+        replacement_pack_id = rerun.json()["pack_id"]
+        research.repository.update_run(
+            UUID(rerun.json()["research_run_id"]),
+            status=RunStatus.COMPLETED,
+            final_report="Replacement report line one.\nReplacement report line two.",
+        )
+        forecast.extract_evidence(UUID(forecast_id))
+
+    source_pack_ids = {row["pack_id"] for row in forecast.repository.get_sources(UUID(forecast_id))}
+    claim_pack_ids = {row["pack_id"] for row in forecast.repository.get_claims(UUID(forecast_id))}
+    assert source_pack_ids == {replacement_pack_id}
+    assert claim_pack_ids == {replacement_pack_id}
+    assert original_pack_id not in source_pack_ids
+    assert original_pack_id not in claim_pack_ids
+    with forecast.repository.connect() as connection:
+        linked_claim_ids = {
+            row["claim_id"]
+            for row in connection.execute(
+                """
+                SELECT claim_id FROM forecast_claim_target_links
+                WHERE forecast_id = ?
+                """,
+                (forecast_id,),
+            ).fetchall()
+        }
+    active_claim_ids = {
+        row["claim_id"] for row in forecast.repository.get_claims(UUID(forecast_id))
+    }
+    assert linked_claim_ids.issubset(active_claim_ids)
+
+
 def test_phase_b_commit_requires_probability_publication_review(
     tmp_path: Path,
 ) -> None:
@@ -783,6 +1021,82 @@ def test_phase_b_commit_requires_probability_publication_review(
         expected_input_snapshot_hash=estimate_set["input_snapshot_hash"],
     )
     assert committed.estimate_set_id == estimate_set_id
+
+
+def test_draft_estimate_set_transaction_rejects_different_existing_inputs(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, _research = _make_orchestrators(tmp_path, fake)
+    created = forecast.create_forecast(
+        request=forecast_service_request(),
+        idempotency_key=None,
+    )
+    forecast_id = created.forecast_id
+    forecast.approve_framing(forecast_id, comment=None)
+    detail = forecast.get_forecast(forecast_id)
+    engine = probability.get_engine("phase_b_v1")
+    snapshot = {
+        "outcomes": [
+            {
+                "outcome_id": str(outcome.outcome_id),
+                "normalization_group_id": outcome.normalization_group_id,
+                "sort_order": outcome.sort_order,
+            }
+            for outcome in detail.outcomes
+        ],
+        "claims": [],
+        "approved_target_links": [],
+        "analog_events": [],
+        "cross_impact": [],
+        "scenarios": [],
+    }
+    estimates = engine.compute(snapshot=snapshot)
+    first = forecast.repository.create_draft_estimate_set(
+        forecast_id=forecast_id,
+        engine_version=engine.engine_version,
+        input_snapshot_hash=engine.snapshot_hash(snapshot),
+        engine_code_hash=engine.engine_code_hash(),
+        random_seed=engine.random_seed,
+        normalization_group_id=detail.outcomes[0].normalization_group_id,
+        snapshot=snapshot,
+        estimates=estimates,
+    )
+
+    replay = forecast.repository.create_draft_estimate_set(
+        forecast_id=forecast_id,
+        engine_version=engine.engine_version,
+        input_snapshot_hash=engine.snapshot_hash(snapshot),
+        engine_code_hash=engine.engine_code_hash(),
+        random_seed=engine.random_seed,
+        normalization_group_id=detail.outcomes[0].normalization_group_id,
+        snapshot=snapshot,
+        estimates=estimates,
+    )
+
+    assert replay["estimate_set_id"] == first["estimate_set_id"]
+    with pytest.raises(ValueError, match="draft_estimate_set_exists"):
+        forecast.repository.create_draft_estimate_set(
+            forecast_id=forecast_id,
+            engine_version=engine.engine_version,
+            input_snapshot_hash="different-snapshot-hash",
+            engine_code_hash=engine.engine_code_hash(),
+            random_seed=engine.random_seed,
+            normalization_group_id=detail.outcomes[0].normalization_group_id,
+            snapshot=snapshot,
+            estimates=estimates,
+        )
+    with pytest.raises(ValueError, match="draft_estimate_set_exists"):
+        forecast.repository.create_draft_estimate_set(
+            forecast_id=forecast_id,
+            engine_version=engine.engine_version,
+            input_snapshot_hash=engine.snapshot_hash(snapshot),
+            engine_code_hash="different-engine-code-hash",
+            random_seed=engine.random_seed,
+            normalization_group_id=detail.outcomes[0].normalization_group_id,
+            snapshot=snapshot,
+            estimates=estimates,
+        )
 
 
 def test_phase_b_probability_dispatch_uses_analogs_polarity_and_scenarios() -> None:
@@ -1091,6 +1405,61 @@ def test_public_commit_rejects_internal_evidence_snapshot(tmp_path: Path) -> Non
             expected_input_snapshot_hash=estimate_set["input_snapshot_hash"],
         )
     assert error.value.code == "classification_mismatch"
+
+
+def test_internal_commit_uses_private_snapshot_artifact_profile(tmp_path: Path) -> None:
+    from api.forecast.schemas import ConfidentialityClass
+
+    fake = IntegrationFakeAzure()
+    forecast, _research = _make_orchestrators(tmp_path, fake)
+    request = forecast_service_request().model_copy(
+        update={"confidentiality_class": ConfidentialityClass.INTERNAL}
+    )
+    created = forecast.create_forecast(
+        request=request,
+        idempotency_key=None,
+    )
+    forecast_id = created.forecast_id
+    forecast.approve_framing(forecast_id, comment=None)
+    detail = forecast.get_forecast(forecast_id)
+    snapshot = {
+        "outcomes": [
+            {
+                "outcome_id": str(outcome.outcome_id),
+                "normalization_group_id": outcome.normalization_group_id,
+                "sort_order": outcome.sort_order,
+            }
+            for outcome in detail.outcomes
+        ],
+        "claims": [],
+        "approved_target_links": [],
+        "sources": [{"data_classification": "internal"}],
+    }
+    engine = probability.get_engine("phase_a_v1")
+    estimate_set = forecast.repository.create_draft_estimate_set(
+        forecast_id=forecast_id,
+        engine_version=engine.engine_version,
+        input_snapshot_hash=engine.snapshot_hash(snapshot),
+        engine_code_hash=engine.engine_code_hash(),
+        random_seed=engine.random_seed,
+        normalization_group_id=detail.outcomes[0].normalization_group_id,
+        snapshot=snapshot,
+        estimates=engine.compute(snapshot=snapshot),
+    )
+    estimate_set_id = UUID(estimate_set["estimate_set_id"])
+    forecast.repository.approve_estimate_set(
+        forecast_id,
+        estimate_set_id=estimate_set_id,
+        comment=None,
+    )
+
+    committed = forecast.commit_version(
+        forecast_id,
+        estimate_set_id=estimate_set_id,
+        expected_input_snapshot_hash=estimate_set["input_snapshot_hash"],
+    )
+
+    assert Path(committed.snapshot_artifact_path).parts[-3] == "private"
 
 
 def forecast_service_request():

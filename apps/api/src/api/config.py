@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     research_deep_research_output_cost_per_1m: float = Field(default=0.0, ge=0)
     research_reviewer_input_cost_per_1m: float = Field(default=0.0, ge=0)
     research_reviewer_output_cost_per_1m: float = Field(default=0.0, ge=0)
-    research_web_search_cost_per_call: float = Field(default=0.0, ge=0)
+    research_web_search_cost_per_call: float = Field(default=0.01, ge=0)
 
     o3_deep_research_azure_openai_endpoint: str = ""
     o3_deep_research_azure_openai_key: str = ""

@@ -47,17 +47,29 @@ router = APIRouter(
 )
 
 ForecastDependency = Annotated[ForecastOrchestrator, Depends(get_forecast_orchestrator)]
-IdempotencyKeyHeader = Annotated[str | None, Header(alias="Idempotency-Key")]
+IdempotencyKeyHeader = Annotated[
+    str | None,
+    Header(alias="Idempotency-Key", max_length=200),
+]
 
 
 @router.get("/human-reviews", response_model=list[dict[str, str]])
-def list_forecast_human_reviews() -> list[dict[str, str]]:
+def list_forecast_human_reviews(
+    orchestrator: ForecastDependency,
+) -> list[dict[str, str]]:
+    try:
+        orchestrator.ensure_enabled()
+    except ForecastConflict as error:
+        raise forecast_http_error(error) from error
     return []
 
 
 @router.get("", response_model=list[ForecastSummary])
 def list_forecasts(orchestrator: ForecastDependency) -> list[ForecastSummary]:
-    return orchestrator.list_forecasts()
+    try:
+        return orchestrator.list_forecasts()
+    except ForecastConflict as error:
+        raise forecast_http_error(error) from error
 
 
 @router.post("", response_model=ForecastCreateResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -113,6 +125,8 @@ def get_forecast(
 ) -> ForecastDetail:
     try:
         return orchestrator.get_forecast(forecast_id)
+    except ForecastConflict as error:
+        raise forecast_http_error(error) from error
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Forecast not found.") from error
 
@@ -245,6 +259,8 @@ def list_research_packs(
 ) -> list[ResearchPackResponse]:
     try:
         return orchestrator.list_research_packs(forecast_id)
+    except ForecastConflict as error:
+        raise forecast_http_error(error) from error
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Forecast not found.") from error
 
@@ -453,6 +469,8 @@ def get_current_estimate_set(
 ) -> dict[str, object]:
     try:
         return orchestrator.current_estimate_set_response(forecast_id)
+    except ForecastConflict as error:
+        raise forecast_http_error(error) from error
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Estimate set not found.") from error
 
@@ -516,6 +534,8 @@ def get_forecast_audit(
 ) -> ForecastAuditResponse:
     try:
         return orchestrator.get_audit(forecast_id)
+    except ForecastConflict as error:
+        raise forecast_http_error(error) from error
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Forecast not found.") from error
 

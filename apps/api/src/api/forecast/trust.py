@@ -16,6 +16,8 @@ def ensure_trusted_sources_allowed(
     tool_profile: ToolProfile,
     pack_role: PackRole,
     tool_names: list[str] | None = None,
+    vector_store_ids: list[str] | None = None,
+    mcp_server_ids: list[str] | None = None,
 ) -> None:
     if not identifiers:
         if tool_profile == ToolProfile.PRIVATE:
@@ -73,6 +75,48 @@ def ensure_trusted_sources_allowed(
                     "identifier": identifier,
                     "allowed_tool_names": sorted(allowed_tool_names),
                     "requested_tool_names": sorted(requested_tool_names),
+                },
+            )
+        allowed_vector_store_ids = set(_json_list(row["allowed_vector_store_ids_json"]))
+        requested_vector_store_ids = set(vector_store_ids or [])
+        if (
+            tool_profile == ToolProfile.PRIVATE
+            and "file_search" in requested_tool_names
+            and not allowed_vector_store_ids
+        ):
+            raise ForecastConflict(
+                "trusted_source_vector_store_not_allowed",
+                "Trusted source must explicitly allow private vector stores.",
+                {
+                    "identifier": identifier,
+                    "allowed_vector_store_ids": [],
+                    "requested_vector_store_ids": sorted(requested_vector_store_ids),
+                },
+            )
+        if allowed_vector_store_ids and not requested_vector_store_ids.issubset(
+            allowed_vector_store_ids
+        ):
+            raise ForecastConflict(
+                "trusted_source_vector_store_not_allowed",
+                "Trusted source does not allow the requested vector stores.",
+                {
+                    "identifier": identifier,
+                    "allowed_vector_store_ids": sorted(allowed_vector_store_ids),
+                    "requested_vector_store_ids": sorted(requested_vector_store_ids),
+                },
+            )
+        allowed_mcp_server_ids = set(_json_list(row["allowed_mcp_server_ids_json"]))
+        requested_mcp_server_ids = set(mcp_server_ids or [])
+        if allowed_mcp_server_ids and not requested_mcp_server_ids.issubset(
+            allowed_mcp_server_ids
+        ):
+            raise ForecastConflict(
+                "trusted_source_mcp_server_not_allowed",
+                "Trusted source does not allow the requested MCP servers.",
+                {
+                    "identifier": identifier,
+                    "allowed_mcp_server_ids": sorted(allowed_mcp_server_ids),
+                    "requested_mcp_server_ids": sorted(requested_mcp_server_ids),
                 },
             )
 

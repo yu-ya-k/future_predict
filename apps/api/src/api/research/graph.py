@@ -10,6 +10,18 @@ from typing_extensions import TypedDict
 from api.research.routing import route_after_review
 from api.research.schemas import HumanReviewAction
 
+GRAPH_HUMAN_REVIEW_ACTIONS = [
+    HumanReviewAction.APPROVE,
+    HumanReviewAction.APPROVE_WITH_LIMITATION,
+    HumanReviewAction.REQUEST_REVIEW,
+    HumanReviewAction.REQUEST_LLM_PATCH,
+    HumanReviewAction.REQUEST_VERIFICATION,
+    HumanReviewAction.REQUEST_TARGETED_RERUN,
+    HumanReviewAction.REQUEST_FULL_RERUN,
+    HumanReviewAction.REQUEST_ITEM_REVISION,
+    HumanReviewAction.REJECT,
+]
+
 
 class GraphState(TypedDict, total=False):
     run_id: str
@@ -144,7 +156,7 @@ def node_human_review(state: GraphState) -> dict[str, Any]:
             "reason": review.get("rationale", ""),
             "latest_report": state.get("report", ""),
             "latest_review": review,
-            "allowed_actions": [action.value for action in HumanReviewAction],
+            "allowed_actions": [action.value for action in GRAPH_HUMAN_REVIEW_ACTIONS],
             "audit_summary": state.get("audit_summary", {}),
             "warnings": state.get("warnings", []),
         }

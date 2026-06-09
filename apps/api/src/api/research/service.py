@@ -896,42 +896,6 @@ class ResearchOrchestrator:
                 raise ValueError(str(error)) from error
 
         imported_at = utc_now()
-        updated = self.repository.accept_manual_rerun_request_and_update_run(
-            run.id,
-            rerun_id=active.rerun_id,
-            result_sha256=result_sha256,
-            allowed_statuses={RunStatus.NEEDS_HUMAN_REVIEW, RunStatus.REVIEWING},
-            status=RunStatus.REVIEWING,
-            needs_human_review=False,
-            done_reason=None,
-            report=merged_report,
-            deep_research_runs=active.expected_run_no,
-            targeted_rerun_runs=(
-                run.targeted_rerun_runs + 1
-                if active.scope != "full_rerun"
-                else run.targeted_rerun_runs
-            ),
-            full_rerun_runs=(
-                run.full_rerun_runs + 1
-                if active.scope == "full_rerun"
-                else run.full_rerun_runs
-            ),
-            pending_deep_research_response_id=None,
-            deep_research_status="completed",
-            review_claim_token=None,
-            review_claim_operation=None,
-            review_claim_expires_at=None,
-        )
-        if updated is None:
-            row = self.repository.get_manual_rerun_request_row(run.id, rerun_id)
-            if row is not None and row["status"] == "accepted":
-                if row["result_sha256"] == result_sha256:
-                    return self.repository.get_run(run.id)
-                raise ValueError(
-                    "Manual rerun result was already accepted with different content."
-                )
-            raise ValueError("Manual rerun result could not be accepted because run state changed.")
-
         artifact_fragment = _manual_rerun_artifact_fragment(
             active.rerun_id,
             result_sha256,
@@ -973,34 +937,27 @@ class ResearchOrchestrator:
             retrieved_at=imported_at.isoformat(),
             source_type="manual_chatgpt_rerun_url_unverified",
         )
-        self.repository.add_attempt(
-            run.id,
-            ResearchAttempt(
-                run_no=active.expected_run_no,
-                response_id=None,
-                status="completed",
-                model="chatgpt-deep-research-manual",
-                source="manual_chatgpt_rerun",
-                prompt=active.prompt,
-                report=result,
-                citations=citations,
-                raw_response_artifact_path=raw_path,
+        checkpoint = self._checkpoint_values(
+            run.model_copy(
+                update={
+                    "status": RunStatus.REVIEWING,
+                    "report": merged_report,
+                    "deep_research_runs": active.expected_run_no,
+                    "targeted_rerun_runs": (
+                        run.targeted_rerun_runs + 1
+                        if active.scope != "full_rerun"
+                        else run.targeted_rerun_runs
+                    ),
+                    "full_rerun_runs": (
+                        run.full_rerun_runs + 1
+                        if active.scope == "full_rerun"
+                        else run.full_rerun_runs
+                    ),
+                    "needs_human_review": False,
+                    "done_reason": None,
+                    "deep_research_status": "completed",
+                }
             ),
-        )
-
-        self.repository.append_history_event(
-            run.id,
-            {
-                "step": "manual_rerun_result_collected",
-                "rerun_id": active.rerun_id,
-                "scope": active.scope,
-                "result_path": result_path,
-                "report_path": report_path,
-                "citations_count": len(citations),
-            },
-        )
-        self._save_checkpoint(
-            updated,
             kind="deep_research_collected",
             node_anchor=f"deep_research:{active.expected_run_no}",
             source_attempt_no=active.expected_run_no,
@@ -1015,6 +972,61 @@ class ResearchOrchestrator:
                 "citations_count": len(citations),
             },
         )
+        updated = self.repository.complete_manual_rerun_request_and_update_run(
+            run.id,
+            rerun_id=active.rerun_id,
+            result_sha256=result_sha256,
+            allowed_statuses={RunStatus.NEEDS_HUMAN_REVIEW, RunStatus.REVIEWING},
+            attempt=ResearchAttempt(
+                run_no=active.expected_run_no,
+                response_id=None,
+                status="completed",
+                model="chatgpt-deep-research-manual",
+                source="manual_chatgpt_rerun",
+                prompt=active.prompt,
+                report=result,
+                citations=citations,
+                raw_response_artifact_path=raw_path,
+            ),
+            checkpoint=checkpoint,
+            collected_history_event={
+                "step": "manual_rerun_result_collected",
+                "rerun_id": active.rerun_id,
+                "scope": active.scope,
+                "result_path": result_path,
+                "report_path": report_path,
+                "citations_count": len(citations),
+            },
+            status=RunStatus.REVIEWING,
+            needs_human_review=False,
+            done_reason=None,
+            report=merged_report,
+            deep_research_runs=active.expected_run_no,
+            targeted_rerun_runs=(
+                run.targeted_rerun_runs + 1
+                if active.scope != "full_rerun"
+                else run.targeted_rerun_runs
+            ),
+            full_rerun_runs=(
+                run.full_rerun_runs + 1
+                if active.scope == "full_rerun"
+                else run.full_rerun_runs
+            ),
+            pending_deep_research_response_id=None,
+            deep_research_status="completed",
+            review_claim_token=None,
+            review_claim_operation=None,
+            review_claim_expires_at=None,
+        )
+        if updated is None:
+            row = self.repository.get_manual_rerun_request_row(run.id, rerun_id)
+            if row is not None and row["status"] == "accepted":
+                if row["result_sha256"] == result_sha256:
+                    return self.repository.get_run(run.id)
+                raise ValueError(
+                    "Manual rerun result was already accepted with different content."
+                )
+            raise ValueError("Manual rerun result could not be accepted because run state changed.")
         return self.review_run(updated.id)
 
     def _record_deep_research_submit_failure(
@@ -1299,24 +1311,24 @@ class ResearchOrchestrator:
             output_cost_per_1m=self.settings.research_deep_research_output_cost_per_1m,
             tool_call_cost=self.settings.research_web_search_cost_per_call,
         )
-        self.repository.add_attempt(
-            run.id,
-            ResearchAttempt(
-                run_no=run.deep_research_runs,
-                response_id=response_id,
-                status=response_status,
-                model=self.azure.deep_research_deployment,
-                prompt=run.optimized_prompt or run.user_prompt,
-                report=report,
-                citations=citations,
-                tool_calls_summary=tool_calls,
-                raw_response_artifact_path=raw_path,
-            ),
-        )
-        cost_recorded = self.repository.add_cost_event(run.id, cost_event)
-        tool_call_delta = len(tool_calls) if cost_recorded else 0
-        cost_delta = cost_event.estimated_cost_usd if cost_recorded else 0.0
         if merge_error is not None:
+            self.repository.add_attempt(
+                run.id,
+                ResearchAttempt(
+                    run_no=run.deep_research_runs,
+                    response_id=response_id,
+                    status=response_status,
+                    model=self.azure.deep_research_deployment,
+                    prompt=run.optimized_prompt or run.user_prompt,
+                    report=report,
+                    citations=citations,
+                    tool_calls_summary=tool_calls,
+                    raw_response_artifact_path=raw_path,
+                ),
+            )
+            cost_recorded = self.repository.add_cost_event(run.id, cost_event)
+            tool_call_delta = len(tool_calls) if cost_recorded else 0
+            cost_delta = cost_event.estimated_cost_usd if cost_recorded else 0.0
             self.repository.append_history_event(
                 run.id,
                 {
@@ -1338,18 +1350,7 @@ class ResearchOrchestrator:
             f"reports/report_attempt_{run.deep_research_runs:03d}.md",
             merged_report,
         )
-        self.repository.append_history_event(
-            run.id,
-            {
-                "step": "deep_research_collected",
-                "response_id": response_id,
-                "citations_count": len(citations),
-                "tool_calls_count": len(tool_calls),
-                "estimated_cost_usd": cost_event.estimated_cost_usd,
-                "report_path": report_path,
-            },
-        )
-        self._save_checkpoint(
+        checkpoint = self._checkpoint_values(
             run,
             kind="deep_research_collected",
             node_anchor=f"deep_research:{run.deep_research_runs}",
@@ -1362,9 +1363,30 @@ class ResearchOrchestrator:
                 "tool_calls_count": len(tool_calls),
             },
         )
-        updated = self.repository.update_run_if_status(
+        updated = self.repository.record_deep_research_collection_and_update_run_if_status(
             run.id,
             {RunStatus.COLLECTING},
+            attempt=ResearchAttempt(
+                run_no=run.deep_research_runs,
+                response_id=response_id,
+                status=response_status,
+                model=self.azure.deep_research_deployment,
+                prompt=run.optimized_prompt or run.user_prompt,
+                report=report,
+                citations=citations,
+                tool_calls_summary=tool_calls,
+                raw_response_artifact_path=raw_path,
+            ),
+            cost_event=cost_event,
+            checkpoint=checkpoint,
+            history_event={
+                "step": "deep_research_collected",
+                "response_id": response_id,
+                "citations_count": len(citations),
+                "tool_calls_count": len(tool_calls),
+                "estimated_cost_usd": cost_event.estimated_cost_usd,
+                "report_path": report_path,
+            },
             status=(
                 RunStatus.COMPLETED
                 if getattr(run, "run_origin", "research") == "forecast"
@@ -1387,8 +1409,8 @@ class ResearchOrchestrator:
                 else run.terminal_status
             ),
             deep_research_status=response_status,
-            total_tool_calls=run.total_tool_calls + tool_call_delta,
-            estimated_cost_usd=run.estimated_cost_usd + cost_delta,
+            total_tool_calls=run.total_tool_calls + len(tool_calls),
+            estimated_cost_usd=run.estimated_cost_usd + cost_event.estimated_cost_usd,
             review_claim_token=None,
             review_claim_operation=None,
             review_claim_expires_at=None,
@@ -2347,6 +2369,34 @@ class ResearchOrchestrator:
         snapshot_extra: dict[str, Any] | None = None,
         forkable: bool = True,
     ) -> ResearchCheckpoint:
+        return self.repository.add_checkpoint(
+            run.id,
+            **self._checkpoint_values(
+                run,
+                kind=kind,
+                node_anchor=node_anchor,
+                source_attempt_no=source_attempt_no,
+                source_review_no=source_review_no,
+                source_response_id=source_response_id,
+                report_override=report_override,
+                snapshot_extra=snapshot_extra,
+                forkable=forkable,
+            ),
+        )
+
+    def _checkpoint_values(
+        self,
+        run: ResearchRunRecord,
+        *,
+        kind: str,
+        node_anchor: str,
+        source_attempt_no: int | None = None,
+        source_review_no: int | None = None,
+        source_response_id: str | None = None,
+        report_override: str | None = None,
+        snapshot_extra: dict[str, Any] | None = None,
+        forkable: bool = True,
+    ) -> dict[str, Any]:
         source_prompt = run.optimized_prompt or run.user_prompt
         source_report = report_override if report_override is not None else (
             run.final_report or run.report or ""
@@ -2372,24 +2422,52 @@ class ResearchOrchestrator:
         }
         if snapshot_extra:
             snapshot.update(snapshot_extra)
-        return self.repository.add_checkpoint(
-            run.id,
-            kind=kind,
-            node_anchor=node_anchor,
-            forkable=forkable and bool(source_report.strip()),
-            dedupe_key=":".join(dedupe_parts),
-            source_attempt_no=source_attempt_no,
-            source_review_no=source_review_no,
-            source_response_id=source_response_id,
-            checkpoint_report_hash=checkpoint_report_hash,
-            snapshot_json=snapshot,
-        )
+        return {
+            "kind": kind,
+            "node_anchor": node_anchor,
+            "forkable": forkable and bool(source_report.strip()),
+            "dedupe_key": ":".join(dedupe_parts),
+            "source_attempt_no": source_attempt_no,
+            "source_review_no": source_review_no,
+            "source_response_id": source_response_id,
+            "checkpoint_report_hash": checkpoint_report_hash,
+            "snapshot_json": snapshot,
+        }
 
     def verify_items(
         self,
         run_id: UUID,
         *,
         _review_claim_token: str | None = None,
+    ) -> ResearchRunRecord:
+        if _review_claim_token is not None:
+            return self._verify_items_claimed(
+                run_id,
+                _review_claim_token=_review_claim_token,
+            )
+
+        claimed = self.repository.claim_review_operation(
+            run_id,
+            operation="verify_items",
+            lease_seconds=self.settings.research_review_timeout_seconds,
+        )
+        if claimed is None:
+            return self.repository.get_run(run_id)
+
+        run, claim_token = claimed
+        try:
+            return self._verify_items_claimed(
+                run.id,
+                _review_claim_token=claim_token,
+            )
+        finally:
+            self.repository.release_review_operation(run.id, claim_token=claim_token)
+
+    def _verify_items_claimed(
+        self,
+        run_id: UUID,
+        *,
+        _review_claim_token: str,
     ) -> ResearchRunRecord:
         run = self.repository.get_run(run_id)
         latest_review = self._latest_review(run.id)

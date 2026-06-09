@@ -139,7 +139,7 @@ export interface ResearchRunOptions {
 }
 
 export interface CreateResearchRunRequest {
-  user_prompt: string; // 1-50000 chars
+  user_prompt: string; // 1-120000 chars
   options?: ResearchRunOptions;
 }
 

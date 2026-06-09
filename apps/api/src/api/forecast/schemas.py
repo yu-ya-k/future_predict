@@ -517,6 +517,8 @@ class ForecastTrustedSourceRecord(BaseModel):
     allowed_profiles: list[ToolProfile] = Field(default_factory=_default_tool_profiles)
     allowed_pack_roles: list[PackRole] = Field(default_factory=_default_pack_roles)
     allowed_tool_names: list[str] = Field(default_factory=_default_string_list)
+    allowed_vector_store_ids: list[str] = Field(default_factory=_default_string_list)
+    allowed_mcp_server_ids: list[str] = Field(default_factory=_default_string_list)
     owner_team_id: str | None = None
 
 

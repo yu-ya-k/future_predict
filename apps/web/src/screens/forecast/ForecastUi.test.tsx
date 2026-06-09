@@ -444,6 +444,100 @@ describe("Forecast UI", () => {
     );
   });
 
+  it("uses the edited rough input as original prompt after returning from clarifying questions", async () => {
+    window.location.hash = "#/forecasts/new";
+    let draftCalls = 0;
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (path === "/forecasts/framing-drafts" && init?.method === "POST") {
+          draftCalls += 1;
+          const body = JSON.parse(String(init.body));
+          if (draftCalls === 1) {
+            expect(body).toMatchObject({
+              rough_question: "Initial product question",
+              locale: "ja",
+            });
+            return jsonResponse(
+              framingDraft({
+                ready_to_create: false,
+                draft: { clarifying_questions: [clarifyingQuestion()] },
+                create_payload: null,
+              }),
+            );
+          }
+          expect(body).toMatchObject({
+            rough_question: "Edited product question with deadline",
+            locale: "ja",
+          });
+          expect(body).not.toHaveProperty("previous_draft");
+          return jsonResponse(framingDraft());
+        }
+        if (path === "/forecasts" && init?.method === "POST") {
+          expect(JSON.parse(String(init.body))).toMatchObject({
+            original_execution_prompt: "Edited product question with deadline",
+          });
+          return jsonResponse({
+            forecast_id: "forecast-1",
+            status: "framing_pending",
+            framing_version: 1,
+            created_at: "2026-06-08T00:00:00Z",
+          });
+        }
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              original_execution_prompt: "Edited product question with deadline",
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.type(
+      screen.getByRole("textbox", { name: /予測したいこと/ }),
+      "Initial product question",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "AIでForecast案を作成" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Forecastメタデータの不足確認",
+      }),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "大枠を編集" }));
+
+    const roughInput = screen.getByRole("textbox", { name: /予測したいこと/ });
+    await userEvent.clear(roughInput);
+    await userEvent.type(roughInput, "Edited product question with deadline");
+    await userEvent.click(
+      screen.getByRole("button", { name: "AIでForecast案を作成" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "保存前のフレーミング確認" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Edited product question with deadline"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Initial product question")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Forecastを作成" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "保存済みプレビュー" }),
+    ).toBeInTheDocument();
+  });
+
   it("asks draft clarifying questions before final create and separate approval", async () => {
     window.location.hash = "#/forecasts/new";
     const fetchMock = vi.fn(
@@ -1201,7 +1295,7 @@ describe("Forecast UI", () => {
     ).toBeInTheDocument();
   });
 
-  it("keeps the first rough input as original prompt across retry and create payload conflicts", async () => {
+  it("uses the latest rough input as original prompt across retry and create payload conflicts", async () => {
     window.location.hash = "#/forecasts/new";
     let draftCalls = 0;
     const fetchMock = vi.fn(
@@ -1240,7 +1334,7 @@ describe("Forecast UI", () => {
         if (path === "/forecasts" && init?.method === "POST") {
           expect(JSON.parse(String(init.body))).toMatchObject({
             question: "Will the product launch by Q4?",
-            original_execution_prompt: "Initial launch prompt",
+            original_execution_prompt: "Retry prompt with deadline",
           });
           return jsonResponse({
             forecast_id: "forecast-1",
@@ -1255,7 +1349,7 @@ describe("Forecast UI", () => {
         ) {
           return jsonResponse(
             forecastDetail({
-              original_execution_prompt: "Initial launch prompt",
+              original_execution_prompt: "Retry prompt with deadline",
             }),
           );
         }
@@ -1291,7 +1385,8 @@ describe("Forecast UI", () => {
     expect(
       await screen.findByRole("heading", { name: "保存前のフレーミング確認" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("Initial launch prompt")).toBeInTheDocument();
+    expect(screen.getByText("Retry prompt with deadline")).toBeInTheDocument();
+    expect(screen.queryByText("Initial launch prompt")).not.toBeInTheDocument();
     expect(
       screen.queryByText("API-provided conflicting prompt"),
     ).not.toBeInTheDocument();
@@ -1901,6 +1996,203 @@ describe("Forecast UI", () => {
     ).toHaveValue("Manual prompt for forecast-2");
     expect(screen.getByLabelText("結果を貼り付け")).toHaveValue("");
     expect(promptForecastIds).toEqual(["forecast-1", "forecast-2"]);
+  });
+
+  it("ignores stale forecast load responses after moving between forecast routes", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const forecast1Response = deferred<Response>();
+    const forecast2Response = deferred<Response>();
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return forecast1Response.promise;
+        }
+        if (
+          path === "/forecasts/forecast-2" &&
+          (!init || init.method === "GET")
+        ) {
+          return forecast2Response.promise;
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:8000/forecasts/forecast-1",
+        expect.anything(),
+      ),
+    );
+
+    act(() => {
+      window.location.hash = "#/forecasts/forecast-2";
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:8000/forecasts/forecast-2",
+        expect.anything(),
+      ),
+    );
+
+    await act(async () => {
+      forecast2Response.resolve(
+        jsonResponse(
+          forecastDetail({
+            forecast_id: "forecast-2",
+            question: "Question for forecast-2",
+            status: "framing_approved",
+            approved_framing_version: 1,
+          }),
+        ),
+      );
+      await forecast2Response.promise;
+    });
+
+    expect(await screen.findByText("Question for forecast-2")).toBeInTheDocument();
+
+    await act(async () => {
+      forecast1Response.resolve(
+        jsonResponse(
+          forecastDetail({
+            forecast_id: "forecast-1",
+            question: "Question for forecast-1",
+            status: "framing_approved",
+            approved_framing_version: 1,
+          }),
+        ),
+      );
+      await forecast1Response.promise;
+    });
+
+    expect(screen.getByText("Question for forecast-2")).toBeInTheDocument();
+    expect(screen.queryByText("Question for forecast-1")).not.toBeInTheDocument();
+  });
+
+  it("resets forecast-scoped workflow state when moving between forecast routes", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const resolveBodies: unknown[] = [];
+    let forecast1Status: ForecastDetail["status"] = "scenarios_ready";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              forecast_id: "forecast-1",
+              question: "Question for forecast-1",
+              status: forecast1Status,
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/review" &&
+          init?.method === "POST"
+        ) {
+          forecast1Status = "draft_ready";
+          return jsonResponse({
+            forecast_id: "forecast-1",
+            action: "approve_claim_target_links",
+            status: "scenarios_ready",
+          });
+        }
+        if (
+          path === "/forecasts/forecast-2" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              forecast_id: "forecast-2",
+              question: "Question for forecast-2",
+              status: "committed",
+              outcomes: [
+                {
+                  outcome_id: "forecast-2-outcome-yes",
+                  label: "Forecast 2 yes",
+                  definition: "Forecast 2 resolves yes.",
+                  resolution_rule: "resolved by official source",
+                  normalization_group_id: "norm-2",
+                  sort_order: 0,
+                },
+                {
+                  outcome_id: "forecast-2-outcome-no",
+                  label: "Forecast 2 no",
+                  definition: "Forecast 2 resolves no.",
+                  resolution_rule: "resolved by official source",
+                  normalization_group_id: "norm-2",
+                  sort_order: 1,
+                },
+              ],
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-2/estimate-set" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            estimateSet({
+              forecast_id: "forecast-2",
+              status: "frozen",
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-2/resolve" &&
+          init?.method === "POST"
+        ) {
+          resolveBodies.push(JSON.parse(String(init.body)));
+          return jsonResponse({
+            forecast_id: "forecast-2",
+            outcome_id: "forecast-2-outcome-yes",
+            multiclass_brier: 0.12,
+            log_score: 0.32,
+            scorer_version: "phase_a_scorer_v1",
+            resolved_at: "2026-06-08T01:00:00Z",
+          });
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    expect(await screen.findByText("Question for forecast-1")).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "主張と結果の対応を承認" }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "確率を計算" })).toBeNull(),
+    );
+
+    act(() => {
+      window.location.hash = "#/forecasts/forecast-2";
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+
+    expect(await screen.findByText("Question for forecast-2")).toBeInTheDocument();
+    expect(screen.queryByText("Question for forecast-1")).not.toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "実績結果" })).toHaveValue(
+      "forecast-2-outcome-yes",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "実績結果で解決" }));
+    await waitFor(() => expect(resolveBodies).toHaveLength(1));
+    expect(resolveBodies[0]).toMatchObject({
+      outcome_id: "forecast-2-outcome-yes",
+      resolution_notes: null,
+    });
   });
 
   it("separates pack submission from a backend-running research pack", async () => {
