@@ -55,7 +55,13 @@ from api.forecast.schemas import (
     ToolProfile,
 )
 from api.research.query_policy import contains_sensitive_terms
-from api.research.schemas import CreateResearchRunRequest, ResearchRunOptions, RunStatus, utc_now
+from api.research.schemas import (
+    CreateResearchRunRequest,
+    ResearchAttempt,
+    ResearchRunOptions,
+    RunStatus,
+    utc_now,
+)
 from api.research.service import ResearchOrchestrator
 
 
@@ -312,6 +318,7 @@ class ForecastOrchestrator:
         pack_status = pack["status"]
         run_id = UUID(pack["research_run_id"])
         run = self.research.repository.get_run(run_id)
+        attempts = self.research.repository.get_attempts(run_id)
         if pack_status == "completed":
             effective_status = "completed"
         elif run.status == RunStatus.COMPLETED:
@@ -344,6 +351,7 @@ class ForecastOrchestrator:
                 fallback=run.estimated_cost_usd,
             ),
             done_reason=run.done_reason,
+            last_error=_current_research_attempt_error(attempts, effective_status),
             needs_human_review=run.needs_human_review,
         )
 
@@ -1563,6 +1571,21 @@ def _parse_dt_required(value: str) -> Any:
 
 def _is_stale_timestamp(value: str, *, seconds: int) -> bool:
     return (utc_now() - _parse_dt_required(value)).total_seconds() >= seconds
+
+
+def _current_research_attempt_error(
+    attempts: list[ResearchAttempt],
+    effective_status: str,
+) -> str | None:
+    if effective_status not in {
+        RunStatus.CANCELLED.value,
+        RunStatus.FAILED.value,
+        RunStatus.NEEDS_HUMAN_REVIEW.value,
+    }:
+        return None
+    if not attempts or not attempts[-1].error:
+        return None
+    return attempts[-1].error[:1000]
 
 
 def _json_load(value: str | None) -> Any:

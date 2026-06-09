@@ -619,6 +619,7 @@ export interface ForecastCurrentResearchPack {
   total_tool_calls: number;
   estimated_cost_usd: number;
   done_reason?: string | null;
+  last_error?: string | null;
   needs_human_review: boolean;
 }
 

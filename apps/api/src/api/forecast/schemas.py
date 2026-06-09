@@ -270,6 +270,7 @@ class ForecastCurrentResearchPack(BaseModel):
     total_tool_calls: int = 0
     estimated_cost_usd: float = 0.0
     done_reason: str | None = None
+    last_error: str | None = None
     needs_human_review: bool = False
 
 

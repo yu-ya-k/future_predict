@@ -1806,11 +1806,105 @@ async def test_research_pack_submit_failure_remains_visible_on_forecast(
         assert pack_detail["effective_status"] == "needs_human_review"
         assert pack_detail["research_run_status"] == "needs_human_review"
         assert pack_detail["done_reason"] == "deep_research_submit_failed"
+        assert pack_detail["last_error"] == "RuntimeError('remote submit failed')"
         assert pack_detail["needs_human_review"] is True
 
         delete_response = await client.delete(f"/research-runs/{run_id}")
         assert delete_response.status_code == 409
         assert "forecast_linked_research_run" in str(delete_response.json()["detail"])
+
+
+@pytest.mark.anyio
+async def test_research_pack_completed_hides_old_attempt_error(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will completed packs hide old submit errors?",
+                "resolution_criteria": "Resolve from public evidence.",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+        assert create.status_code == 202
+        forecast_id = UUID(create.json()["forecast_id"])
+        approve = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={"action": "approve_framing"},
+        )
+        assert approve.status_code == 200
+
+        run = research.create_run_record(
+            CreateResearchRunRequest(
+                user_prompt="completed pack prompt",
+                options=ResearchRunOptions(max_total_tool_calls=3),
+            ),
+            forecast_mode=True,
+        )
+        research.repository.add_attempt(
+            run.id,
+            ResearchAttempt(
+                run_no=1,
+                response_id=None,
+                status="failed_to_submit",
+                model="test-deployment",
+                prompt="completed pack prompt",
+                error="APITimeoutError('Request timed out.')",
+            ),
+        )
+        research.repository.add_attempt(
+            run.id,
+            ResearchAttempt(
+                run_no=2,
+                response_id="resp_completed",
+                status="completed",
+                model="test-deployment",
+                prompt="completed pack prompt",
+                report="Completed report",
+            ),
+        )
+        research.repository.update_run(
+            run.id,
+            status=RunStatus.COMPLETED,
+            report="Completed report",
+            done_reason="completed_passed_review",
+            needs_human_review=False,
+        )
+        policy_decision_id = forecast.repository.add_policy_decision(
+            forecast_id=forecast_id,
+            profile="public",
+            status="allowed",
+            reason=None,
+            prompt_hash="completed-pack-prompt-hash",
+        )
+        forecast.repository.add_research_pack(
+            forecast_id=forecast_id,
+            research_run_id=run.id,
+            pack_role="current_state",
+            tool_profile="public",
+            status="completed",
+            model_deployment="test-deployment",
+            prompt_version="completed-pack-test",
+            max_tool_calls=3,
+            policy_decision_id=policy_decision_id,
+        )
+
+        detail = await client.get(f"/forecasts/{forecast_id}")
+        assert detail.status_code == 200
+        pack_detail = detail.json()["current_research_pack"]
+        assert pack_detail["effective_status"] == "completed"
+        assert pack_detail["research_run_status"] == "completed"
+        assert pack_detail["last_error"] is None
 
 
 @pytest.mark.anyio

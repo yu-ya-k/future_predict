@@ -352,11 +352,11 @@ function deriveCurrentStep({
     return {
       title,
       description:
-        "Research runの詳細で原因や人手確認の要否を確認し、必要な対応後にこの画面で状態を再確認してください。",
+        "Research runの詳細で原因や人手確認の要否を確認してください。対応後にこの画面へ戻ると最新状態を確認できます。",
       stateLabel: packStatusLabel(currentResearchPackStatus),
       tone: "blocked",
-      action: "refresh",
-      actionLabel: "状態を再確認",
+      action: "researchRun",
+      actionLabel: "Research run詳細",
     };
   }
 
@@ -1088,6 +1088,9 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     currentResearchPack?.done_reason
       ? { label: "完了理由", value: currentResearchPack.done_reason }
       : null,
+    currentResearchPack?.last_error
+      ? { label: "エラー詳細", value: currentResearchPack.last_error }
+      : null,
     currentResearchPack?.needs_human_review
       ? { label: "人による確認", value: "必要" }
       : null,
@@ -1184,20 +1187,18 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
               <Link to={researchRunPath} className="btn-primary">
                 {currentStep.actionLabel}
               </Link>
+            ) : currentStep.action === "researchRun" ? (
+              <button type="button" className="btn-primary" disabled>
+                Research run未登録
+              </button>
             ) : (
               <button
                 type="button"
                 className="btn-primary"
                 disabled={!!busy && currentStep.action !== "refresh"}
-                onClick={() =>
-                  handleCurrentStepAction(
-                    currentStep.action === "researchRun" ? "refresh" : currentStep.action,
-                  )
-                }
+                onClick={() => handleCurrentStepAction(currentStep.action)}
               >
-                {currentStep.action === "researchRun"
-                  ? "状態を再確認"
-                  : currentStep.actionLabel}
+                {currentStep.actionLabel}
               </button>
             )}
           </div>

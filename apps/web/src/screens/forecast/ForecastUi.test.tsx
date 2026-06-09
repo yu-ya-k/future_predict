@@ -149,6 +149,7 @@ function currentResearchPack(
     total_tool_calls: 0,
     estimated_cost_usd: 0,
     done_reason: null,
+    last_error: null,
     needs_human_review: false,
     ...overrides,
   };
@@ -2153,7 +2154,6 @@ describe("Forecast UI", () => {
 
   it("does not show a needs_human_review research pack as running in the flow", async () => {
     window.location.hash = "#/forecasts/forecast-1";
-    let forecastGetCount = 0;
     const fetchMock = vi.fn(
       async (url: string | URL | Request, init?: RequestInit) => {
         const path = String(url).replace("http://localhost:8000", "");
@@ -2161,7 +2161,6 @@ describe("Forecast UI", () => {
           path === "/forecasts/forecast-1" &&
           (!init || init.method === "GET")
         ) {
-          forecastGetCount += 1;
           return jsonResponse(
             forecastDetail({
               status: "pack_running",
@@ -2180,6 +2179,7 @@ describe("Forecast UI", () => {
                 total_tool_calls: 18,
                 estimated_cost_usd: 1.7,
                 done_reason: "human_review_required",
+                last_error: "APITimeoutError('Request timed out.')",
                 needs_human_review: true,
               },
               current_research_pack_status: "needs_human_review",
@@ -2215,11 +2215,16 @@ describe("Forecast UI", () => {
     expect(screen.getAllByText("公開情報フェーズ").length).toBeGreaterThan(0);
     expect(screen.getAllByText("要確認").length).toBeGreaterThan(0);
     expect(screen.getByText(/human_review_required/)).toBeInTheDocument();
+    expect(screen.getByText(/APITimeoutError/)).toBeInTheDocument();
+    const currentStep = screen.getByRole("region", {
+      name: "公開情報の収集に確認が必要です",
+    });
     expect(
-      screen.getByRole("button", { name: "状態を再確認" }),
-    ).toBeEnabled();
-    await userEvent.click(screen.getByRole("button", { name: "状態を再確認" }));
-    await waitFor(() => expect(forecastGetCount).toBeGreaterThan(1));
+      within(currentStep).getByRole("link", { name: "Research run詳細" }),
+    ).toHaveAttribute("href", "#/runs/run-1");
+    expect(
+      within(currentStep).queryByRole("button", { name: "状態を再確認" }),
+    ).toBeNull();
     expect(
       screen.queryByRole("button", { name: "証拠抽出" }),
     ).toBeNull();
@@ -2299,7 +2304,13 @@ describe("Forecast UI", () => {
       expect(screen.getAllByText("公開情報フェーズ").length).toBeGreaterThan(0);
       expect(screen.getAllByText(packStatus).length).toBeGreaterThan(0);
       expect(screen.getByText(doneReason)).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "状態を再確認" })).toBeEnabled();
+      const currentStep = screen.getByRole("region", { name: title });
+      expect(
+        within(currentStep).getByRole("link", { name: "Research run詳細" }),
+      ).toHaveAttribute("href", "#/runs/run-1");
+      expect(
+        within(currentStep).queryByRole("button", { name: "状態を再確認" }),
+      ).toBeNull();
     },
   );
 
