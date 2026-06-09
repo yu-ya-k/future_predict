@@ -17,6 +17,13 @@ def _dump(value: Any) -> str:
 
 
 IDEMPOTENCY_IN_PROGRESS = "__forecast_idempotency_in_progress__"
+_UNSET = object()
+
+
+class ResearchPackAlreadyExists(Exception):
+    def __init__(self, existing_pack: sqlite3.Row) -> None:
+        super().__init__("research_pack_already_exists")
+        self.existing_pack = existing_pack
 
 
 def _load(value: str | None, default: Any) -> Any:
@@ -36,6 +43,14 @@ def _parse_dt(value: str | None) -> datetime | None:
 
 def _parse_date(value: str | None) -> date | None:
     return date.fromisoformat(value) if value else None
+
+
+def _is_phase_a_research_pack_unique_error(error: sqlite3.IntegrityError) -> bool:
+    message = str(error)
+    return (
+        "UNIQUE constraint failed: forecast_research_packs.forecast_id, "
+        "forecast_research_packs.pack_role, forecast_research_packs.tool_profile"
+    ) in message
 
 
 class ForecastRepository:
@@ -751,30 +766,44 @@ class ForecastRepository:
         pack_id = uuid4()
         now = utc_now().isoformat()
         with self.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO forecast_research_packs (
-                    pack_id, forecast_id, research_run_id, pack_role, tool_profile,
-                    status, model_deployment, prompt_version, max_tool_calls,
-                    policy_decision_id, created_at, updated_at
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO forecast_research_packs (
+                        pack_id, forecast_id, research_run_id, pack_role, tool_profile,
+                        status, model_deployment, prompt_version, max_tool_calls,
+                        policy_decision_id, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(pack_id),
+                        str(forecast_id),
+                        str(research_run_id),
+                        pack_role,
+                        tool_profile,
+                        status,
+                        model_deployment,
+                        prompt_version,
+                        max_tool_calls,
+                        str(policy_decision_id),
+                        now,
+                        now,
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(pack_id),
-                    str(forecast_id),
-                    str(research_run_id),
-                    pack_role,
-                    tool_profile,
-                    status,
-                    model_deployment,
-                    prompt_version,
-                    max_tool_calls,
-                    str(policy_decision_id),
-                    now,
-                    now,
-                ),
-            )
+            except sqlite3.IntegrityError as error:
+                if not _is_phase_a_research_pack_unique_error(error):
+                    raise
+                existing = connection.execute(
+                    """
+                    SELECT * FROM forecast_research_packs
+                    WHERE forecast_id = ? AND pack_role = ? AND tool_profile = ?
+                    """,
+                    (str(forecast_id), pack_role, tool_profile),
+                ).fetchone()
+                if existing is None:
+                    raise
+                raise ResearchPackAlreadyExists(existing) from error
             connection.execute(
                 """
                 UPDATE forecast_forecasts
@@ -813,21 +842,48 @@ class ForecastRepository:
                 (str(forecast_id),),
             ).fetchall()
 
+    def update_research_pack_status(
+        self,
+        *,
+        pack_id: UUID,
+        status: str,
+        report_artifact_hash: str | None | object = _UNSET,
+    ) -> sqlite3.Row:
+        now = utc_now().isoformat()
+        assignments = ["status = ?", "updated_at = ?"]
+        values: list[Any] = [status, now]
+        if report_artifact_hash is not _UNSET:
+            assignments.append("report_artifact_hash = ?")
+            values.append(report_artifact_hash)
+        values.append(str(pack_id))
+        with self.connect() as connection:
+            connection.execute(
+                f"""
+                UPDATE forecast_research_packs
+                SET {", ".join(assignments)}
+                WHERE pack_id = ?
+                """,
+                values,
+            )
+            row = connection.execute(
+                "SELECT * FROM forecast_research_packs WHERE pack_id = ?",
+                (str(pack_id),),
+            ).fetchone()
+        if row is None:
+            raise KeyError(str(pack_id))
+        return row
+
     def mark_pack_completed(
         self,
         *,
         pack_id: UUID,
         report_artifact_hash: str | None,
     ) -> None:
-        with self.connect() as connection:
-            connection.execute(
-                """
-                UPDATE forecast_research_packs
-                SET status = 'completed', report_artifact_hash = ?, updated_at = ?
-                WHERE pack_id = ?
-                """,
-                (report_artifact_hash, utc_now().isoformat(), str(pack_id)),
-            )
+        self.update_research_pack_status(
+            pack_id=pack_id,
+            status="completed",
+            report_artifact_hash=report_artifact_hash,
+        )
 
     def replace_evidence(
         self,

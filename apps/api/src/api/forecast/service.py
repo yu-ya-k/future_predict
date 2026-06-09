@@ -24,7 +24,7 @@ from api.forecast.probability.phase_a_v1 import (
     multiclass_brier,
     snapshot_hash,
 )
-from api.forecast.repository import ForecastRepository
+from api.forecast.repository import ForecastRepository, ResearchPackAlreadyExists
 from api.forecast.research_packs import (
     CURRENT_STATE_PROMPT_VERSION,
     build_current_state_prompt,
@@ -206,7 +206,12 @@ class ForecastOrchestrator:
             )
         ]
         packs = self.repository.list_packs(forecast_id)
-        current_pack = self._current_research_pack_summary(packs[-1]) if packs else None
+        current_pack_row = self._reconcile_research_pack(packs[-1]) if packs else None
+        current_pack = (
+            self._current_research_pack_summary(current_pack_row)
+            if current_pack_row is not None
+            else None
+        )
         return ForecastDetail(
             **base,
             outcomes=outcomes,
@@ -221,6 +226,48 @@ class ForecastOrchestrator:
 
     def _current_research_pack_status(self, pack: Any) -> str | None:
         return self._current_research_pack_summary(pack).effective_status
+
+    def _reconcile_research_pack(self, pack: Any) -> Any:
+        pack_status = pack["status"]
+        if pack_status == "completed":
+            return pack
+        run = self.research.repository.get_run(UUID(pack["research_run_id"]))
+        if (
+            run.status == RunStatus.WAITING_DEEP_RESEARCH
+            and run.pending_deep_research_response_id is None
+        ):
+            run = (
+                self.research.repository.update_run_if_status(
+                    run.id,
+                    {RunStatus.WAITING_DEEP_RESEARCH},
+                    status=RunStatus.NEEDS_HUMAN_REVIEW,
+                    needs_human_review=True,
+                    pending_deep_research_response_id=None,
+                    done_reason="missing_deep_research_response_id",
+                )
+                or self.research.repository.get_run(run.id)
+            )
+        if run.status == RunStatus.COMPLETED:
+            report = (run.final_report or run.report or "").strip()
+            return self.repository.update_research_pack_status(
+                pack_id=UUID(pack["pack_id"]),
+                status="completed",
+                report_artifact_hash=(
+                    hashlib.sha256(report.encode("utf-8")).hexdigest()
+                    if report
+                    else None
+                ),
+            )
+        if run.status in {
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.NEEDS_HUMAN_REVIEW,
+        } and pack_status != run.status.value:
+            return self.repository.update_research_pack_status(
+                pack_id=UUID(pack["pack_id"]),
+                status=run.status.value,
+            )
+        return pack
 
     def _current_research_pack_summary(self, pack: Any) -> ForecastCurrentResearchPack:
         pack_status = pack["status"]
@@ -331,11 +378,6 @@ class ForecastOrchestrator:
                 "framing_not_approved",
                 "Approve the latest framing before dispatching research packs.",
             )
-        if forecast.status != ForecastStatus.FRAMING_APPROVED:
-            raise ForecastConflict(
-                "forecast_already_started",
-                "A PhaseA research pack can only be dispatched once.",
-            )
         if forecast.confidentiality_class != "public":
             raise ForecastConflict(
                 "policy_requires_revision",
@@ -351,9 +393,11 @@ class ForecastOrchestrator:
             )
         existing = self.repository.list_packs(forecast_id)
         if existing:
+            return _pack_response(self._reconcile_research_pack(existing[-1]))
+        if forecast.status != ForecastStatus.FRAMING_APPROVED:
             raise ForecastConflict(
                 "forecast_already_started",
-                "A PhaseA research pack already exists for this forecast.",
+                "A PhaseA research pack can only be dispatched once.",
             )
         prompt = build_current_state_prompt(forecast)
         policy = evaluate_forecast_policy(prompt, profile=request.tool_profile.value)
@@ -377,40 +421,66 @@ class ForecastOrchestrator:
                 {"policy_decision_id": str(policy_decision_id)},
             )
 
-        run = self.research.create_run(
+        run = self.research.create_run_record(
             CreateResearchRunRequest(
                 user_prompt=prompt,
                 options=ResearchRunOptions(max_total_tool_calls=request.max_tool_calls),
             ),
             forecast_mode=True,
+        )
+        try:
+            pack = self.repository.add_research_pack(
+                forecast_id=forecast_id,
+                research_run_id=run.id,
+                pack_role=request.pack_role.value,
+                tool_profile=request.tool_profile.value,
+                status="submitting",
+                model_deployment=getattr(
+                    self.research.azure,
+                    "deep_research_deployment",
+                    None,
+                ),
+                prompt_version=CURRENT_STATE_PROMPT_VERSION,
+                max_tool_calls=request.max_tool_calls,
+                policy_decision_id=policy_decision_id,
+            )
+        except ResearchPackAlreadyExists as error:
+            self.research.repository.delete_run(run.id)
+            return _pack_response(self._reconcile_research_pack(error.existing_pack))
+        submitted = self.research.submit_deep_research(
+            run.id,
             tool_profile="public",
             background=self.settings.forecast_background_mode_enabled,
             policy_decision_id=str(policy_decision_id),
         )
-        if (
-            run.status != RunStatus.WAITING_DEEP_RESEARCH
-            or run.pending_deep_research_response_id is None
-        ):
-            raise ForecastConflict(
-                "policy_requires_revision",
-                "Forecast research pack did not enter Deep Research collection.",
-                {
-                    "research_run_id": str(run.id),
-                    "status": run.status.value,
-                    "done_reason": run.done_reason,
-                },
+        if submitted.status == RunStatus.WAITING_DEEP_RESEARCH:
+            if submitted.pending_deep_research_response_id:
+                pack = self.repository.update_research_pack_status(
+                    pack_id=UUID(pack["pack_id"]),
+                    status="running",
+                )
+            else:
+                submitted = (
+                    self.research.repository.update_run_if_status(
+                        submitted.id,
+                        {RunStatus.WAITING_DEEP_RESEARCH},
+                        status=RunStatus.NEEDS_HUMAN_REVIEW,
+                        needs_human_review=True,
+                        pending_deep_research_response_id=None,
+                        done_reason="missing_deep_research_response_id",
+                    )
+                    or self.research.repository.get_run(submitted.id)
+                )
+        if submitted.status in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.NEEDS_HUMAN_REVIEW,
+        }:
+            pack = self.repository.update_research_pack_status(
+                pack_id=UUID(pack["pack_id"]),
+                status=submitted.status.value,
             )
-        pack = self.repository.add_research_pack(
-            forecast_id=forecast_id,
-            research_run_id=run.id,
-            pack_role=request.pack_role.value,
-            tool_profile=request.tool_profile.value,
-            status="running",
-            model_deployment=getattr(self.research.azure, "deep_research_deployment", None),
-            prompt_version=CURRENT_STATE_PROMPT_VERSION,
-            max_tool_calls=request.max_tool_calls,
-            policy_decision_id=policy_decision_id,
-        )
         return _pack_response(pack)
 
     def extract_evidence(self, forecast_id: UUID) -> tuple[list[SourceRecord], list[ClaimRecord]]:

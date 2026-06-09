@@ -43,6 +43,8 @@ type CurrentStepAction =
   | "resolvePanel"
   | null;
 
+const PACK_SUBMISSION_POLL_MS = 1_000;
+
 interface CurrentStepModel {
   title: string;
   description: string;
@@ -125,6 +127,8 @@ function forecastStatusLabel(status: ForecastStatus | undefined): string {
 
 function packStatusLabel(status: string | null | undefined): string {
   switch (status) {
+    case "submitting":
+      return "サーバーに登録中";
     case "running":
       return "実行中";
     case "completed":
@@ -147,15 +151,17 @@ function packFlowMeta({
   currentResearchPackStatus,
   researchPackCompleted,
   researchPackRunning,
+  researchPackSubmitting,
   packSubmissionPending,
 }: {
   currentResearchPackStatus: string | null | undefined;
   researchPackCompleted: boolean;
   researchPackRunning: boolean;
+  researchPackSubmitting: boolean;
   packSubmissionPending: boolean;
 }): string {
   if (researchPackRunning) return "公開情報を収集中";
-  if (packSubmissionPending) return "サーバーに登録中";
+  if (researchPackSubmitting || packSubmissionPending) return "サーバーに登録中";
   if (researchPackCompleted) return "収集完了";
   switch (currentResearchPackStatus) {
     case "needs_human_review":
@@ -188,6 +194,7 @@ function deriveCurrentStep({
   currentResearchPackPresent,
   packSubmissionPending,
   packSubmissionIsSlow,
+  researchPackSubmitting,
   researchPackRunning,
   researchPackCompleted,
   researchPackBlocked,
@@ -207,6 +214,7 @@ function deriveCurrentStep({
   currentResearchPackPresent: boolean;
   packSubmissionPending: boolean;
   packSubmissionIsSlow: boolean;
+  researchPackSubmitting: boolean;
   researchPackRunning: boolean;
   researchPackCompleted: boolean;
   researchPackBlocked: boolean;
@@ -234,15 +242,27 @@ function deriveCurrentStep({
   if (packSubmissionPending) {
     return {
       title: packSubmissionIsSlow
-        ? "登録結果をまだ確認できません"
+        ? "サーバー応答待ち。まだForecast Packは確認できません"
         : "公開情報をサーバーに登録中",
       description: packSubmissionIsSlow
-        ? "Research Packの作成リクエストは継続中の可能性があります。状態を再確認し、Research run IDが発行されているか確認してください。"
+        ? "Research Pack作成リクエストへの応答を待っています。最新状態は自動で確認しています。"
         : "Research Packを作成するリクエストを送っています。登録されるとResearch run IDと開始時刻が表示されます。",
       stateLabel: "サーバーに登録中",
-      tone: packSubmissionIsSlow ? "blocked" : "running",
+      tone: "running",
       action: "refresh",
       actionLabel: "状態を再確認",
+    };
+  }
+
+  if (researchPackSubmitting) {
+    return {
+      title: "公開情報をサーバーに登録中",
+      description:
+        "Forecast Packはサーバー側で登録処理中です。Research run IDがある場合は詳細を確認できます。",
+      stateLabel: "サーバーに登録中",
+      tone: "running",
+      action: "researchRun",
+      actionLabel: "Research runを開く",
     };
   }
 
@@ -415,6 +435,7 @@ function forecastExecutionNodes({
   researchPackCompleted,
   researchPackRunning,
   researchPackBlocked,
+  researchPackSubmitting,
   currentResearchPackStatus,
   claimTargetsApproved,
   hasEstimate,
@@ -427,6 +448,7 @@ function forecastExecutionNodes({
   researchPackCompleted: boolean;
   researchPackRunning: boolean;
   researchPackBlocked: boolean;
+  researchPackSubmitting: boolean;
   currentResearchPackStatus: string | null | undefined;
   claimTargetsApproved: boolean;
   hasEstimate: boolean;
@@ -454,12 +476,13 @@ function forecastExecutionNodes({
         currentResearchPackStatus,
         researchPackCompleted,
         researchPackRunning,
+        researchPackSubmitting,
         packSubmissionPending,
       }),
       status: flowStatus({
         done: researchPackCompleted || statusAtLeast(status, "evidence_ready"),
         active: researchPackRunning,
-        submitting: packSubmissionPending,
+        submitting: researchPackSubmitting || packSubmissionPending,
         blocked: researchPackBlocked,
         available: status === "framing_approved",
       }),
@@ -577,6 +600,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     } else {
       setEstimate(null);
     }
+    setError(null);
   }, [forecastId]);
 
   useEffect(() => {
@@ -593,10 +617,10 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     currentResearchPackStatus === "failed" ||
     currentResearchPackStatus === "cancelled" ||
     currentResearchPackStatus === "needs_human_review";
+  const researchPackSubmitting = currentResearchPackStatus === "submitting";
   const researchPackRunning =
     status === "pack_running" && currentResearchPackStatus === "running";
-  const packSubmissionPending =
-    busy === "pack" && !currentResearchPack && status === "framing_approved";
+  const packSubmissionPending = busy === "pack" && !currentResearchPack;
   const packSubmissionElapsed = useElapsed(
     packSubmissionPending ? (busyStartedAt ?? undefined) : undefined,
     packSubmissionPending,
@@ -613,13 +637,29 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     ? routes().monitor(currentResearchPack.research_run_id)
     : null;
 
+  const shouldPollCurrentResearchPack = researchPackRunning || researchPackSubmitting;
+
   useEffect(() => {
-    if (!researchPackRunning) return undefined;
+    if (!shouldPollCurrentResearchPack) return undefined;
     const interval = window.setInterval(() => {
       void load().catch((err) => setError(formatForecastError(err)));
-    }, 3_000);
+    }, researchPackSubmitting ? PACK_SUBMISSION_POLL_MS : 3_000);
     return () => window.clearInterval(interval);
-  }, [researchPackRunning, load]);
+  }, [shouldPollCurrentResearchPack, researchPackSubmitting, load]);
+
+  useEffect(() => {
+    if (busy !== "pack" || currentResearchPack) return undefined;
+    const interval = window.setInterval(() => {
+      void load().catch((err) => setError(formatForecastError(err)));
+    }, PACK_SUBMISSION_POLL_MS);
+    return () => window.clearInterval(interval);
+  }, [busy, currentResearchPack, load]);
+
+  useEffect(() => {
+    if (busy !== "pack" || !currentResearchPack) return;
+    setBusy(null);
+    setBusyStartedAt(null);
+  }, [busy, currentResearchPack]);
 
   useEffect(() => {
     if (!selectedOutcomeId && forecast?.outcomes[0]) {
@@ -752,6 +792,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     researchPackCompleted,
     researchPackRunning,
     researchPackBlocked,
+    researchPackSubmitting,
     currentResearchPackStatus,
     claimTargetsApproved: effectiveClaimTargetsApproved,
     hasEstimate: Boolean(estimate),
@@ -765,6 +806,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     currentResearchPackPresent: Boolean(currentResearchPack),
     packSubmissionPending,
     packSubmissionIsSlow,
+    researchPackSubmitting,
     researchPackRunning,
     researchPackCompleted,
     researchPackBlocked,

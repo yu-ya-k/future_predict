@@ -1,6 +1,7 @@
 import {
   act,
   cleanup,
+  fireEvent,
   render,
   screen,
   waitFor,
@@ -13,6 +14,7 @@ import { App } from "../../App";
 import type {
   EstimateSetResponse,
   ForecastCreateRequest,
+  ForecastCurrentResearchPack,
   ForecastDetail,
   ForecastFramingDraft,
   ForecastFramingDraftClarifyingQuestion,
@@ -126,6 +128,28 @@ function estimateSet(
         components: { clamp_applied: false },
       },
     ],
+    ...overrides,
+  };
+}
+
+function currentResearchPack(
+  overrides: Partial<ForecastCurrentResearchPack> = {},
+): ForecastCurrentResearchPack {
+  return {
+    pack_id: "pack-1",
+    research_run_id: "run-1",
+    pack_status: "running",
+    effective_status: "running",
+    research_run_status: "waiting_deep_research",
+    pack_created_at: "2026-06-08T00:00:00Z",
+    pack_updated_at: "2026-06-08T00:00:00Z",
+    research_run_created_at: "2026-06-08T00:00:00Z",
+    research_run_updated_at: "2026-06-08T00:00:00Z",
+    deep_research_started_at: null,
+    total_tool_calls: 0,
+    estimated_cost_usd: 0,
+    done_reason: null,
+    needs_human_review: false,
     ...overrides,
   };
 }
@@ -1411,6 +1435,336 @@ describe("Forecast UI", () => {
     expect(
       screen.getByRole("link", { name: "Research runを開く" }),
     ).toHaveAttribute("href", "#/runs/run-1");
+  });
+
+  it("polls pending pack submission until the current research pack appears", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    vi.useFakeTimers();
+    const packRequest = deferred<Response>();
+    let forecastGetCount = 0;
+    let packRequestStarted = false;
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          forecastGetCount += 1;
+          return jsonResponse(
+            forecastDetail({
+              status: packRequestStarted ? "pack_running" : "framing_approved",
+              approved_framing_version: 1,
+              current_research_pack: packRequestStarted
+                ? {
+                    pack_id: "pack-1",
+                    research_run_id: "run-1",
+                    pack_status: "completed",
+                    effective_status: "completed",
+                    research_run_status: "completed",
+                    pack_created_at: "2026-06-08T00:00:00Z",
+                    pack_updated_at: "2026-06-08T00:00:00Z",
+                    research_run_created_at: "2026-06-08T00:00:00Z",
+                    research_run_updated_at: "2026-06-08T01:00:00Z",
+                    deep_research_started_at: "2026-06-08T00:05:00Z",
+                    total_tool_calls: 24,
+                    estimated_cost_usd: 2.5,
+                    done_reason: "forecast_raw_report_collected",
+                    needs_human_review: false,
+                  }
+                : null,
+              current_research_pack_status: packRequestStarted
+                ? "completed"
+                : null,
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/research-packs" &&
+          init?.method === "POST"
+        ) {
+          packRequestStarted = true;
+          return packRequest.promise;
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "公開情報の収集を開始",
+      }),
+    );
+    expect(
+      screen.getByRole("heading", { name: "公開情報をサーバーに登録中" }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.getByRole("heading", { name: "公開情報の収集が完了しました" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "証拠を抽出" }),
+    ).toBeEnabled();
+    expect(forecastGetCount).toBeGreaterThan(1);
+  });
+
+  it("keeps slow pending pack submission copy neutral", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    vi.useFakeTimers();
+    const packRequest = deferred<Response>();
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: "framing_approved",
+              approved_framing_version: 1,
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/research-packs" &&
+          init?.method === "POST"
+        ) {
+          return packRequest.promise;
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "公開情報の収集を開始",
+      }),
+    );
+    expect(
+      screen.getByRole("heading", { name: "公開情報をサーバーに登録中" }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(31_000);
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.getByRole("heading", {
+        name: "サーバー応答待ち。まだForecast Packは確認できません",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Research Pack作成リクエストへの応答を待っています。最新状態は自動で確認しています。",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a submitting current research pack as server registration", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: "pack_running",
+              approved_framing_version: 1,
+              current_research_pack: {
+                pack_id: "pack-1",
+                research_run_id: "run-1",
+                pack_status: "running",
+                effective_status: "submitting",
+                research_run_status: "queued",
+                pack_created_at: "2026-06-08T00:00:00Z",
+                pack_updated_at: "2026-06-08T00:00:00Z",
+                research_run_created_at: "2026-06-08T00:00:00Z",
+                research_run_updated_at: "2026-06-08T00:00:00Z",
+                deep_research_started_at: null,
+                total_tool_calls: 0,
+                estimated_cost_usd: 0,
+                done_reason: null,
+                needs_human_review: false,
+              },
+              current_research_pack_status: "running",
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    const flow = await screen.findByRole("region", {
+      name: "全体フロー",
+    });
+    const flowList = within(flow).getByRole("list", {
+      name: "Forecast実行フロー",
+    });
+    const flowItems = within(flowList)
+      .getAllByRole("listitem")
+      .filter((item) => item.parentElement === flowList);
+    const packItem = flowItems[1];
+    expect(within(packItem).getByText("登録中")).toBeInTheDocument();
+    expect(within(packItem).getByText("サーバーに登録中")).toBeInTheDocument();
+    expect(within(packItem).queryByText("実行中")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "公開情報をサーバーに登録中" }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("サーバーに登録中").length).toBeGreaterThan(0);
+    expect(
+      screen.queryByRole("heading", { name: "公開情報を収集中です" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("polls a submitting current research pack until it starts running", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    vi.useFakeTimers();
+    let forecastGetCount = 0;
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          forecastGetCount += 1;
+          const effectiveStatus =
+            forecastGetCount === 1 ? "submitting" : "running";
+          return jsonResponse(
+            forecastDetail({
+              status: "pack_running",
+              approved_framing_version: 1,
+              current_research_pack: currentResearchPack({
+                effective_status: effectiveStatus,
+                research_run_status:
+                  effectiveStatus === "submitting"
+                    ? "queued"
+                    : "waiting_deep_research",
+              }),
+              current_research_pack_status: effectiveStatus,
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(
+      screen.getByRole("heading", { name: "公開情報をサーバーに登録中" }),
+    ).toBeInTheDocument();
+    expect(forecastGetCount).toBe(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.getByRole("heading", { name: "公開情報を収集中です" }),
+    ).toBeInTheDocument();
+    expect(forecastGetCount).toBe(2);
+  });
+
+  it("clears a stale poll error after a successful current pack transition", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    vi.useFakeTimers();
+    let forecastGetCount = 0;
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          forecastGetCount += 1;
+          if (forecastGetCount === 2) {
+            return jsonResponse({ detail: "temporary poll failure" }, 503);
+          }
+          const effectiveStatus =
+            forecastGetCount === 1 ? "submitting" : "running";
+          return jsonResponse(
+            forecastDetail({
+              status: "pack_running",
+              approved_framing_version: 1,
+              current_research_pack: currentResearchPack({
+                effective_status: effectiveStatus,
+                research_run_status:
+                  effectiveStatus === "submitting"
+                    ? "queued"
+                    : "waiting_deep_research",
+              }),
+              current_research_pack_status: effectiveStatus,
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(
+      screen.getByRole("heading", { name: "公開情報をサーバーに登録中" }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "temporary poll failure",
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.getByRole("heading", { name: "公開情報を収集中です" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(forecastGetCount).toBe(3);
   });
 
   it("keeps pack_running on the research pack node without enabling evidence extraction", async () => {

@@ -137,7 +137,7 @@ async def test_phase_a_forecast_research_pack_completes_through_poller(
         detail_after_poll_json = cast(dict[str, Any], detail_after_poll.json())
         pack_detail = cast(dict[str, Any], detail_after_poll_json["current_research_pack"])
         assert detail_after_poll_json["current_research_pack_status"] == "completed"
-        assert pack_detail["pack_status"] == "running"
+        assert pack_detail["pack_status"] == "completed"
         assert pack_detail["effective_status"] == "completed"
         assert pack_detail["research_run_status"] == "completed"
         assert pack_detail["done_reason"] == "forecast_raw_report_collected"
@@ -327,7 +327,7 @@ async def test_phase_a_remote_failed_research_surfaces_as_pack_not_completed(
         pack_detail = cast(dict[str, Any], detail_json["current_research_pack"])
         assert pack_detail["research_run_id"] == str(run_id)
         assert detail_json["current_research_pack_status"] == "needs_human_review"
-        assert pack_detail["pack_status"] == "running"
+        assert pack_detail["pack_status"] == "needs_human_review"
         assert pack_detail["effective_status"] == "needs_human_review"
         assert pack_detail["research_run_status"] == "needs_human_review"
         assert pack_detail["done_reason"] == "deep_research_failed"
@@ -335,7 +335,7 @@ async def test_phase_a_remote_failed_research_surfaces_as_pack_not_completed(
 
         pack_rows = stack.forecast.repository.list_packs(forecast_id)
         assert len(pack_rows) == 1
-        assert pack_rows[0]["status"] == "running"
+        assert pack_rows[0]["status"] == "needs_human_review"
         assert pack_rows[0]["report_artifact_hash"] is None
 
         evidence = await client.post(f"/forecasts/{forecast_id}/evidence/extract")

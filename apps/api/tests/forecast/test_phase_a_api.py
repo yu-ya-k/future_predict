@@ -30,6 +30,7 @@ from api.main import create_app
 from api.research.artifacts import ArtifactStore
 from api.research.dependencies import get_research_orchestrator
 from api.research.repository import ResearchRepository
+from api.research.schemas import CreateResearchRunRequest, ResearchRunOptions, RunStatus
 from api.research.service import ResearchOrchestrator
 from research_fakes import IntegrationFakeAzure
 
@@ -77,6 +78,29 @@ def _request_hash(payload: object) -> str:
             default=str,
         ).encode("utf-8")
     ).hexdigest()
+
+
+class _MissingResponseIdFakeAzure(IntegrationFakeAzure):
+    def submit_deep_research(
+        self,
+        *,
+        prompt: str,
+        max_tool_calls: int,
+        tool_profile: str = "public",
+        background: bool = True,
+        policy_decision_id: str | None = None,
+        **_: object,
+    ) -> dict[str, object]:
+        self.submit_calls.append(
+            {
+                "prompt": prompt,
+                "max_tool_calls": max_tool_calls,
+                "tool_profile": tool_profile,
+                "background": background,
+                "policy_decision_id": policy_decision_id,
+            }
+        )
+        return {"status": "queued", "output": []}
 
 
 def _framing_draft_payload(
@@ -1297,12 +1321,203 @@ async def test_current_research_pack_effective_status_uses_terminal_research_run
     assert detail_json["current_research_pack_status"] == research_status
     pack_detail = detail_json["current_research_pack"]
     assert pack_detail["research_run_id"] == run_id
-    assert pack_detail["pack_status"] == "running"
+    assert pack_detail["pack_status"] == research_status
     assert pack_detail["effective_status"] == research_status
     assert pack_detail["research_run_status"] == research_status
     assert pack_detail["done_reason"] == done_reason
     assert pack_detail["needs_human_review"] is needs_human_review
     assert pack_detail["deep_research_started_at"]
+
+
+@pytest.mark.anyio
+async def test_research_pack_missing_deep_research_response_id_needs_review(
+    tmp_path: Path,
+) -> None:
+    fake = _MissingResponseIdFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will queued research without response ids be visible?",
+                "resolution_criteria": "Resolve from public evidence.",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+        assert create.status_code == 202
+        forecast_id = create.json()["forecast_id"]
+
+        approve = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={"action": "approve_framing"},
+        )
+        assert approve.status_code == 200
+
+        pack = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={"pack_role": "current_state", "tool_profile": "public"},
+        )
+        assert pack.status_code == 200
+        pack_json = pack.json()
+        assert pack_json["status"] == "needs_human_review"
+        run_id = UUID(pack_json["research_run_id"])
+
+        run = research.repository.get_run(run_id)
+        assert run.status.value == "needs_human_review"
+        assert run.needs_human_review is True
+        assert run.done_reason == "missing_deep_research_response_id"
+        assert run.pending_deep_research_response_id is None
+
+        detail = await client.get(f"/forecasts/{forecast_id}")
+        assert detail.status_code == 200
+        detail_json = detail.json()
+        assert detail_json["current_research_pack_status"] == "needs_human_review"
+        pack_detail = detail_json["current_research_pack"]
+        assert pack_detail["pack_status"] == "needs_human_review"
+        assert pack_detail["effective_status"] == "needs_human_review"
+        assert pack_detail["research_run_status"] == "needs_human_review"
+        assert pack_detail["done_reason"] == "missing_deep_research_response_id"
+        assert pack_detail["needs_human_review"] is True
+
+
+@pytest.mark.anyio
+async def test_forecast_detail_reconciles_legacy_missing_response_id_pack(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will legacy missing response id packs recover on detail?",
+                "resolution_criteria": "Resolve from public evidence.",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+        assert create.status_code == 202
+        forecast_id = UUID(create.json()["forecast_id"])
+        approve = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={"action": "approve_framing"},
+        )
+        assert approve.status_code == 200
+
+        run = research.create_run_record(
+            CreateResearchRunRequest(
+                user_prompt="legacy pack prompt",
+                options=ResearchRunOptions(max_total_tool_calls=3),
+            ),
+            forecast_mode=True,
+        )
+        waiting_run = research.repository.update_run_if_status(
+            run.id,
+            {RunStatus.QUEUED},
+            status=RunStatus.WAITING_DEEP_RESEARCH,
+            needs_human_review=False,
+            pending_deep_research_response_id=None,
+            done_reason=None,
+        )
+        assert waiting_run is not None
+        policy_decision_id = forecast.repository.add_policy_decision(
+            forecast_id=forecast_id,
+            profile="public",
+            status="allowed",
+            reason=None,
+            prompt_hash="legacy-pack-prompt-hash",
+        )
+        forecast.repository.add_research_pack(
+            forecast_id=forecast_id,
+            research_run_id=run.id,
+            pack_role="current_state",
+            tool_profile="public",
+            status="submitting",
+            model_deployment="test-deployment",
+            prompt_version="legacy-test",
+            max_tool_calls=3,
+            policy_decision_id=policy_decision_id,
+        )
+
+        detail = await client.get(f"/forecasts/{forecast_id}")
+        assert detail.status_code == 200
+        detail_json = detail.json()
+        assert detail_json["current_research_pack_status"] == "needs_human_review"
+        pack_detail = detail_json["current_research_pack"]
+        assert pack_detail["pack_status"] == "needs_human_review"
+        assert pack_detail["effective_status"] == "needs_human_review"
+        assert pack_detail["research_run_status"] == "needs_human_review"
+        assert pack_detail["done_reason"] == "missing_deep_research_response_id"
+
+
+@pytest.mark.anyio
+async def test_research_pack_submit_failure_remains_visible_on_forecast(
+    tmp_path: Path,
+) -> None:
+    fake = IntegrationFakeAzure(submit_raises=RuntimeError("remote submit failed"))
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will AI agents handle 30% of support tickets by 2029?",
+                "resolution_criteria": "Resolve from public vendor and benchmark reports.",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+        assert create.status_code == 202
+        forecast_id = create.json()["forecast_id"]
+
+        approve = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={"action": "approve_framing"},
+        )
+        assert approve.status_code == 200
+
+        pack = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={"pack_role": "current_state", "tool_profile": "public"},
+        )
+        assert pack.status_code == 200
+        pack_json = pack.json()
+        assert pack_json["status"] == "needs_human_review"
+        run_id = pack_json["research_run_id"]
+
+        detail = await client.get(f"/forecasts/{forecast_id}")
+        assert detail.status_code == 200
+        detail_json = detail.json()
+        assert detail_json["current_research_pack_status"] == "needs_human_review"
+        pack_detail = detail_json["current_research_pack"]
+        assert pack_detail["research_run_id"] == run_id
+        assert pack_detail["pack_status"] == "needs_human_review"
+        assert pack_detail["effective_status"] == "needs_human_review"
+        assert pack_detail["research_run_status"] == "needs_human_review"
+        assert pack_detail["done_reason"] == "deep_research_submit_failed"
+        assert pack_detail["needs_human_review"] is True
+
+        delete_response = await client.delete(f"/research-runs/{run_id}")
+        assert delete_response.status_code == 409
+        assert "forecast_linked_research_run" in str(delete_response.json()["detail"])
 
 
 @pytest.mark.anyio
@@ -1379,7 +1594,7 @@ async def test_phase_a_forecast_lifecycle_and_forecast_research_mode(
         )
         collected_pack_detail = detail_after_collect.json()["current_research_pack"]
         assert collected_pack_detail["research_run_id"] == run_id
-        assert collected_pack_detail["pack_status"] == "running"
+        assert collected_pack_detail["pack_status"] == "completed"
         assert collected_pack_detail["effective_status"] == "completed"
         assert collected_pack_detail["research_run_status"] == "completed"
         assert collected_pack_detail["done_reason"] == "forecast_raw_report_collected"
@@ -1571,10 +1786,99 @@ async def test_forecast_idempotency_replays_and_conflicts(tmp_path: Path) -> Non
             headers={"Idempotency-Key": "pack-replay"},
             json={"pack_role": "current_state", "tool_profile": "public"},
         )
+        pack_retry = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={"pack_role": "current_state", "tool_profile": "public"},
+        )
         assert pack.status_code == 200
         assert pack_replay.status_code == 200
+        assert pack_retry.status_code == 200
         assert pack_replay.json()["pack_id"] == pack.json()["pack_id"]
+        assert pack_retry.json()["pack_id"] == pack.json()["pack_id"]
         assert len(fake.submit_calls) == 1
+
+
+@pytest.mark.anyio
+async def test_research_pack_unique_race_returns_existing_and_deletes_losing_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        create = await client.post(
+            "/forecasts",
+            json={
+                "question": "Will duplicate forecast pack posts race safely?",
+                "resolution_criteria": "Resolve from public evidence.",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+        assert create.status_code == 202
+        forecast_id = UUID(create.json()["forecast_id"])
+        approve = await client.post(
+            f"/forecasts/{forecast_id}/review",
+            json={"action": "approve_framing"},
+        )
+        assert approve.status_code == 200
+
+        first = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={"pack_role": "current_state", "tool_profile": "public"},
+        )
+        assert first.status_code == 200
+        first_json = first.json()
+
+        with forecast.repository.connect() as connection:
+            connection.execute(
+                """
+                UPDATE forecast_forecasts
+                SET status = 'framing_approved'
+                WHERE id = ?
+                """,
+                (str(forecast_id),),
+            )
+
+        original_list_packs = forecast.repository.list_packs
+        list_pack_calls = 0
+
+        def stale_empty_list_packs(forecast_id_arg: UUID) -> list[sqlite3.Row]:
+            nonlocal list_pack_calls
+            list_pack_calls += 1
+            if list_pack_calls <= 2:
+                return []
+            return original_list_packs(forecast_id_arg)
+
+        monkeypatch.setattr(forecast.repository, "list_packs", stale_empty_list_packs)
+
+        duplicate = await client.post(
+            f"/forecasts/{forecast_id}/research-packs",
+            json={"pack_role": "current_state", "tool_profile": "public"},
+        )
+
+    assert duplicate.status_code == 200
+    duplicate_json = duplicate.json()
+    assert duplicate_json["pack_id"] == first_json["pack_id"]
+    assert duplicate_json["research_run_id"] == first_json["research_run_id"]
+    assert len(fake.submit_calls) == 1
+    assert list_pack_calls >= 2
+    with research.repository.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM research_runs
+            WHERE run_origin = 'forecast'
+            """,
+        ).fetchone()
+    assert row is not None
+    assert row["count"] == 1
 
 
 @pytest.mark.anyio

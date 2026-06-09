@@ -127,6 +127,20 @@ class ResearchOrchestrator:
             policy_decision_id=policy_decision_id,
         )
 
+    def create_run_record(
+        self,
+        request: CreateResearchRunRequest,
+        *,
+        forecast_mode: bool = False,
+    ) -> ResearchRunRecord:
+        """Create a ResearchRun row without submitting it to Deep Research."""
+        return self.repository.create_run(
+            user_prompt=request.user_prompt,
+            options=request.options,
+            settings=self.settings,
+            run_origin="forecast" if forecast_mode else "research",
+        )
+
     def create_manual_import_run(
         self,
         *,
