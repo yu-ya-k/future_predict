@@ -15,6 +15,7 @@ from api.forecast.repository import IDEMPOTENCY_IN_PROGRESS
 from api.forecast.schemas import (
     CommitVersionRequest,
     CommitVersionResponse,
+    ComputeProbabilitiesRequest,
     EstimateSetResponse,
     EvidenceExtractResponse,
     ForecastAuditResponse,
@@ -27,7 +28,9 @@ from api.forecast.schemas import (
     ForecastReviewResponse,
     ForecastSummary,
     ManualResearchPackPromptResponse,
+    ResearchPackDefaultsResponse,
     ResearchPackRequest,
+    ResearchPackRerunRequest,
     ResearchPackResponse,
     ResolveForecastRequest,
     ResolveForecastResponse,
@@ -163,6 +166,31 @@ def review_forecast(
                     status=forecast.status,
                     approved_framing_version=forecast.approved_framing_version,
                 )
+            if request.action in {
+                ReviewAction.APPROVE_PRIVATE_DATA_USE,
+                ReviewAction.APPROVE_PROBABILITY_PUBLICATION,
+                ReviewAction.OVERRIDE_PROBABILITY_WITH_REASON,
+                ReviewAction.APPROVE_EXTERNAL_REPORT,
+                ReviewAction.APPROVE_TRUSTED_SOURCE,
+            }:
+                forecast = orchestrator.record_phase_b_review(
+                    forecast_id,
+                    action=request.action.value,
+                    comment=request.comment,
+                    reviewer=request.reviewer,
+                    reviewer_auth_subject=request.reviewer_auth_subject,
+                    policy_decision_id=request.policy_decision_id,
+                    review_reason=request.review_reason,
+                    estimate_set_id=request.estimate_set_id,
+                    version_id=request.version_id,
+                )
+                return ForecastReviewResponse(
+                    forecast_id=forecast.forecast_id,
+                    action=request.action,
+                    status=forecast.status,
+                    approved_framing_version=forecast.approved_framing_version,
+                    estimate_set_id=request.estimate_set_id,
+                )
             raise HTTPException(status_code=422, detail="Unsupported review action.")
 
         return _run_idempotent(
@@ -174,6 +202,11 @@ def review_forecast(
             action=action,
         )
     except ForecastConflict as error:
+        if error.code == "reviewer_required":
+            raise forecast_http_error(
+                error,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            ) from error
         raise forecast_http_error(error) from error
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Forecast not found.") from error
@@ -192,11 +225,76 @@ def create_research_pack(
             scope="forecast:research_pack",
             resource_id=str(forecast_id),
             idempotency_key=_normalize_idempotency_key(idempotency_key),
-            payload=request.model_dump(mode="json"),
+            payload=_research_pack_idempotency_payload(request),
             action=lambda: orchestrator.dispatch_research_pack(
                 forecast_id,
                 request,
                 idempotency_key=None,
+            ),
+        )
+    except ForecastConflict as error:
+        raise forecast_http_error(error) from error
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Forecast not found.") from error
+
+
+@router.get("/{forecast_id}/research-packs", response_model=list[ResearchPackResponse])
+def list_research_packs(
+    forecast_id: UUID,
+    orchestrator: ForecastDependency,
+) -> list[ResearchPackResponse]:
+    try:
+        return orchestrator.list_research_packs(forecast_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Forecast not found.") from error
+
+
+@router.post(
+    "/{forecast_id}/research-packs/defaults",
+    response_model=ResearchPackDefaultsResponse,
+)
+def create_default_research_packs(
+    forecast_id: UUID,
+    orchestrator: ForecastDependency,
+    idempotency_key: IdempotencyKeyHeader = None,
+) -> ResearchPackDefaultsResponse:
+    try:
+        return _run_idempotent(
+            orchestrator,
+            scope="forecast:research_pack_defaults",
+            resource_id=str(forecast_id),
+            idempotency_key=_normalize_idempotency_key(idempotency_key),
+            payload={},
+            action=lambda: orchestrator.dispatch_default_research_packs(forecast_id),
+        )
+    except ForecastConflict as error:
+        raise forecast_http_error(error) from error
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Forecast not found.") from error
+
+
+@router.post(
+    "/{forecast_id}/research-packs/{pack_id}/rerun",
+    response_model=ResearchPackResponse,
+)
+def rerun_research_pack(
+    forecast_id: UUID,
+    pack_id: UUID,
+    request: ResearchPackRerunRequest,
+    orchestrator: ForecastDependency,
+    idempotency_key: IdempotencyKeyHeader = None,
+) -> ResearchPackResponse:
+    try:
+        return _run_idempotent(
+            orchestrator,
+            scope="forecast:research_pack_rerun",
+            resource_id=f"{forecast_id}:{pack_id}",
+            idempotency_key=_normalize_idempotency_key(idempotency_key),
+            payload=request.model_dump(mode="json"),
+            action=lambda: orchestrator.rerun_research_pack(
+                forecast_id,
+                pack_id,
+                request,
             ),
         )
     except ForecastConflict as error:
@@ -330,15 +428,17 @@ def compute_probabilities(
     forecast_id: UUID,
     orchestrator: ForecastDependency,
     idempotency_key: IdempotencyKeyHeader = None,
+    request: ComputeProbabilitiesRequest | None = None,
 ) -> dict[str, object]:
     try:
+        body = request or ComputeProbabilitiesRequest()
         return _run_idempotent(
             orchestrator,
             scope="forecast:probabilities_compute",
             resource_id=str(forecast_id),
             idempotency_key=_normalize_idempotency_key(idempotency_key),
-            payload={},
-            action=lambda: orchestrator.compute_probabilities(forecast_id),
+            payload=body.model_dump(mode="json"),
+            action=lambda: orchestrator.compute_probabilities(forecast_id, body),
         )
     except ForecastConflict as error:
         raise forecast_http_error(error) from error
@@ -443,6 +543,25 @@ def _forecast_create_idempotency_payload(request: ForecastCreateRequest) -> dict
     payload = request.model_dump(mode="json")
     if payload.get("original_execution_prompt") is None:
         payload.pop("original_execution_prompt", None)
+    return payload
+
+
+def _research_pack_idempotency_payload(
+    request: ResearchPackRequest,
+) -> dict[str, object]:
+    payload = request.model_dump(mode="json")
+    phase_b_defaults: dict[str, object] = {
+        "background": True,
+        "data_classification": "public",
+        "vector_store_ids": [],
+        "mcp_server_ids": [],
+        "trusted_source_identifiers": [],
+        "timeout_sec": None,
+        "estimated_cost_budget_usd": None,
+    }
+    for key, default in phase_b_defaults.items():
+        if payload.get(key) == default:
+            payload.pop(key, None)
     return payload
 
 

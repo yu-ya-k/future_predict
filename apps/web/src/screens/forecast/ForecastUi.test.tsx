@@ -31,6 +31,13 @@ const NON_BINARY_OUTCOMES = [
   "Delayed beyond 2026 Q4",
   "Launch canceled",
 ];
+const DEFAULT_PHASE_B_PACK_ROLES = [
+  "current_state",
+  "base_rate",
+  "drivers",
+  "counter_evidence",
+  "signals",
+] as const;
 
 function jsonResponse(data: unknown, status = 200): Response {
   return {
@@ -156,6 +163,31 @@ function currentResearchPack(
     needs_human_review: false,
     ...overrides,
   };
+}
+
+function phaseBResearchPack(
+  packRole: (typeof DEFAULT_PHASE_B_PACK_ROLES)[number],
+  overrides: Partial<ForecastCurrentResearchPack> = {},
+): ForecastCurrentResearchPack {
+  return currentResearchPack({
+    pack_id: `pack-${packRole}`,
+    research_run_id: `run-${packRole}`,
+    pack_role: packRole,
+    tool_profile: "public",
+    attempt_no: 1,
+    is_active: true,
+    data_classification: "public",
+    pack_status: "completed",
+    effective_status: "completed",
+    research_run_status: "completed",
+    total_tool_calls: 8,
+    done_reason: "forecast_raw_report_collected",
+    ...overrides,
+  });
+}
+
+function completedPhaseBPacks(): ForecastCurrentResearchPack[] {
+  return DEFAULT_PHASE_B_PACK_ROLES.map((role) => phaseBResearchPack(role));
 }
 
 type FramingDraftOverrides = Partial<
@@ -1345,6 +1377,218 @@ describe("Forecast UI", () => {
     expect(screen.queryByText("実行できます")).not.toBeInTheDocument();
   });
 
+  it("starts PhaseB default packs from the primary pack CTA", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: "framing_approved",
+              approved_framing_version: 1,
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/research-packs/defaults" &&
+          init?.method === "POST"
+        ) {
+          return jsonResponse({ packs: [] });
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "公開情報の収集を開始" }),
+    );
+
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) =>
+          String(url).endsWith("/forecasts/forecast-1/research-packs/defaults") &&
+          init?.method === "POST",
+      ),
+    ).toBe(true);
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) =>
+          String(url).endsWith("/forecasts/forecast-1/research-packs") &&
+          init?.method === "POST",
+      ),
+    ).toBe(false);
+  });
+
+  it("does not unlock evidence extraction until all active PhaseB default packs complete", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const partialPacks = DEFAULT_PHASE_B_PACK_ROLES.slice(0, 4).map((role) =>
+      phaseBResearchPack(role),
+    );
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: "pack_running",
+              approved_framing_version: 1,
+              current_research_pack: partialPacks[0],
+              current_research_pack_status: "completed",
+              research_packs: partialPacks,
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "必要な5 Packがそろっていません" }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText(/必要Pack不足/).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("button", { name: "証拠を抽出" })).toBeNull();
+  });
+
+  it("uses phase_b_v1 when the active PhaseB default pack set is present", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    let status: ForecastDetail["status"] = "scenarios_ready";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status,
+              approved_framing_version: 1,
+              approved_claim_target_link_count: 5,
+              research_packs: completedPhaseBPacks(),
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/probabilities/compute" &&
+          init?.method === "POST"
+        ) {
+          expect(JSON.parse(String(init.body))).toMatchObject({
+            engine_version: "phase_b_v1",
+          });
+          status = "draft_ready";
+          return jsonResponse(estimateSet({ engine_version: "phase_b_v1" }));
+        }
+        if (
+          path === "/forecasts/forecast-1/estimate-set" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(estimateSet({ engine_version: "phase_b_v1" }));
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "確率を計算" }));
+
+    expect(await screen.findAllByText("phase_b_v1")).not.toHaveLength(0);
+  });
+
+  it("reruns the active pack with expected_active_pack_id", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const activePack = phaseBResearchPack("current_state", {
+      pack_id: "pack-current-active",
+      research_run_id: "run-current-active",
+      attempt_no: 2,
+      effective_status: "failed",
+      pack_status: "failed",
+      research_run_status: "failed",
+      last_error: "source timeout",
+    });
+    const inactivePack = phaseBResearchPack("current_state", {
+      pack_id: "pack-current-old",
+      research_run_id: "run-current-old",
+      attempt_no: 1,
+      is_active: false,
+      effective_status: "completed",
+      pack_status: "completed",
+    });
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: "pack_running",
+              approved_framing_version: 1,
+              current_research_pack: activePack,
+              current_research_pack_status: "failed",
+              research_packs: [inactivePack, activePack],
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/research-packs/pack-current-active/rerun" &&
+          init?.method === "POST"
+        ) {
+          expect(JSON.parse(String(init.body))).toMatchObject({
+            expected_active_pack_id: "pack-current-active",
+          });
+          return jsonResponse({
+            pack_id: "pack-current-new",
+            forecast_id: "forecast-1",
+            research_run_id: "run-current-new",
+            pack_role: "current_state",
+            tool_profile: "public",
+            status: "running",
+            policy_decision_id: "policy-1",
+            attempt_no: 3,
+            is_active: true,
+            data_classification: "public",
+          });
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    expect(await screen.findByText(/attempt 2/)).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Current State を再実行" }),
+    );
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([url, init]) =>
+            String(url).endsWith(
+              "/forecasts/forecast-1/research-packs/pack-current-active/rerun",
+            ) && init?.method === "POST",
+        ),
+      ).toBe(true),
+    );
+  });
+
   it("imports manual public information and advances to evidence extraction", async () => {
     window.location.hash = "#/forecasts/forecast-1";
     let imported = false;
@@ -1697,7 +1941,7 @@ describe("Forecast UI", () => {
           );
         }
         if (
-          path === "/forecasts/forecast-1/research-packs" &&
+          path === "/forecasts/forecast-1/research-packs/defaults" &&
           init?.method === "POST"
         ) {
           return packRequest.promise;
@@ -1808,7 +2052,7 @@ describe("Forecast UI", () => {
           );
         }
         if (
-          path === "/forecasts/forecast-1/research-packs" &&
+          path === "/forecasts/forecast-1/research-packs/defaults" &&
           init?.method === "POST"
         ) {
           packRequestStarted = true;
@@ -1867,7 +2111,7 @@ describe("Forecast UI", () => {
           );
         }
         if (
-          path === "/forecasts/forecast-1/research-packs" &&
+          path === "/forecasts/forecast-1/research-packs/defaults" &&
           init?.method === "POST"
         ) {
           return packRequest.promise;
@@ -2846,7 +3090,7 @@ describe("Forecast UI", () => {
           );
         }
         if (
-          path === "/forecasts/forecast-1/research-packs" &&
+          path === "/forecasts/forecast-1/research-packs/defaults" &&
           init?.method === "POST"
         ) {
           return jsonResponse(
@@ -2899,7 +3143,7 @@ describe("Forecast UI", () => {
           );
         }
         if (
-          path === "/forecasts/forecast-1/research-packs" &&
+          path === "/forecasts/forecast-1/research-packs/defaults" &&
           init?.method === "POST"
         ) {
           return jsonResponse(

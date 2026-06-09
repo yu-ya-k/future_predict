@@ -35,6 +35,10 @@ class ForecastStatus(StrEnum):
 
 class PackRole(StrEnum):
     CURRENT_STATE = "current_state"
+    BASE_RATE = "base_rate"
+    DRIVERS = "drivers"
+    COUNTER_EVIDENCE = "counter_evidence"
+    SIGNALS = "signals"
 
 
 class ToolProfile(StrEnum):
@@ -43,10 +47,21 @@ class ToolProfile(StrEnum):
     SYNTHESIS = "synthesis"
 
 
+class ConfidentialityClass(StrEnum):
+    PUBLIC = "public"
+    INTERNAL = "internal"
+    RESTRICTED = "restricted"
+
+
 class ReviewAction(StrEnum):
     APPROVE_FRAMING = "approve_framing"
     APPROVE_PHASE_A_VERSION = "approve_phase_a_version"
     APPROVE_CLAIM_TARGET_LINKS = "approve_claim_target_links"
+    APPROVE_PRIVATE_DATA_USE = "approve_private_data_use"
+    APPROVE_PROBABILITY_PUBLICATION = "approve_probability_publication"
+    OVERRIDE_PROBABILITY_WITH_REASON = "override_probability_with_reason"
+    APPROVE_EXTERNAL_REPORT = "approve_external_report"
+    APPROVE_TRUSTED_SOURCE = "approve_trusted_source"
 
 
 class ForecastCreateRequest(BaseModel):
@@ -68,7 +83,7 @@ class ForecastCreateRequest(BaseModel):
     resolution_criteria: str = Field(default="", max_length=5000)
     resolution_sources: list[str] = Field(default_factory=list, max_length=20)
     decision_context: str | None = Field(default=None, max_length=5000)
-    confidentiality_class: Literal["public", "restricted"] = "public"
+    confidentiality_class: ConfidentialityClass = ConfidentialityClass.PUBLIC
     outcomes: list[str] = Field(default_factory=list, max_length=8)
 
     _strip_question = field_validator("question", mode="before")(_strip)
@@ -259,6 +274,8 @@ class ForecastSummary(BaseModel):
 class ForecastCurrentResearchPack(BaseModel):
     pack_id: UUID
     research_run_id: UUID
+    pack_role: PackRole = PackRole.CURRENT_STATE
+    tool_profile: ToolProfile = ToolProfile.PUBLIC
     pack_status: str
     effective_status: str
     research_run_status: str
@@ -274,6 +291,10 @@ class ForecastCurrentResearchPack(BaseModel):
     needs_human_review: bool = False
 
 
+def _default_research_packs() -> list[ForecastCurrentResearchPack]:
+    return []
+
+
 class ForecastDetail(ForecastSummary):
     original_execution_prompt: str | None
     target_population: str | None
@@ -285,6 +306,9 @@ class ForecastDetail(ForecastSummary):
     outcomes: list[ForecastOutcome]
     current_research_pack: ForecastCurrentResearchPack | None = None
     current_research_pack_status: str | None = None
+    research_packs: list[ForecastCurrentResearchPack] = Field(
+        default_factory=_default_research_packs
+    )
     approved_claim_target_link_count: int = 0
 
 
@@ -295,6 +319,10 @@ class ForecastReviewRequest(BaseModel):
     comment: str | None = Field(default=None, max_length=5000)
     estimate_set_id: UUID | None = None
     version_id: UUID | None = None
+    reviewer: str | None = Field(default=None, max_length=500)
+    reviewer_auth_subject: str | None = Field(default=None, max_length=500)
+    policy_decision_id: UUID | None = None
+    review_reason: str | None = Field(default=None, max_length=5000)
 
 
 class ForecastReviewResponse(BaseModel):
@@ -311,6 +339,13 @@ class ResearchPackRequest(BaseModel):
     pack_role: PackRole = PackRole.CURRENT_STATE
     tool_profile: ToolProfile = ToolProfile.PUBLIC
     max_tool_calls: int = Field(default=40, ge=1, le=120)
+    background: bool = True
+    data_classification: ConfidentialityClass = ConfidentialityClass.PUBLIC
+    vector_store_ids: list[str] = Field(default_factory=list, max_length=2)
+    mcp_server_ids: list[str] = Field(default_factory=list, max_length=10)
+    trusted_source_identifiers: list[str] = Field(default_factory=list, max_length=20)
+    timeout_sec: int | None = Field(default=None, ge=1)
+    estimated_cost_budget_usd: float | None = Field(default=None, ge=0)
 
 
 class ResearchPackResponse(BaseModel):
@@ -321,6 +356,23 @@ class ResearchPackResponse(BaseModel):
     tool_profile: ToolProfile
     status: str
     policy_decision_id: UUID
+    attempt_no: int = 1
+    is_active: bool = True
+    data_classification: ConfidentialityClass = ConfidentialityClass.PUBLIC
+
+
+class ResearchPackDefaultsResponse(BaseModel):
+    packs: list[ResearchPackResponse]
+
+
+class ResearchPackRerunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_active_pack_id: UUID
+    max_tool_calls: int = Field(default=40, ge=1, le=120)
+    background: bool = True
+    timeout_sec: int | None = Field(default=None, ge=1)
+    estimated_cost_budget_usd: float | None = Field(default=None, ge=0)
 
 
 class ManualResearchPackPromptResponse(BaseModel):
@@ -345,7 +397,9 @@ class SourceRecord(BaseModel):
     publisher: str | None
     url: str | None
     source_type: str
-    source_classification: ToolProfile
+    source_classification: str
+    data_classification: ConfidentialityClass = ConfidentialityClass.PUBLIC
+    origin_tool_profile: ToolProfile = ToolProfile.PUBLIC
     reliability_score: float
 
 
@@ -360,6 +414,8 @@ class ClaimRecord(BaseModel):
     independence_group: str
     source_ids: list[UUID]
     review_status: str
+    data_classification: ConfidentialityClass = ConfidentialityClass.PUBLIC
+    origin_tool_profile: ToolProfile = ToolProfile.PUBLIC
 
 
 class EvidenceExtractResponse(BaseModel):
@@ -367,6 +423,10 @@ class EvidenceExtractResponse(BaseModel):
     sources: list[SourceRecord]
     claims: list[ClaimRecord]
     quarantine_artifact_path: str | None = None
+
+
+def _default_driver_state_ids() -> list[UUID]:
+    return []
 
 
 class ScenarioRecord(BaseModel):
@@ -377,6 +437,7 @@ class ScenarioRecord(BaseModel):
     probability: float | None = None
     normalized_weight: float
     validity_status: str
+    driver_state_ids: list[UUID] = Field(default_factory=_default_driver_state_ids)
 
 
 class ScenarioGenerateResponse(BaseModel):
@@ -410,6 +471,53 @@ class EstimateSetResponse(BaseModel):
     random_seed: int
     normalization_group_id: str
     estimates: list[ProbabilityEstimateRecord]
+
+
+class ComputeProbabilitiesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    engine_version: Literal["phase_a_v1", "phase_b_v1"] | None = None
+
+
+class ForecastDriverRecord(BaseModel):
+    driver_id: UUID
+    forecast_id: UUID
+    name: str
+    description: str
+    sort_order: int
+
+
+class ForecastDriverStateRecord(BaseModel):
+    state_id: UUID
+    driver_id: UUID
+    label: str
+    description: str
+    sort_order: int
+
+
+def _default_tool_profiles() -> list[ToolProfile]:
+    return []
+
+
+def _default_pack_roles() -> list[PackRole]:
+    return []
+
+
+def _default_string_list() -> list[str]:
+    return []
+
+
+class ForecastTrustedSourceRecord(BaseModel):
+    trusted_source_id: UUID
+    identifier: str
+    status: Literal["pending", "approved", "revoked", "expired"]
+    approved_by: str | None = None
+    approved_at: datetime | None = None
+    expires_at: datetime | None = None
+    allowed_profiles: list[ToolProfile] = Field(default_factory=_default_tool_profiles)
+    allowed_pack_roles: list[PackRole] = Field(default_factory=_default_pack_roles)
+    allowed_tool_names: list[str] = Field(default_factory=_default_string_list)
+    owner_team_id: str | None = None
 
 
 class CommitVersionRequest(BaseModel):

@@ -563,6 +563,7 @@ class ResearchOrchestrator:
         tool_profile: Literal["public", "private", "synthesis"] = "public",
         background: bool = True,
         policy_decision_id: str | None = None,
+        vector_store_ids: list[str] | None = None,
     ) -> ResearchRunRecord:
         run = self.repository.get_run(run_id)
         if run.run_origin == "forecast" and not policy_decision_id:
@@ -635,6 +636,8 @@ class ResearchOrchestrator:
             )
 
         policy_decision = _deep_research_query_policy_decision(prompt)
+        if run.run_origin == "forecast" and tool_profile == "private":
+            policy_decision = QueryPolicyDecision(status="allowed", safe_queries=[])
         if policy_decision.status != "allowed":
             self.repository.append_history_event(
                 run.id,
@@ -699,6 +702,7 @@ class ResearchOrchestrator:
                 tool_profile=tool_profile,
                 background=background,
                 policy_decision_id=policy_decision_id,
+                vector_store_ids=vector_store_ids,
             )
             response_id = get_response_id(response)
             raw_path, _ = self.artifacts.save_json(
