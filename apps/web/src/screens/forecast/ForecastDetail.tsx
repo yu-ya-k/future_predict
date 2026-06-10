@@ -1,18 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import "./forecast.css";
 import {
   commitForecastVersion,
   computeProbabilities,
-  dispatchCurrentStatePack,
+  dispatchDefaultResearchPacks,
   extractEvidence,
   generateScenarios,
   getForecast,
   getForecastEstimateSet,
   getManualResearchPackPrompt,
   importManualResearchPack,
+  rerunForecastResearchPack,
   resolveForecast,
   reviewForecast,
 } from "../../api/forecast";
+import { MetricCard } from "../../components";
 import { copyTextToClipboard } from "../../lib/clipboard";
 import { Link, routes } from "../../router";
 import { formatElapsed, useElapsed } from "../../hooks/useElapsed";
@@ -20,6 +23,7 @@ import type {
   EstimateSetResponse,
   ForecastCurrentResearchPack,
   ForecastDetail as ForecastDetailType,
+  ForecastPackRole,
   ManualResearchPackPromptResponse,
   ForecastStatus,
   ResolveForecastResponse,
@@ -30,6 +34,18 @@ import {
   type ForecastFlowNode,
   type ForecastFlowStatus,
 } from "./ForecastFlowProgress";
+import {
+  forecastStatusLabel,
+  forecastStatusTone,
+  localizePackStatus,
+} from "./forecastStatus";
+import {
+  EvidenceBoard,
+  ForecastReport,
+  PackCollectionPanel,
+  ProbabilityPanel,
+  ScenarioMap,
+} from "./PhaseBPanels";
 
 type Command =
   | "pack"
@@ -52,6 +68,13 @@ type CurrentStepAction =
 const PACK_SUBMISSION_POLL_MS = 1_000;
 const MANUAL_PROMPT_COPY_FAILED =
   "コピーできませんでした。Prompt欄を選択してコピーするか、Markdownでダウンロードしてください。";
+const DEFAULT_PACK_ROLES: ForecastPackRole[] = [
+  "current_state",
+  "base_rate",
+  "drivers",
+  "counter_evidence",
+  "signals",
+];
 
 interface CurrentStepModel {
   title: string;
@@ -112,51 +135,6 @@ function flowStatus({
   return "pending";
 }
 
-function forecastStatusLabel(status: ForecastStatus | undefined): string {
-  switch (status) {
-    case "framing_pending":
-      return "フレーミング待ち";
-    case "framing_approved":
-      return "フレーミング承認済み";
-    case "pack_running":
-      return "公開情報フェーズ";
-    case "evidence_ready":
-      return "証拠抽出済み";
-    case "scenarios_ready":
-      return "シナリオ生成済み";
-    case "draft_ready":
-      return "確率計算済み";
-    case "committed":
-      return "予測版確定済み";
-    case "resolved":
-      return "解決済み";
-    default:
-      return "読み込み中";
-  }
-}
-
-function packStatusLabel(status: string | null | undefined): string {
-  switch (status) {
-    case "submitting":
-      return "サーバーに登録中";
-    case "running":
-      return "実行中";
-    case "completed":
-      return "完了";
-    case "needs_human_review":
-      return "要確認";
-    case "failed":
-      return "失敗";
-    case "cancelled":
-      return "中断";
-    case null:
-    case undefined:
-      return "未収集";
-    default:
-      return status;
-  }
-}
-
 function isRemoteResearchRunning(
   pack: ForecastCurrentResearchPack | null,
   effectiveStatus: string | null | undefined,
@@ -184,6 +162,188 @@ function isWaitingForRemoteSubmit(
   );
 }
 
+function packEffectiveStatus(pack: ForecastCurrentResearchPack | null): string | null {
+  return pack?.effective_status ?? pack?.pack_status ?? null;
+}
+
+function packUpdatedTime(pack: ForecastCurrentResearchPack): number {
+  const time = Date.parse(pack.pack_updated_at || pack.pack_created_at);
+  return Number.isNaN(time) ? 0 : time;
+}
+
+function sortedRecentPacks(
+  packs: ForecastCurrentResearchPack[],
+): ForecastCurrentResearchPack[] {
+  return [...packs].sort((a, b) => packUpdatedTime(b) - packUpdatedTime(a));
+}
+
+function preferredPackForRole(
+  current: ForecastCurrentResearchPack | undefined,
+  candidate: ForecastCurrentResearchPack,
+): ForecastCurrentResearchPack {
+  if (!current) return candidate;
+  const currentAttempt = current.attempt_no ?? 1;
+  const candidateAttempt = candidate.attempt_no ?? 1;
+  if (candidateAttempt !== currentAttempt) {
+    return candidateAttempt > currentAttempt ? candidate : current;
+  }
+  return packUpdatedTime(candidate) > packUpdatedTime(current) ? candidate : current;
+}
+
+function activeDefaultPackByRole(
+  packs: ForecastCurrentResearchPack[],
+): Map<ForecastPackRole, ForecastCurrentResearchPack> {
+  const byRole = new Map<ForecastPackRole, ForecastCurrentResearchPack>();
+  for (const pack of packs) {
+    if (!pack.pack_role || !DEFAULT_PACK_ROLES.includes(pack.pack_role)) continue;
+    byRole.set(pack.pack_role, preferredPackForRole(byRole.get(pack.pack_role), pack));
+  }
+  return byRole;
+}
+
+function uniqueForecastPacks(
+  forecast: ForecastDetailType | null,
+): ForecastCurrentResearchPack[] {
+  const packs = [...(forecast?.research_packs ?? [])];
+  const current = forecast?.current_research_pack ?? null;
+  if (current && !packs.some((pack) => pack.pack_id === current.pack_id)) {
+    packs.push(current);
+  }
+  return packs;
+}
+
+function choosePrimaryPack(
+  packs: ForecastCurrentResearchPack[],
+  fallback: ForecastCurrentResearchPack | null,
+): ForecastCurrentResearchPack | null {
+  const recent = sortedRecentPacks(packs);
+  return (
+    recent.find((pack) => {
+      const status = packEffectiveStatus(pack);
+      return status === "running" || status === "submitting";
+    }) ??
+    recent.find((pack) => {
+      const status = packEffectiveStatus(pack);
+      return (
+        status === "failed" ||
+        status === "cancelled" ||
+        status === "needs_human_review"
+      );
+    }) ??
+    recent.find((pack) => packEffectiveStatus(pack) === "completed") ??
+    fallback
+  );
+}
+
+interface ForecastProgressModel {
+  packs: ForecastCurrentResearchPack[];
+  activeDefaultPacksByRole: Map<ForecastPackRole, ForecastCurrentResearchPack>;
+  primaryPack: ForecastCurrentResearchPack | null;
+  phaseBStarted: boolean;
+  phaseBDefaultSetPresent: boolean;
+  missingDefaultRoles: ForecastPackRole[];
+  completedDefaultPackCount: number;
+  currentResearchPackStatus: string | null | undefined;
+  researchPackCompleted: boolean;
+  researchPackBlocked: boolean;
+  researchPackRunning: boolean;
+  researchPackSubmitting: boolean;
+  researchPackSubmitWaiting: boolean;
+  researchPackSubmitStalled: boolean;
+  shouldPoll: boolean;
+  shouldUsePhaseBEngine: boolean;
+}
+
+function deriveForecastProgress(
+  forecast: ForecastDetailType | null,
+): ForecastProgressModel {
+  const packs = uniqueForecastPacks(forecast);
+  const activePacks = packs.filter((pack) => pack.is_active !== false);
+  const activeDefaultPacksByRole = activeDefaultPackByRole(activePacks);
+  const phaseBStarted = DEFAULT_PACK_ROLES.some(
+    (role) => role !== "current_state" && activeDefaultPacksByRole.has(role),
+  );
+  const phaseBDefaultSetPresent = DEFAULT_PACK_ROLES.every((role) =>
+    activeDefaultPacksByRole.has(role),
+  );
+  const missingDefaultRoles = phaseBStarted
+    ? DEFAULT_PACK_ROLES.filter((role) => !activeDefaultPacksByRole.has(role))
+    : [];
+  const defaultPacks = DEFAULT_PACK_ROLES.map((role) =>
+    activeDefaultPacksByRole.get(role),
+  ).filter((pack): pack is ForecastCurrentResearchPack => Boolean(pack));
+  const primaryPack = phaseBStarted
+    ? choosePrimaryPack(defaultPacks, forecast?.current_research_pack ?? null)
+    : (forecast?.current_research_pack ??
+      choosePrimaryPack(activePacks, null));
+  const statuses = phaseBStarted
+    ? defaultPacks.map((pack) => packEffectiveStatus(pack))
+    : [packEffectiveStatus(primaryPack) ?? forecast?.current_research_pack_status ?? null];
+  const completedDefaultPackCount = DEFAULT_PACK_ROLES.filter(
+    (role) => activeDefaultPacksByRole.get(role)?.effective_status === "completed",
+  ).length;
+  const anyWaiting = (phaseBStarted ? defaultPacks : primaryPack ? [primaryPack] : []).some(
+    (pack) => isWaitingForRemoteSubmit(pack, packEffectiveStatus(pack)),
+  );
+  const anySubmitting = statuses.some((status) => status === "submitting") && !anyWaiting;
+  const anyRunning = (phaseBStarted ? defaultPacks : primaryPack ? [primaryPack] : []).some(
+    (pack) => isRemoteResearchRunning(pack, packEffectiveStatus(pack)),
+  );
+  const anyBlocked = statuses.some(
+    (status) =>
+      status === "failed" ||
+      status === "cancelled" ||
+      status === "needs_human_review",
+  );
+  const defaultSetGap = phaseBStarted && !phaseBDefaultSetPresent;
+  const currentResearchPackStatus = phaseBStarted
+    ? defaultSetGap
+      ? "default_packs_missing"
+      : anyBlocked
+        ? statuses.find(
+            (status) =>
+              status === "failed" ||
+              status === "cancelled" ||
+              status === "needs_human_review",
+          )
+        : anyRunning
+          ? "running"
+          : anyWaiting
+            ? "running"
+            : anySubmitting
+              ? "submitting"
+              : phaseBDefaultSetPresent && completedDefaultPackCount === DEFAULT_PACK_ROLES.length
+                ? "completed"
+                : packEffectiveStatus(primaryPack)
+    : (packEffectiveStatus(primaryPack) ?? forecast?.current_research_pack_status);
+  const researchPackCompleted = phaseBStarted
+    ? phaseBDefaultSetPresent && completedDefaultPackCount === DEFAULT_PACK_ROLES.length
+    : currentResearchPackStatus === "completed";
+  const researchPackBlocked =
+    anyBlocked || (defaultSetGap && !anyRunning && !anyWaiting && !anySubmitting);
+  const researchPackSubmitStalled =
+    researchPackBlocked && primaryPack?.done_reason === "deep_research_submit_stalled";
+
+  return {
+    packs,
+    activeDefaultPacksByRole,
+    primaryPack,
+    phaseBStarted,
+    phaseBDefaultSetPresent,
+    missingDefaultRoles,
+    completedDefaultPackCount,
+    currentResearchPackStatus,
+    researchPackCompleted,
+    researchPackBlocked,
+    researchPackRunning: anyRunning,
+    researchPackSubmitting: anySubmitting,
+    researchPackSubmitWaiting: anyWaiting,
+    researchPackSubmitStalled,
+    shouldPoll: anyRunning || anySubmitting || anyWaiting,
+    shouldUsePhaseBEngine: phaseBDefaultSetPresent,
+  };
+}
+
 function packFlowMeta({
   currentResearchPackStatus,
   researchPackCompleted,
@@ -191,6 +351,9 @@ function packFlowMeta({
   researchPackSubmitting,
   researchPackSubmitWaiting,
   packSubmissionPending,
+  phaseBStarted,
+  completedDefaultPackCount,
+  missingDefaultPacks,
 }: {
   currentResearchPackStatus: string | null | undefined;
   researchPackCompleted: boolean;
@@ -198,12 +361,19 @@ function packFlowMeta({
   researchPackSubmitting: boolean;
   researchPackSubmitWaiting: boolean;
   packSubmissionPending: boolean;
+  phaseBStarted: boolean;
+  completedDefaultPackCount: number;
+  missingDefaultPacks: number;
 }): string {
   if (researchPackRunning) return "公開情報を収集中";
   if (researchPackSubmitWaiting) return "Deep Research送信待ち";
   if (researchPackSubmitting || packSubmissionPending) return "サーバーに登録中";
+  if (phaseBStarted && missingDefaultPacks > 0) return "必要Pack不足";
   if (researchPackCompleted) return "収集完了";
+  if (phaseBStarted) return `${completedDefaultPackCount}/5 Pack完了`;
   switch (currentResearchPackStatus) {
+    case "default_packs_missing":
+      return "必要Pack不足";
     case "needs_human_review":
       return "確認が必要";
     case "failed":
@@ -240,6 +410,8 @@ function deriveCurrentStep({
   researchPackRunning,
   researchPackCompleted,
   researchPackBlocked,
+  phaseBStarted,
+  missingDefaultPacks,
   canDispatch,
   canExtract,
   canGenerate,
@@ -250,6 +422,8 @@ function deriveCurrentStep({
   canCommit,
   canResolve,
   estimatePresent,
+  probabilityEngine,
+  isPhaseBEstimate,
 }: {
   status: ForecastStatus | undefined;
   currentResearchPackStatus: string | null | undefined;
@@ -262,6 +436,8 @@ function deriveCurrentStep({
   researchPackRunning: boolean;
   researchPackCompleted: boolean;
   researchPackBlocked: boolean;
+  phaseBStarted: boolean;
+  missingDefaultPacks: number;
   canDispatch: boolean;
   canExtract: boolean;
   canGenerate: boolean;
@@ -272,6 +448,8 @@ function deriveCurrentStep({
   canCommit: boolean;
   canResolve: boolean;
   estimatePresent: boolean;
+  probabilityEngine: "phase_a_v1" | "phase_b_v1";
+  isPhaseBEstimate: boolean;
 }): CurrentStepModel {
   if (!status) {
     return {
@@ -334,6 +512,18 @@ function deriveCurrentStep({
     };
   }
 
+  if (phaseBStarted && missingDefaultPacks > 0 && !researchPackRunning) {
+    return {
+      title: "必要な5 Packがそろっていません",
+      description:
+        "Phase Bの証拠抽出には既定5 Packのactive packが必要です。Pack Collectionで不足しているpackを確認してください。",
+      stateLabel: "必要Pack不足",
+      tone: "blocked",
+      action: "refresh",
+      actionLabel: "状態を再確認",
+    };
+  }
+
   if (researchPackBlocked) {
     if (researchPackSubmitStalled) {
       return {
@@ -356,7 +546,7 @@ function deriveCurrentStep({
       title,
       description:
         "Research runの詳細で原因や人手確認の要否を確認してください。対応後にこの画面へ戻ると最新状態を確認できます。",
-      stateLabel: packStatusLabel(currentResearchPackStatus),
+      stateLabel: localizePackStatus(currentResearchPackStatus),
       tone: "blocked",
       action: "researchRun",
       actionLabel: "Research run詳細",
@@ -424,7 +614,7 @@ function deriveCurrentStep({
       title: canRestoreDraft ? "推定値を復元できます" : "確率計算の準備ができました",
       description: canRestoreDraft
         ? "保存済みの下書き推定値を読み込みます。"
-        : "承認済みの対応関係をもとに、PhaseAエンジンで確率を計算します。",
+        : `承認済みの対応関係をもとに、${probabilityEngine}で確率を計算します。`,
       stateLabel: canRestoreDraft ? "復元可能" : "計算可能",
       tone: "ready",
       action: "compute",
@@ -434,12 +624,20 @@ function deriveCurrentStep({
 
   if (canApproveEstimate) {
     return {
-      title: "推定結果の承認待ちです",
-      description: "下の推定結果を確認し、問題なければこのまま承認できます。",
+      title: isPhaseBEstimate
+        ? "確率公開の承認待ちです"
+        : "推定結果の承認待ちです",
+      description: isPhaseBEstimate
+        ? "下の推定結果を確認し、問題なければ公開承認できます。"
+        : "下の推定結果を確認し、問題なければこのまま承認できます。",
       stateLabel: "承認待ち",
       tone: "ready",
       action: estimatePresent ? "approve" : null,
-      actionLabel: estimatePresent ? "推定結果を承認" : undefined,
+      actionLabel: estimatePresent
+        ? isPhaseBEstimate
+          ? "確率公開を承認"
+          : "推定結果を承認"
+        : undefined,
     };
   }
 
@@ -504,11 +702,16 @@ function forecastExecutionNodes({
   researchPackSubmitting,
   researchPackSubmitWaiting,
   currentResearchPackStatus,
+  phaseBStarted,
+  completedDefaultPackCount,
+  missingDefaultPacks,
   claimTargetsApproved,
   hasEstimate,
-  phaseAApproved,
+  estimateApproved,
   packSubmissionPending,
   busy,
+  probabilityEngine,
+  isPhaseBEstimate,
 }: {
   status: ForecastStatus | undefined;
   approvedFraming: boolean;
@@ -518,11 +721,16 @@ function forecastExecutionNodes({
   researchPackSubmitting: boolean;
   researchPackSubmitWaiting: boolean;
   currentResearchPackStatus: string | null | undefined;
+  phaseBStarted: boolean;
+  completedDefaultPackCount: number;
+  missingDefaultPacks: number;
   claimTargetsApproved: boolean;
   hasEstimate: boolean;
-  phaseAApproved: boolean;
+  estimateApproved: boolean;
   packSubmissionPending: boolean;
   busy: Command | null;
+  probabilityEngine: "phase_a_v1" | "phase_b_v1";
+  isPhaseBEstimate: boolean;
 }): ForecastFlowNode[] {
   const isResolved = status === "resolved";
   const estimateReady = hasEstimate || statusAtLeast(status, "draft_ready");
@@ -547,6 +755,9 @@ function forecastExecutionNodes({
         researchPackSubmitting,
         researchPackSubmitWaiting,
         packSubmissionPending,
+        phaseBStarted,
+        completedDefaultPackCount,
+        missingDefaultPacks,
       }),
       status: flowStatus({
         done: researchPackCompleted || statusAtLeast(status, "evidence_ready"),
@@ -572,7 +783,7 @@ function forecastExecutionNodes({
     {
       id: "scenarios",
       title: "シナリオを生成",
-      meta: "結果別のPhaseAシナリオを生成",
+      meta: "結果別のシナリオを生成",
       status: flowStatus({
         done: statusAtLeast(status, "scenarios_ready"),
         active: busy === "scenarios",
@@ -594,7 +805,7 @@ function forecastExecutionNodes({
     {
       id: "compute",
       title: "確率を計算",
-      meta: estimateReady ? "下書き推定値あり" : "PhaseAエンジンで計算",
+      meta: estimateReady ? "下書き推定値あり" : `${probabilityEngine}で計算`,
       status: flowStatus({
         done: estimateReady,
         active: busy === "compute",
@@ -603,13 +814,17 @@ function forecastExecutionNodes({
       tone: "verify",
     },
     {
-      id: "approve-phase-a",
-      title: "推定結果を承認",
-      meta: phaseAApproved ? "PhaseA下書き承認済み" : "下書き推定値の承認待ち",
+      id: "approve-estimate",
+      title: isPhaseBEstimate ? "確率公開を承認" : "推定結果を承認",
+      meta: estimateApproved
+        ? "推定結果承認済み"
+        : isPhaseBEstimate
+          ? "確率公開の承認待ち"
+          : "下書き推定値の承認待ち",
       status: flowStatus({
-        done: phaseAApproved || statusAtLeast(status, "committed"),
+        done: estimateApproved || statusAtLeast(status, "committed"),
         active: busy === "approve",
-        available: status === "draft_ready" && estimateReady && !phaseAApproved,
+        available: status === "draft_ready" && estimateReady && !estimateApproved,
       }),
       tone: "review",
     },
@@ -622,7 +837,7 @@ function forecastExecutionNodes({
       status: flowStatus({
         done: statusAtLeast(status, "committed"),
         active: busy === "commit",
-        available: status === "draft_ready" && phaseAApproved,
+        available: status === "draft_ready" && estimateApproved,
       }),
       tone: "finalize",
     },
@@ -644,7 +859,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   const [forecast, setForecast] = useState<ForecastDetailType | null>(null);
   const [estimate, setEstimate] = useState<EstimateSetResponse | null>(null);
   const [claimTargetsApproved, setClaimTargetsApproved] = useState(false);
-  const [phaseAApprovedEstimateId, setPhaseAApprovedEstimateId] = useState<string | null>(null);
+  const [approvedEstimateSetId, setApprovedEstimateSetId] = useState<string | null>(null);
   const [resolution, setResolution] = useState<ResolveForecastResponse | null>(null);
   const [selectedOutcomeId, setSelectedOutcomeId] = useState("");
   const [resolutionNotes, setResolutionNotes] = useState("");
@@ -663,8 +878,11 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     failed: boolean;
   } | null>(null);
   const manualPromptRequestId = useRef(0);
+  const loadRequestId = useRef(0);
+  const currentForecastIdRef = useRef(forecastId);
   const manualReportFileInputRef = useRef<HTMLInputElement | null>(null);
   const manualPromptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  currentForecastIdRef.current = forecastId;
   const idempotencyKeys = useRef<Record<Command, string>>({
     pack: stableKey(forecastId, "pack"),
     manualPack: stableKey(forecastId, "manualPack"),
@@ -679,6 +897,16 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
 
   useEffect(() => {
     manualPromptRequestId.current += 1;
+    setForecast(null);
+    setEstimate(null);
+    setClaimTargetsApproved(false);
+    setApprovedEstimateSetId(null);
+    setResolution(null);
+    setSelectedOutcomeId("");
+    setResolutionNotes("");
+    setBusy(null);
+    setBusyStartedAt(null);
+    setError(null);
     setCollectionMode("auto");
     setManualRecoveryOpen(false);
     setManualPrompt(null);
@@ -703,14 +931,30 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   }, [forecastId]);
 
   const load = useCallback(async () => {
-    const nextForecast = await getForecast(forecastId);
-    setForecast(nextForecast);
-    if (hasEstimateSet(nextForecast.status)) {
-      setEstimate(await getForecastEstimateSet(forecastId));
-    } else {
-      setEstimate(null);
+    const requestId = loadRequestId.current + 1;
+    loadRequestId.current = requestId;
+    const requestForecastId = forecastId;
+    const isCurrentRequest = () =>
+      loadRequestId.current === requestId &&
+      currentForecastIdRef.current === requestForecastId;
+
+    try {
+      const nextForecast = await getForecast(requestForecastId);
+      if (!isCurrentRequest()) return;
+
+      setForecast(nextForecast);
+      if (hasEstimateSet(nextForecast.status)) {
+        const nextEstimate = await getForecastEstimateSet(requestForecastId);
+        if (!isCurrentRequest()) return;
+        setEstimate(nextEstimate);
+      } else {
+        setEstimate(null);
+      }
+
+      setError(null);
+    } catch (err) {
+      if (isCurrentRequest()) throw err;
     }
-    setError(null);
   }, [forecastId]);
 
   useEffect(() => {
@@ -719,27 +963,20 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
 
   const status = forecast?.status;
   const approvedFraming = Boolean(forecast?.approved_framing_version);
-  const currentResearchPack = forecast?.current_research_pack ?? null;
-  const currentResearchPackStatus =
-    currentResearchPack?.effective_status ?? forecast?.current_research_pack_status;
-  const researchPackCompleted = currentResearchPackStatus === "completed";
-  const researchPackBlocked =
-    currentResearchPackStatus === "failed" ||
-    currentResearchPackStatus === "cancelled" ||
-    currentResearchPackStatus === "needs_human_review";
-  const researchPackSubmitWaiting = isWaitingForRemoteSubmit(
-    currentResearchPack,
-    currentResearchPackStatus,
-  );
-  const researchPackSubmitting =
-    currentResearchPackStatus === "submitting" && !researchPackSubmitWaiting;
-  const researchPackSubmitStalled =
-    researchPackBlocked &&
-    currentResearchPack?.done_reason === "deep_research_submit_stalled";
+  const forecastProgress = deriveForecastProgress(forecast);
+  const currentResearchPack = forecastProgress.primaryPack;
+  const currentResearchPackStatus = forecastProgress.currentResearchPackStatus;
+  const researchPackCompleted = forecastProgress.researchPackCompleted;
+  const researchPackBlocked = forecastProgress.researchPackBlocked;
+  const researchPackSubmitWaiting = forecastProgress.researchPackSubmitWaiting;
+  const researchPackSubmitting = forecastProgress.researchPackSubmitting;
+  const researchPackSubmitStalled = forecastProgress.researchPackSubmitStalled;
   const researchPackRunning =
-    status === "pack_running" &&
-    isRemoteResearchRunning(currentResearchPack, currentResearchPackStatus);
+    status === "pack_running" && forecastProgress.researchPackRunning;
   const packSubmissionPending = busy === "pack" && !currentResearchPack;
+  const probabilityEngine = forecastProgress.shouldUsePhaseBEngine
+    ? "phase_b_v1"
+    : "phase_a_v1";
   const packSubmissionElapsed = useElapsed(
     packSubmissionPending ? (busyStartedAt ?? undefined) : undefined,
     packSubmissionPending,
@@ -766,8 +1003,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       ? "取り込み記録"
       : "Research run詳細";
 
-  const shouldPollCurrentResearchPack =
-    researchPackRunning || researchPackSubmitting || researchPackSubmitWaiting;
+  const shouldPollCurrentResearchPack = forecastProgress.shouldPoll;
 
   useEffect(() => {
     if (!shouldPollCurrentResearchPack) return undefined;
@@ -797,24 +1033,24 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   }, [busy, currentResearchPack]);
 
   useEffect(() => {
-    const resetPackStatus =
-      forecast?.current_research_pack?.effective_status ??
-      forecast?.current_research_pack_status;
-    if (resetPackStatus !== "completed") return;
+    if (!researchPackCompleted) return;
     setManualRecoveryOpen(false);
     setManualReportText("");
     setManualReportFile(null);
     if (manualReportFileInputRef.current) {
       manualReportFileInputRef.current.value = "";
     }
-  }, [
-    forecast?.current_research_pack?.effective_status,
-    forecast?.current_research_pack_status,
-  ]);
+  }, [researchPackCompleted]);
 
   useEffect(() => {
-    if (!selectedOutcomeId && forecast?.outcomes[0]) {
-      setSelectedOutcomeId(forecast.outcomes[0].outcome_id);
+    if (!forecast) return;
+    const outcomeIds = forecast.outcomes.map((outcome) => outcome.outcome_id);
+    if (outcomeIds.length === 0) {
+      if (selectedOutcomeId) setSelectedOutcomeId("");
+      return;
+    }
+    if (!selectedOutcomeId || !outcomeIds.includes(selectedOutcomeId)) {
+      setSelectedOutcomeId(outcomeIds[0]);
     }
   }, [forecast, selectedOutcomeId]);
 
@@ -832,7 +1068,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       const result = await fn();
       if (step === "claimTargets") setClaimTargetsApproved(true);
       if (step === "approve" && estimate) {
-        setPhaseAApprovedEstimateId(estimate.estimate_set_id);
+        setApprovedEstimateSetId(estimate.estimate_set_id);
       }
       if (step === "compute") setEstimate(result as EstimateSetResponse);
       if (step === "resolve") setResolution(result as ResolveForecastResponse);
@@ -851,7 +1087,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     switch (command) {
       case "pack":
         return runStep("pack", () =>
-          dispatchCurrentStatePack(forecastId, {
+          dispatchDefaultResearchPacks(forecastId, {
             idempotencyKey: idempotencyKeys.current.pack,
           }),
         );
@@ -879,19 +1115,35 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
         );
       case "compute":
         return runStep("compute", () =>
-          computeProbabilities(forecastId, {
-            idempotencyKey: idempotencyKeys.current.compute,
-          }),
+          computeProbabilities(
+            forecastId,
+            { engine_version: probabilityEngine },
+            {
+              idempotencyKey: idempotencyKeys.current.compute,
+            },
+          ),
         );
       case "approve":
         if (!estimate) return Promise.resolve();
+        if (!estimate.estimate_set_id) return Promise.resolve();
+        if (
+          estimate.engine_version !== "phase_a_v1" &&
+          estimate.engine_version !== "phase_b_v1"
+        ) {
+          return Promise.resolve();
+        }
         return runStep("approve", () =>
           reviewForecast(
             forecastId,
-            {
-              action: "approve_phase_a_version",
-              estimate_set_id: estimate.estimate_set_id,
-            },
+            estimate.engine_version === "phase_b_v1"
+              ? {
+                  action: "approve_probability_publication",
+                  estimate_set_id: estimate.estimate_set_id,
+                }
+              : {
+                  action: "approve_phase_a_version",
+                  estimate_set_id: estimate.estimate_set_id,
+                },
             { idempotencyKey: idempotencyKeys.current.approve },
           ),
         );
@@ -1008,8 +1260,27 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     }
   }
 
+  function rerunPack(pack: ForecastCurrentResearchPack) {
+    if (
+      !window.confirm(
+        "このパックを再実行しますか？Deep Researchを再度呼び出すため、追加のコストと時間が発生します。",
+      )
+    ) {
+      return;
+    }
+    void runStep("pack", () =>
+      rerunForecastResearchPack(
+        forecastId,
+        pack.pack_id,
+        { expected_active_pack_id: pack.pack_id },
+        { idempotencyKey: stableKey(forecastId, "pack") },
+      ),
+    );
+  }
+
   const canDispatch = approvedFraming && status === "framing_approved";
   const canRecoverManualPack =
+    !forecastProgress.phaseBStarted &&
     Boolean(currentResearchPack) &&
     (currentResearchPackStatus === "needs_human_review" ||
       currentResearchPackStatus === "failed" ||
@@ -1024,18 +1295,27 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     claimTargetsApproved ||
     (forecast?.approved_claim_target_link_count ?? 0) > 0 ||
     statusAtLeast(status, "draft_ready");
-  const phaseAApproved =
+  const isPhaseBEstimate = estimate?.engine_version === "phase_b_v1";
+  const hasKnownEstimateEngine =
+    estimate?.engine_version === "phase_a_v1" ||
+    estimate?.engine_version === "phase_b_v1";
+  const estimateApproved =
     statusAtLeast(status, "committed") ||
     Boolean(
       estimate &&
-        (estimate.approved || phaseAApprovedEstimateId === estimate.estimate_set_id),
+        (estimate.approved || approvedEstimateSetId === estimate.estimate_set_id),
     );
   const canApproveClaimTargets =
     status === "scenarios_ready" && !effectiveClaimTargetsApproved;
   const canCompute = status === "scenarios_ready" && effectiveClaimTargetsApproved;
   const canRestoreDraft = status === "draft_ready" && !estimate;
-  const canApproveEstimate = status === "draft_ready" && Boolean(estimate) && !phaseAApproved;
-  const canCommit = status === "draft_ready" && Boolean(estimate) && phaseAApproved;
+  const canApproveEstimate =
+    status === "draft_ready" &&
+    Boolean(estimate?.estimate_set_id) &&
+    hasKnownEstimateEngine &&
+    !estimateApproved;
+  const canSubmitEstimateApproval = canApproveEstimate;
+  const canCommit = status === "draft_ready" && Boolean(estimate) && estimateApproved;
   const canResolve = status === "committed" && Boolean(selectedOutcomeId);
   const flowNodes = forecastExecutionNodes({
     status,
@@ -1046,16 +1326,22 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     researchPackSubmitting,
     researchPackSubmitWaiting,
     currentResearchPackStatus,
+    phaseBStarted: forecastProgress.phaseBStarted,
+    completedDefaultPackCount: forecastProgress.completedDefaultPackCount,
+    missingDefaultPacks: forecastProgress.missingDefaultRoles.length,
     claimTargetsApproved: effectiveClaimTargetsApproved,
     hasEstimate: Boolean(estimate),
-    phaseAApproved,
+    estimateApproved,
     packSubmissionPending,
     busy,
+    probabilityEngine,
+    isPhaseBEstimate,
   });
   const currentStep = deriveCurrentStep({
     status,
     currentResearchPackStatus,
-    currentResearchPackPresent: Boolean(currentResearchPack),
+    currentResearchPackPresent:
+      Boolean(currentResearchPack) || forecastProgress.phaseBStarted,
     packSubmissionPending,
     packSubmissionIsSlow,
     researchPackSubmitting,
@@ -1064,6 +1350,8 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     researchPackRunning,
     researchPackCompleted,
     researchPackBlocked,
+    phaseBStarted: forecastProgress.phaseBStarted,
+    missingDefaultPacks: forecastProgress.missingDefaultRoles.length,
     canDispatch,
     canExtract,
     canGenerate,
@@ -1074,6 +1362,8 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     canCommit,
     canResolve,
     estimatePresent: Boolean(estimate),
+    probabilityEngine,
+    isPhaseBEstimate,
   });
   const researchPackUpdatedLabel = formatStartedAt(
     currentResearchPack?.research_run_updated_at ??
@@ -1085,7 +1375,13 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     ? "Deep Research送信待ち"
     : packSubmissionPending
       ? "サーバーに登録中"
-      : packStatusLabel(currentResearchPackStatus);
+      : forecastProgress.phaseBStarted
+        ? forecastProgress.missingDefaultRoles.length > 0
+          ? `必要Pack不足 (${forecastProgress.completedDefaultPackCount}/5完了)`
+          : researchPackCompleted
+            ? "5 Pack完了"
+            : `${forecastProgress.completedDefaultPackCount}/5 Pack完了`
+      : localizePackStatus(currentResearchPackStatus);
   const currentStepDetails = [
     { label: "Forecast本体状態", value: forecastDisplayStatus },
     {
@@ -1164,7 +1460,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
           <p className="screen-subtitle">{forecast?.question ?? forecastId}</p>
         </div>
         <div className="forecast-detail-actions">
-          <span className="forecast-status-pill">
+          <span className={`status-pill status-pill--${forecastStatusTone(status)}`}>
             {forecastDisplayStatus}
           </span>
           {researchRunPath && (
@@ -1185,22 +1481,13 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       )}
 
       <div className="metric-grid">
-        <div className="metric-card">
-          <span className="metric-label">Forecast本体</span>
-          <strong>{forecastDisplayStatus}</strong>
-        </div>
-        <div className="metric-card">
-          <span className="metric-label">フレーミング</span>
-          <strong>{forecast?.approved_framing_version ? "承認済み" : "承認待ち"}</strong>
-        </div>
-        <div className="metric-card">
-          <span className="metric-label">公開情報パック</span>
-          <strong>{currentResearchPackDisplayStatus}</strong>
-        </div>
-        <div className="metric-card">
-          <span className="metric-label">確率エンジン</span>
-          <strong>{estimate?.engine_version ?? "未計算"}</strong>
-        </div>
+        <MetricCard label="Forecast本体" value={forecastDisplayStatus} />
+        <MetricCard
+          label="フレーミング"
+          value={forecast?.approved_framing_version ? "承認済み" : "承認待ち"}
+        />
+        <MetricCard label="公開情報パック" value={currentResearchPackDisplayStatus} />
+        <MetricCard label="確率エンジン" value={estimate?.engine_version ?? "未計算"} />
       </div>
 
       <section
@@ -1209,7 +1496,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       >
         <div className="forecast-current-step__header">
           <div>
-            <span className="metric-label">現在のステップ</span>
+            <span className="forecast-current-step__kicker">現在のステップ</span>
             <h2 id="forecast-current-step-heading">{currentStep.title}</h2>
           </div>
           <span className="forecast-current-step__state">
@@ -1233,7 +1520,10 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
               <button
                 type="button"
                 className="btn-primary"
-                disabled={!!busy && currentStep.action !== "refresh"}
+                disabled={
+                  (!!busy && currentStep.action !== "refresh") ||
+                  (currentStep.action === "approve" && !canSubmitEstimateApproval)
+                }
                 onClick={() => handleCurrentStepAction(currentStep.action)}
               >
                 {currentStep.actionLabel}
@@ -1282,7 +1572,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
             {collectionMode === "auto" ? (
               <div className="forecast-collection-choice__action">
                 <p>
-                  Deep Research APIで公開情報を収集し、完了後に証拠抽出へ進めます。
+                  Deep Research APIで既定5 Packを収集し、完了後に証拠抽出へ進めます。
                 </p>
                 <button
                   type="button"
@@ -1437,6 +1727,8 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
         </dl>
       </section>
 
+      <ForecastReport forecast={forecast} estimate={estimate} />
+
       <ForecastFlowProgress
         heading="全体フロー"
         summary="Forecastが解決までのどこにいるかを確認できます。操作は上の現在ステップから行います。"
@@ -1446,26 +1738,21 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
         columns={4}
       />
 
-      {estimate && (
-        <div className="form-panel" id="forecast-estimate-panel">
-          <div className="run-card-meta">
-            <span>{estimate.engine_version}</span>
-            <span>{estimate.input_snapshot_hash}</span>
-          </div>
-          <div className="result-list">
-            {estimate.estimates.map((item) => (
-              <article key={item.estimate_id} className="run-card">
-                <p className="run-card-title">{item.target_id}</p>
-                <p>{(item.final_probability * 100).toFixed(1)}%</p>
-                <p className="run-card-meta">
-                  80%推定範囲 {item.uncertainty_range.lo80.toFixed(3)}-
-                  {item.uncertainty_range.hi80.toFixed(3)}
-                </p>
-              </article>
-            ))}
-          </div>
-        </div>
-      )}
+      <PackCollectionPanel
+        packs={forecastProgress.packs}
+        busy={Boolean(busy)}
+        onRerunPack={rerunPack}
+        onDispatchDefaults={
+          canDispatch
+            ? () => void runCommand("pack")
+            : undefined
+        }
+      />
+
+      <EvidenceBoard forecast={forecast} />
+      <ScenarioMap forecast={forecast} estimate={estimate} />
+
+      <ProbabilityPanel forecast={forecast} estimate={estimate} />
 
       {(forecast?.status === "committed" || forecast?.status === "resolved") && (
         <div className="form-panel" id="forecast-resolve-panel">

@@ -2435,6 +2435,7 @@ async def test_manual_research_pack_import_cleans_up_run_when_pack_update_fails(
 @pytest.mark.anyio
 async def test_phase_a_forecast_lifecycle_and_forecast_research_mode(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake = IntegrationFakeAzure()
     forecast, research = _make_orchestrators(tmp_path, fake)
@@ -2632,6 +2633,28 @@ async def test_phase_a_forecast_lifecycle_and_forecast_research_mode(
         assert compute_after_commit.status_code == 409
         assert _typed_code(compute_after_commit.json()) == "estimate_set_already_committed"
 
+        from dataclasses import replace
+
+        from api.forecast import probability
+
+        original_get_engine = probability.get_engine
+        original_engine = original_get_engine("phase_a_v1")
+
+        def fail_compute(*, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+            _ = snapshot
+            raise AssertionError("resolve_forecast must use frozen estimates")
+
+        frozen_scoring_engine = replace(original_engine, compute=fail_compute)
+
+        def patched_get_engine(
+            engine_version: str | None = None,
+        ) -> probability.ProbabilityEngine:
+            if engine_version in (None, "phase_a_v1"):
+                return frozen_scoring_engine
+            return original_get_engine(engine_version)
+
+        monkeypatch.setattr(probability, "get_engine", patched_get_engine)
+
         outcome_id = estimate_json["estimates"][0]["target_id"]
         resolve = await client.post(
             f"/forecasts/{forecast_id}/resolve",
@@ -2735,6 +2758,36 @@ async def test_forecast_idempotency_replays_and_conflicts(tmp_path: Path) -> Non
         assert pack_replay.json()["pack_id"] == pack.json()["pack_id"]
         assert pack_retry.json()["pack_id"] == pack.json()["pack_id"]
         assert len(fake.submit_calls) == 1
+
+
+@pytest.mark.anyio
+async def test_forecast_rejects_oversized_idempotency_key(tmp_path: Path) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/forecasts",
+            headers={"Idempotency-Key": "x" * 201},
+            json={
+                "question": "Will oversized idempotency keys be rejected?",
+                "resolution_criteria": "Resolve from public sources.",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+
+    assert response.status_code == 422
+    with forecast.repository.connect() as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM forecast_idempotency_keys").fetchone()[0]
+            == 0
+        )
 
 
 @pytest.mark.anyio
@@ -3029,6 +3082,33 @@ async def test_forecast_disabled_returns_typed_conflict(tmp_path: Path) -> None:
     assert _typed_code(response.json()) == "forecast_disabled"
 
 
+@pytest.mark.anyio
+async def test_forecast_disabled_rejects_read_endpoints(tmp_path: Path) -> None:
+    fake = IntegrationFakeAzure()
+    forecast, research = _make_orchestrators(tmp_path, fake)
+    created = forecast.create_forecast(
+        request=forecast_create_request(),
+        idempotency_key=None,
+    )
+    forecast_id = created.forecast_id
+    forecast.settings = forecast.settings.model_copy(update={"forecast_enabled": False})
+    app = create_app()
+    app.dependency_overrides[get_forecast_orchestrator] = lambda: forecast
+    app.dependency_overrides[get_research_orchestrator] = lambda: research
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        listed = await client.get("/forecasts")
+        detail = await client.get(f"/forecasts/{forecast_id}")
+        audit = await client.get(f"/forecasts/{forecast_id}/audit")
+
+    for response in (listed, detail, audit):
+        assert response.status_code == 409
+        assert _typed_code(response.json()) == "forecast_disabled"
+
+
 def test_forecast_audit_events_are_append_only(tmp_path: Path) -> None:
     fake = IntegrationFakeAzure()
     forecast, _research = _make_orchestrators(tmp_path, fake)
@@ -3100,6 +3180,40 @@ def test_phase_a_softmax_exact_reference_case() -> None:
 
     actual_probability = float(estimates[0]["final_probability"])
     assert abs(actual_probability - 0.8807970779778823) < 1e-15
+
+
+def test_phase_a_applies_claim_polarity_to_link_direction() -> None:
+    snapshot = {
+        "outcomes": [
+            {"outcome_id": "yes"},
+            {"outcome_id": "no"},
+        ],
+        "claims": [
+            {
+                "claim_id": "c1",
+                "polarity": -1,
+                "evidence_strength": 1.0,
+                "reliability_score": 1.0,
+                "cluster_id": "cluster-a",
+                "independence_group": "group-a",
+            },
+        ],
+        "approved_target_links": [
+            {
+                "claim_id": "c1",
+                "target_kind": "outcome",
+                "target_id": "yes",
+                "direction": 1,
+                "relevance_weight": 1.0,
+            },
+        ],
+    }
+
+    estimates = compute_phase_a_estimates(snapshot=snapshot, epsilon_floor=0.0)
+
+    yes_probability = float(estimates[0]["final_probability"])
+    assert yes_probability < 0.5
+    assert abs(yes_probability - 0.2689414213699951) < 1e-15
 
 
 def forecast_create_request():

@@ -61,7 +61,7 @@ Fields:
   `allow_api_reruns=true` maps to `api`, and `false` maps to `disabled`.
   If `allow_api_reruns=false`, an explicit `api` mode is also normalized to
   `disabled`.
-  `manual_chatgpt` requires `allow_api_reruns=true`; it keeps rerun limits but
+  `manual_chatgpt` is valid even when `allow_api_reruns=false`; it keeps rerun limits but
   pauses after rerun planning for a ChatGPT prompt/result upload instead of
   submitting Deep Research through the API.
 - `options_json`, optional JSON matching `ResearchRunOptions`.
@@ -589,15 +589,24 @@ Required PhaseA `409` codes include `forecast_disabled`,
 `scenarios_not_ready`, `claim_targets_not_approved`,
 `draft_estimate_set_exists`, `approval_required`,
 `estimate_set_already_committed`, `forecast_already_resolved`,
-`idempotency_conflict`, and `idempotency_in_progress`.
+`idempotency_conflict`, and `idempotency_in_progress`. PhaseB private-pack
+policy gates can also return `private_vector_store_required`,
+`private_vector_store_not_allowlisted`, `trusted_source_required`,
+`trusted_source_unknown`, `trusted_source_not_approved`,
+`trusted_source_expired`, `trusted_source_profile_not_allowed`,
+`trusted_source_pack_role_not_allowed`, `trusted_source_tool_not_allowed`,
+`trusted_source_vector_store_not_allowed`, and
+`trusted_source_mcp_server_not_allowed`.
 
 Lifecycle:
 
 - `POST /forecasts` returns `202` and creates a forecast plus framing version.
 - `POST /forecasts/{id}/review` with `{"action":"approve_framing"}` freezes the
   latest question/outcome framing.
-- `POST /forecasts/{id}/research-packs` dispatches the public `current_state`
-  pack after framing approval.
+- `POST /forecasts/{id}/research-packs` dispatches a research pack after
+  framing approval. By default this is the public `current_state` pack.
+  `tool_profile="private"` is available for approved private-data workflows and
+  requires `vector_store_ids` plus `trusted_source_identifiers`.
 - `POST /forecasts/{id}/evidence/extract` requires a completed pack and stores
   only source-linked public claims.
 - `POST /forecasts/{id}/scenarios/generate` requires evidence and creates
@@ -625,9 +634,20 @@ Forecast-linked ResearchRuns are protected. If
 `409 forecast_linked_research_run`; retain both Research artifacts and Forecast
 version artifacts for reproducibility.
 
-PhaseA read APIs return public sources and claims only. Private data approval,
-private packs, reforecasting, and narrative-only scenarios are PhaseB/C work and
-are not available in PhaseA.
+PhaseA read APIs return public sources and claims only by default.
+
+PhaseB private research packs are available on
+`POST /forecasts/{id}/research-packs` with `tool_profile="private"` and
+`data_classification="internal"` or `"restricted"`. Private requests require
+`vector_store_ids`; those IDs must be listed in
+`RESEARCH_PRIVATE_VECTOR_STORE_ALLOWLIST`. Requests must also include approved
+`trusted_source_identifiers`. Each trusted source must allow the requested tool
+profile, pack role, resolved tool names, and, for private `file_search`, must
+explicitly allow every requested vector store ID. Empty trusted-source vector
+store allowlists are rejected rather than treated as wildcards. Restricted
+packs cannot run in background mode.
+
+Reforecasting and narrative-only scenarios remain PhaseC work.
 
 ## Storage Compatibility
 

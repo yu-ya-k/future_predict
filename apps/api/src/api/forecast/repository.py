@@ -45,6 +45,21 @@ def _parse_date(value: str | None) -> date | None:
     return date.fromisoformat(value) if value else None
 
 
+def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table_name})")}
+
+
+def _ensure_column(
+    connection: sqlite3.Connection,
+    *,
+    table_name: str,
+    column_name: str,
+    ddl: str,
+) -> None:
+    if column_name not in _table_columns(connection, table_name):
+        connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {ddl}")
+
+
 def _is_phase_a_research_pack_unique_error(error: sqlite3.IntegrityError) -> bool:
     message = str(error)
     return (
@@ -114,6 +129,14 @@ class ForecastRepository:
                     status TEXT NOT NULL,
                     reason TEXT,
                     prompt_hash TEXT NOT NULL,
+                    decision TEXT NOT NULL DEFAULT 'allowed',
+                    policy_version TEXT NOT NULL DEFAULT 'phase_a_v1',
+                    data_classification TEXT NOT NULL DEFAULT 'public',
+                    resolved_tools_json TEXT NOT NULL DEFAULT '[]',
+                    vector_store_ids_json TEXT NOT NULL DEFAULT '[]',
+                    mcp_server_ids_json TEXT NOT NULL DEFAULT '[]',
+                    background INTEGER NOT NULL DEFAULT 1,
+                    blocked_terms_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL
                 );
 
@@ -129,12 +152,36 @@ class ForecastRepository:
                     max_tool_calls INTEGER NOT NULL,
                     policy_decision_id TEXT NOT NULL REFERENCES forecast_policy_decisions(policy_decision_id),
                     report_artifact_hash TEXT,
+                    attempt_no INTEGER NOT NULL DEFAULT 1,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    rerun_of_pack_id TEXT REFERENCES forecast_research_packs(pack_id),
+                    timeout_sec INTEGER,
+                    estimated_cost_budget_usd REAL,
+                    vector_store_ids_json TEXT NOT NULL DEFAULT '[]',
+                    mcp_server_ids_json TEXT NOT NULL DEFAULT '[]',
+                    cache_key TEXT,
+                    rerun_policy TEXT,
+                    pack_request_id TEXT,
+                    data_classification TEXT NOT NULL DEFAULT 'public',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
 
-                CREATE UNIQUE INDEX IF NOT EXISTS forecast_research_packs_phase_a_unique
-                ON forecast_research_packs(forecast_id, pack_role, tool_profile);
+                CREATE TABLE IF NOT EXISTS forecast_pack_requests (
+                    pack_request_id TEXT PRIMARY KEY,
+                    forecast_id TEXT NOT NULL REFERENCES forecast_forecasts(id) ON DELETE CASCADE,
+                    pack_role TEXT NOT NULL,
+                    tool_profile TEXT NOT NULL,
+                    data_classification TEXT NOT NULL DEFAULT 'public',
+                    status TEXT NOT NULL,
+                    reason TEXT,
+                    policy_decision_id TEXT REFERENCES forecast_policy_decisions(policy_decision_id),
+                    reviewer TEXT,
+                    reviewer_auth_subject TEXT,
+                    request_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS forecast_sources (
                     source_id TEXT PRIMARY KEY,
@@ -145,6 +192,8 @@ class ForecastRepository:
                     url TEXT,
                     source_type TEXT NOT NULL,
                     source_classification TEXT NOT NULL,
+                    data_classification TEXT NOT NULL DEFAULT 'public',
+                    origin_tool_profile TEXT NOT NULL DEFAULT 'public',
                     reliability_score REAL NOT NULL,
                     metadata_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL
@@ -161,6 +210,13 @@ class ForecastRepository:
                     cluster_id TEXT NOT NULL,
                     independence_group TEXT NOT NULL,
                     source_classification TEXT NOT NULL,
+                    data_classification TEXT NOT NULL DEFAULT 'public',
+                    origin_tool_profile TEXT NOT NULL DEFAULT 'public',
+                    pack_id TEXT REFERENCES forecast_research_packs(pack_id) ON DELETE SET NULL,
+                    extraction_batch_id TEXT,
+                    report_artifact_hash TEXT,
+                    manual_locked INTEGER NOT NULL DEFAULT 0,
+                    origin TEXT NOT NULL DEFAULT 'extractor',
                     extraction_model TEXT NOT NULL,
                     extraction_prompt_version TEXT NOT NULL,
                     review_status TEXT NOT NULL DEFAULT 'pending',
@@ -194,6 +250,71 @@ class ForecastRepository:
                     normalized_weight REAL NOT NULL DEFAULT 1,
                     validity_status TEXT NOT NULL DEFAULT 'valid',
                     created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS forecast_drivers (
+                    driver_id TEXT PRIMARY KEY,
+                    forecast_id TEXT NOT NULL REFERENCES forecast_forecasts(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS forecast_driver_states (
+                    state_id TEXT PRIMARY KEY,
+                    driver_id TEXT NOT NULL REFERENCES forecast_drivers(driver_id) ON DELETE CASCADE,
+                    label TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS forecast_scenario_driver_states (
+                    scenario_id TEXT NOT NULL REFERENCES forecast_scenarios(scenario_id) ON DELETE CASCADE,
+                    state_id TEXT NOT NULL REFERENCES forecast_driver_states(state_id) ON DELETE CASCADE,
+                    PRIMARY KEY (scenario_id, state_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS forecast_cross_impact (
+                    cross_impact_id TEXT PRIMARY KEY,
+                    forecast_id TEXT NOT NULL REFERENCES forecast_forecasts(id) ON DELETE CASCADE,
+                    source_outcome_id TEXT NOT NULL REFERENCES forecast_outcomes(outcome_id) ON DELETE CASCADE,
+                    target_outcome_id TEXT NOT NULL REFERENCES forecast_outcomes(outcome_id) ON DELETE CASCADE,
+                    delta REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS forecast_analog_events (
+                    analog_event_id TEXT PRIMARY KEY,
+                    forecast_id TEXT NOT NULL REFERENCES forecast_forecasts(id) ON DELETE CASCADE,
+                    pack_id TEXT REFERENCES forecast_research_packs(pack_id) ON DELETE SET NULL,
+                    title TEXT NOT NULL,
+                    matched_outcome_id TEXT NOT NULL REFERENCES forecast_outcomes(outcome_id) ON DELETE CASCADE,
+                    weight REAL NOT NULL CHECK (weight > 0),
+                    rationale TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS forecast_trusted_sources (
+                    trusted_source_id TEXT PRIMARY KEY,
+                    identifier TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL CHECK (status IN ('pending','approved','revoked','expired')),
+                    approved_by TEXT,
+                    approved_at TEXT,
+                    expires_at TEXT,
+                    allowed_profiles_json TEXT NOT NULL DEFAULT '[]',
+                    allowed_pack_roles_json TEXT NOT NULL DEFAULT '[]',
+                    allowed_tool_names_json TEXT NOT NULL DEFAULT '[]',
+                    allowed_vector_store_ids_json TEXT NOT NULL DEFAULT '[]',
+                    allowed_mcp_server_ids_json TEXT NOT NULL DEFAULT '[]',
+                    owner_team_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS forecast_estimate_sets (
@@ -253,6 +374,10 @@ class ForecastRepository:
                     version_id TEXT,
                     action TEXT NOT NULL,
                     comment TEXT,
+                    reviewer TEXT,
+                    reviewer_auth_subject TEXT,
+                    policy_decision_id TEXT,
+                    review_reason TEXT,
                     created_at TEXT NOT NULL
                 );
 
@@ -371,14 +496,152 @@ class ForecastRepository:
                 END;
                 """
             )
-            columns = {
-                row["name"]
-                for row in connection.execute("PRAGMA table_info(forecast_forecasts)")
-            }
-            if "original_execution_prompt" not in columns:
-                connection.execute(
-                    "ALTER TABLE forecast_forecasts ADD COLUMN original_execution_prompt TEXT"
+            _ensure_column(
+                connection,
+                table_name="forecast_forecasts",
+                column_name="original_execution_prompt",
+                ddl="original_execution_prompt TEXT",
+            )
+            _ensure_column(
+                connection,
+                table_name="forecast_policy_decisions",
+                column_name="decision",
+                ddl="decision TEXT NOT NULL DEFAULT 'allowed'",
+            )
+            _ensure_column(
+                connection,
+                table_name="forecast_policy_decisions",
+                column_name="policy_version",
+                ddl="policy_version TEXT NOT NULL DEFAULT 'phase_a_v1'",
+            )
+            _ensure_column(
+                connection,
+                table_name="forecast_policy_decisions",
+                column_name="data_classification",
+                ddl="data_classification TEXT NOT NULL DEFAULT 'public'",
+            )
+            _ensure_column(
+                connection,
+                table_name="forecast_policy_decisions",
+                column_name="resolved_tools_json",
+                ddl="resolved_tools_json TEXT NOT NULL DEFAULT '[]'",
+            )
+            _ensure_column(
+                connection,
+                table_name="forecast_policy_decisions",
+                column_name="vector_store_ids_json",
+                ddl="vector_store_ids_json TEXT NOT NULL DEFAULT '[]'",
+            )
+            _ensure_column(
+                connection,
+                table_name="forecast_policy_decisions",
+                column_name="mcp_server_ids_json",
+                ddl="mcp_server_ids_json TEXT NOT NULL DEFAULT '[]'",
+            )
+            _ensure_column(
+                connection,
+                table_name="forecast_policy_decisions",
+                column_name="background",
+                ddl="background INTEGER NOT NULL DEFAULT 1",
+            )
+            _ensure_column(
+                connection,
+                table_name="forecast_policy_decisions",
+                column_name="blocked_terms_json",
+                ddl="blocked_terms_json TEXT NOT NULL DEFAULT '[]'",
+            )
+            for column_name, ddl in {
+                "attempt_no": "attempt_no INTEGER NOT NULL DEFAULT 1",
+                "is_active": "is_active INTEGER NOT NULL DEFAULT 1",
+                "rerun_of_pack_id": "rerun_of_pack_id TEXT REFERENCES forecast_research_packs(pack_id)",
+                "timeout_sec": "timeout_sec INTEGER",
+                "estimated_cost_budget_usd": "estimated_cost_budget_usd REAL",
+                "vector_store_ids_json": "vector_store_ids_json TEXT NOT NULL DEFAULT '[]'",
+                "mcp_server_ids_json": "mcp_server_ids_json TEXT NOT NULL DEFAULT '[]'",
+                "cache_key": "cache_key TEXT",
+                "rerun_policy": "rerun_policy TEXT",
+                "pack_request_id": "pack_request_id TEXT",
+                "data_classification": "data_classification TEXT NOT NULL DEFAULT 'public'",
+            }.items():
+                _ensure_column(
+                    connection,
+                    table_name="forecast_research_packs",
+                    column_name=column_name,
+                    ddl=ddl,
                 )
+            for column_name, ddl in {
+                "data_classification": "data_classification TEXT NOT NULL DEFAULT 'public'",
+                "origin_tool_profile": "origin_tool_profile TEXT NOT NULL DEFAULT 'public'",
+            }.items():
+                _ensure_column(
+                    connection,
+                    table_name="forecast_sources",
+                    column_name=column_name,
+                    ddl=ddl,
+                )
+            for column_name, ddl in {
+                "data_classification": "data_classification TEXT NOT NULL DEFAULT 'public'",
+                "origin_tool_profile": "origin_tool_profile TEXT NOT NULL DEFAULT 'public'",
+                "pack_id": "pack_id TEXT REFERENCES forecast_research_packs(pack_id) ON DELETE SET NULL",
+                "extraction_batch_id": "extraction_batch_id TEXT",
+                "report_artifact_hash": "report_artifact_hash TEXT",
+                "manual_locked": "manual_locked INTEGER NOT NULL DEFAULT 0",
+                "origin": "origin TEXT NOT NULL DEFAULT 'extractor'",
+            }.items():
+                _ensure_column(
+                    connection,
+                    table_name="forecast_claims",
+                    column_name=column_name,
+                    ddl=ddl,
+                )
+            for column_name, ddl in {
+                "reviewer": "reviewer TEXT",
+                "reviewer_auth_subject": "reviewer_auth_subject TEXT",
+                "policy_decision_id": "policy_decision_id TEXT",
+                "review_reason": "review_reason TEXT",
+            }.items():
+                _ensure_column(
+                    connection,
+                    table_name="forecast_reviews",
+                    column_name=column_name,
+                    ddl=ddl,
+                )
+            for column_name, ddl in {
+                "allowed_vector_store_ids_json": "allowed_vector_store_ids_json TEXT NOT NULL DEFAULT '[]'",
+                "allowed_mcp_server_ids_json": "allowed_mcp_server_ids_json TEXT NOT NULL DEFAULT '[]'",
+            }.items():
+                _ensure_column(
+                    connection,
+                    table_name="forecast_trusted_sources",
+                    column_name=column_name,
+                    ddl=ddl,
+                )
+            connection.execute("DROP INDEX IF EXISTS forecast_research_packs_phase_a_unique")
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS forecast_research_packs_active_unique
+                ON forecast_research_packs(forecast_id, pack_role, tool_profile)
+                WHERE is_active = 1
+                """
+            )
+            connection.execute(
+                """
+                UPDATE forecast_sources
+                SET data_classification = source_classification,
+                    origin_tool_profile = source_classification
+                WHERE source_classification IN ('public', 'private')
+                  AND data_classification = 'public'
+                """
+            )
+            connection.execute(
+                """
+                UPDATE forecast_claims
+                SET data_classification = source_classification,
+                    origin_tool_profile = source_classification
+                WHERE source_classification IN ('public', 'private')
+                  AND data_classification = 'public'
+                """
+            )
 
     def append_audit(
         self,
@@ -715,6 +978,14 @@ class ForecastRepository:
         status: str,
         reason: str | None,
         prompt_hash: str,
+        decision: str | None = None,
+        policy_version: str = "phase_a_v1",
+        data_classification: str = "public",
+        resolved_tools: list[dict[str, Any]] | None = None,
+        vector_store_ids: list[str] | None = None,
+        mcp_server_ids: list[str] | None = None,
+        background: bool = True,
+        blocked_terms: list[str] | None = None,
     ) -> UUID:
         decision_id = uuid4()
         now = utc_now().isoformat()
@@ -723,9 +994,11 @@ class ForecastRepository:
                 """
                 INSERT INTO forecast_policy_decisions (
                     policy_decision_id, forecast_id, profile, status, reason,
-                    prompt_hash, created_at
+                    prompt_hash, decision, policy_version, data_classification,
+                    resolved_tools_json, vector_store_ids_json, mcp_server_ids_json,
+                    background, blocked_terms_json, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(decision_id),
@@ -734,6 +1007,14 @@ class ForecastRepository:
                     status,
                     reason,
                     prompt_hash,
+                    decision or status,
+                    policy_version,
+                    data_classification,
+                    _dump(resolved_tools or []),
+                    _dump(vector_store_ids or []),
+                    _dump(mcp_server_ids or []),
+                    1 if background else 0,
+                    _dump(blocked_terms or []),
                     now,
                 ),
             )
@@ -746,6 +1027,8 @@ class ForecastRepository:
                     "profile": profile,
                     "status": status,
                     "reason": reason,
+                    "policy_version": policy_version,
+                    "data_classification": data_classification,
                 },
             )
         return decision_id
@@ -762,19 +1045,45 @@ class ForecastRepository:
         prompt_version: str,
         max_tool_calls: int,
         policy_decision_id: UUID,
+        attempt_no: int = 1,
+        is_active: bool = True,
+        rerun_of_pack_id: UUID | None = None,
+        timeout_sec: int | None = None,
+        estimated_cost_budget_usd: float | None = None,
+        vector_store_ids: list[str] | None = None,
+        mcp_server_ids: list[str] | None = None,
+        cache_key: str | None = None,
+        rerun_policy: str | None = None,
+        pack_request_id: UUID | None = None,
+        data_classification: str = "public",
+        replace_active_pack_id: UUID | None = None,
     ) -> sqlite3.Row:
         pack_id = uuid4()
         now = utc_now().isoformat()
         with self.connect() as connection:
             try:
+                if replace_active_pack_id is not None:
+                    cursor = connection.execute(
+                        """
+                        UPDATE forecast_research_packs
+                        SET is_active = 0, updated_at = ?
+                        WHERE pack_id = ? AND forecast_id = ? AND is_active = 1
+                        """,
+                        (now, str(replace_active_pack_id), str(forecast_id)),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ValueError("active_pack_changed")
                 connection.execute(
                     """
                     INSERT INTO forecast_research_packs (
                         pack_id, forecast_id, research_run_id, pack_role, tool_profile,
                         status, model_deployment, prompt_version, max_tool_calls,
-                        policy_decision_id, created_at, updated_at
+                        policy_decision_id, attempt_no, is_active, rerun_of_pack_id,
+                        timeout_sec, estimated_cost_budget_usd, vector_store_ids_json,
+                        mcp_server_ids_json, cache_key, rerun_policy, pack_request_id,
+                        data_classification, created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(pack_id),
@@ -787,6 +1096,17 @@ class ForecastRepository:
                         prompt_version,
                         max_tool_calls,
                         str(policy_decision_id),
+                        attempt_no,
+                        1 if is_active else 0,
+                        str(rerun_of_pack_id) if rerun_of_pack_id else None,
+                        timeout_sec,
+                        estimated_cost_budget_usd,
+                        _dump(vector_store_ids or []),
+                        _dump(mcp_server_ids or []),
+                        cache_key,
+                        rerun_policy,
+                        str(pack_request_id) if pack_request_id else None,
+                        data_classification,
                         now,
                         now,
                     ),
@@ -798,6 +1118,7 @@ class ForecastRepository:
                     """
                     SELECT * FROM forecast_research_packs
                     WHERE forecast_id = ? AND pack_role = ? AND tool_profile = ?
+                      AND is_active = 1
                     """,
                     (str(forecast_id), pack_role, tool_profile),
                 ).fetchone()
@@ -821,6 +1142,8 @@ class ForecastRepository:
                     "research_run_id": str(research_run_id),
                     "pack_role": pack_role,
                     "tool_profile": tool_profile,
+                    "attempt_no": attempt_no,
+                    "data_classification": data_classification,
                 },
             )
             row = connection.execute(
@@ -841,6 +1164,184 @@ class ForecastRepository:
                 """,
                 (str(forecast_id),),
             ).fetchall()
+
+    def list_active_packs(self, forecast_id: UUID) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM forecast_research_packs
+                WHERE forecast_id = ? AND is_active = 1
+                ORDER BY pack_role, tool_profile, created_at
+                """,
+                (str(forecast_id),),
+            ).fetchall()
+
+    def get_pack(self, pack_id: UUID) -> sqlite3.Row:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM forecast_research_packs WHERE pack_id = ?",
+                (str(pack_id),),
+            ).fetchone()
+        if row is None:
+            raise KeyError(str(pack_id))
+        return row
+
+    def deactivate_pack(self, pack_id: UUID) -> None:
+        now = utc_now().isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE forecast_research_packs
+                SET is_active = 0, updated_at = ?
+                WHERE pack_id = ?
+                """,
+                (now, str(pack_id)),
+            )
+
+    def add_pack_request(
+        self,
+        *,
+        forecast_id: UUID,
+        pack_role: str,
+        tool_profile: str,
+        data_classification: str,
+        status: str,
+        reason: str | None,
+        policy_decision_id: UUID | None,
+        request_payload: dict[str, Any],
+        reviewer: str | None = None,
+        reviewer_auth_subject: str | None = None,
+    ) -> UUID:
+        pack_request_id = uuid4()
+        now = utc_now().isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO forecast_pack_requests (
+                    pack_request_id, forecast_id, pack_role, tool_profile,
+                    data_classification, status, reason, policy_decision_id,
+                    reviewer, reviewer_auth_subject, request_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(pack_request_id),
+                    str(forecast_id),
+                    pack_role,
+                    tool_profile,
+                    data_classification,
+                    status,
+                    reason,
+                    str(policy_decision_id) if policy_decision_id else None,
+                    reviewer,
+                    reviewer_auth_subject,
+                    _dump(request_payload),
+                    now,
+                    now,
+                ),
+            )
+            self.append_audit(
+                connection,
+                forecast_id,
+                "pack_request_recorded",
+                {
+                    "pack_request_id": str(pack_request_id),
+                    "pack_role": pack_role,
+                    "tool_profile": tool_profile,
+                    "data_classification": data_classification,
+                    "status": status,
+                    "reason": reason,
+                },
+            )
+        return pack_request_id
+
+    def get_policy_decision(self, policy_decision_id: UUID) -> sqlite3.Row:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM forecast_policy_decisions
+                WHERE policy_decision_id = ?
+                """,
+                (str(policy_decision_id),),
+            ).fetchone()
+        if row is None:
+            raise KeyError(str(policy_decision_id))
+        return row
+
+    def get_trusted_source(self, identifier: str) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM forecast_trusted_sources
+                WHERE identifier = ?
+                """,
+                (identifier,),
+            ).fetchone()
+
+    def upsert_trusted_source(
+        self,
+        *,
+        identifier: str,
+        status: str,
+        approved_by: str | None = None,
+        approved_at: datetime | None = None,
+        expires_at: datetime | None = None,
+        allowed_profiles: list[str] | None = None,
+        allowed_pack_roles: list[str] | None = None,
+        allowed_tool_names: list[str] | None = None,
+        allowed_vector_store_ids: list[str] | None = None,
+        allowed_mcp_server_ids: list[str] | None = None,
+        owner_team_id: str | None = None,
+    ) -> sqlite3.Row:
+        now = utc_now().isoformat()
+        trusted_source_id = uuid4()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO forecast_trusted_sources (
+                    trusted_source_id, identifier, status, approved_by, approved_at,
+                    expires_at, allowed_profiles_json, allowed_pack_roles_json,
+                    allowed_tool_names_json, allowed_vector_store_ids_json,
+                    allowed_mcp_server_ids_json, owner_team_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(identifier) DO UPDATE SET
+                    status = excluded.status,
+                    approved_by = excluded.approved_by,
+                    approved_at = excluded.approved_at,
+                    expires_at = excluded.expires_at,
+                    allowed_profiles_json = excluded.allowed_profiles_json,
+                    allowed_pack_roles_json = excluded.allowed_pack_roles_json,
+                    allowed_tool_names_json = excluded.allowed_tool_names_json,
+                    allowed_vector_store_ids_json = excluded.allowed_vector_store_ids_json,
+                    allowed_mcp_server_ids_json = excluded.allowed_mcp_server_ids_json,
+                    owner_team_id = excluded.owner_team_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(trusted_source_id),
+                    identifier,
+                    status,
+                    approved_by,
+                    approved_at.isoformat() if approved_at else None,
+                    expires_at.isoformat() if expires_at else None,
+                    _dump(allowed_profiles or []),
+                    _dump(allowed_pack_roles or []),
+                    _dump(allowed_tool_names or []),
+                    _dump(allowed_vector_store_ids or []),
+                    _dump(allowed_mcp_server_ids or []),
+                    owner_team_id,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM forecast_trusted_sources WHERE identifier = ?",
+                (identifier,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(identifier)
+        return row
 
     def update_research_pack_status(
         self,
@@ -922,7 +1423,7 @@ class ForecastRepository:
                     (
                         source["source_id"],
                         str(forecast_id),
-                        str(pack_id),
+                        str(source.get("pack_id", pack_id)),
                         source["title"],
                         source.get("publisher"),
                         source.get("url"),
@@ -1006,13 +1507,298 @@ class ForecastRepository:
             )
         return self.get_sources(forecast_id), self.get_claims(forecast_id)
 
+    def upsert_evidence_batch(
+        self,
+        *,
+        forecast_id: UUID,
+        pack_id: UUID,
+        extraction_batch_id: str,
+        report_artifact_hash: str | None,
+        sources: list[dict[str, Any]],
+        claims: list[dict[str, Any]],
+        links: list[dict[str, Any]],
+    ) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+        now = utc_now().isoformat()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active_pack_ids = {
+                row["pack_id"]
+                for row in connection.execute(
+                    """
+                    SELECT pack_id FROM forecast_research_packs
+                    WHERE forecast_id = ? AND is_active = 1
+                    """,
+                    (str(forecast_id),),
+                ).fetchall()
+            }
+            connection.execute(
+                """
+                DELETE FROM forecast_claim_target_links
+                WHERE forecast_id = ?
+                  AND claim_id IN (
+                    SELECT claim_id FROM forecast_claims
+                    WHERE forecast_id = ?
+                      AND origin != 'manual'
+                      AND manual_locked = 0
+                      AND (
+                        pack_id IS NULL
+                        OR pack_id NOT IN (
+                          SELECT pack_id FROM forecast_research_packs
+                          WHERE forecast_id = ? AND is_active = 1
+                        )
+                      )
+                  )
+                """,
+                (str(forecast_id), str(forecast_id), str(forecast_id)),
+            )
+            connection.execute(
+                """
+                DELETE FROM forecast_claims
+                WHERE forecast_id = ?
+                  AND origin != 'manual'
+                  AND manual_locked = 0
+                  AND (
+                    pack_id IS NULL
+                    OR pack_id NOT IN (
+                      SELECT pack_id FROM forecast_research_packs
+                      WHERE forecast_id = ? AND is_active = 1
+                    )
+                  )
+                """,
+                (str(forecast_id), str(forecast_id)),
+            )
+            connection.execute(
+                """
+                DELETE FROM forecast_sources
+                WHERE forecast_id = ?
+                  AND (
+                    pack_id IS NULL
+                    OR pack_id NOT IN (
+                      SELECT pack_id FROM forecast_research_packs
+                      WHERE forecast_id = ? AND is_active = 1
+                    )
+                  )
+                  AND source_id NOT IN (
+                    SELECT source_id FROM forecast_claim_source_links
+                  )
+                """,
+                (str(forecast_id), str(forecast_id)),
+            )
+            for source in sources:
+                source_pack_id = str(source.get("pack_id", pack_id))
+                if source_pack_id not in active_pack_ids:
+                    continue
+                data_classification = source.get(
+                    "data_classification",
+                    source.get("source_classification", "public"),
+                )
+                origin_tool_profile = source.get(
+                    "origin_tool_profile",
+                    source.get("source_classification", "public"),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO forecast_sources (
+                        source_id, forecast_id, pack_id, title, publisher, url,
+                        source_type, source_classification, data_classification,
+                        origin_tool_profile, reliability_score, metadata_json, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source_id) DO UPDATE SET
+                        pack_id = excluded.pack_id,
+                        title = excluded.title,
+                        publisher = excluded.publisher,
+                        url = excluded.url,
+                        source_type = excluded.source_type,
+                        source_classification = excluded.source_classification,
+                        data_classification = excluded.data_classification,
+                        origin_tool_profile = excluded.origin_tool_profile,
+                        reliability_score = excluded.reliability_score,
+                        metadata_json = excluded.metadata_json
+                    """,
+                    (
+                        source["source_id"],
+                        str(forecast_id),
+                        source_pack_id,
+                        source["title"],
+                        source.get("publisher"),
+                        source.get("url"),
+                        source["source_type"],
+                        source.get("source_classification", data_classification),
+                        data_classification,
+                        origin_tool_profile,
+                        source["reliability_score"],
+                        _dump(source.get("metadata", {})),
+                        now,
+                    ),
+                )
+            for claim in claims:
+                claim_pack_id = str(claim.get("pack_id", pack_id))
+                if claim_pack_id not in active_pack_ids:
+                    continue
+                existing = connection.execute(
+                    """
+                    SELECT manual_locked, origin FROM forecast_claims
+                    WHERE claim_id = ?
+                    """,
+                    (claim["claim_id"],),
+                ).fetchone()
+                if existing is not None and (
+                    int(existing["manual_locked"]) == 1 or existing["origin"] == "manual"
+                ):
+                    continue
+                data_classification = claim.get(
+                    "data_classification",
+                    claim.get("source_classification", "public"),
+                )
+                origin_tool_profile = claim.get(
+                    "origin_tool_profile",
+                    claim.get("source_classification", "public"),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO forecast_claims (
+                        claim_id, forecast_id, text, claim_type, polarity,
+                        evidence_strength, reliability_score, cluster_id,
+                        independence_group, source_classification,
+                        data_classification, origin_tool_profile, pack_id,
+                        extraction_batch_id, report_artifact_hash, manual_locked,
+                        origin, extraction_model, extraction_prompt_version,
+                        review_status, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(claim_id) DO UPDATE SET
+                        text = excluded.text,
+                        claim_type = excluded.claim_type,
+                        polarity = excluded.polarity,
+                        evidence_strength = excluded.evidence_strength,
+                        reliability_score = excluded.reliability_score,
+                        cluster_id = excluded.cluster_id,
+                        independence_group = excluded.independence_group,
+                        source_classification = excluded.source_classification,
+                        data_classification = excluded.data_classification,
+                        origin_tool_profile = excluded.origin_tool_profile,
+                        pack_id = excluded.pack_id,
+                        extraction_batch_id = excluded.extraction_batch_id,
+                        report_artifact_hash = excluded.report_artifact_hash,
+                        extraction_model = excluded.extraction_model,
+                        extraction_prompt_version = excluded.extraction_prompt_version,
+                        review_status = excluded.review_status
+                    """,
+                    (
+                        claim["claim_id"],
+                        str(forecast_id),
+                        claim["text"],
+                        claim["claim_type"],
+                        claim["polarity"],
+                        claim["evidence_strength"],
+                        claim["reliability_score"],
+                        claim["cluster_id"],
+                        claim["independence_group"],
+                        claim.get("source_classification", data_classification),
+                        data_classification,
+                        origin_tool_profile,
+                        claim_pack_id,
+                        extraction_batch_id,
+                        claim.get("report_artifact_hash", report_artifact_hash),
+                        int(claim.get("manual_locked", 0)),
+                        claim.get("origin", "extractor"),
+                        claim["extraction_model"],
+                        claim["extraction_prompt_version"],
+                        claim["review_status"],
+                        now,
+                    ),
+                )
+                for source_id in claim["source_ids"]:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO forecast_claim_source_links (claim_id, source_id)
+                        VALUES (?, ?)
+                        """,
+                        (claim["claim_id"], source_id),
+                    )
+            for link in links:
+                claim_exists = connection.execute(
+                    """
+                    SELECT 1 FROM forecast_claims
+                    WHERE forecast_id = ? AND claim_id = ?
+                    """,
+                    (str(forecast_id), link["claim_id"]),
+                ).fetchone()
+                if claim_exists is None:
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO forecast_claim_target_links (
+                        link_id, forecast_id, claim_id, target_kind, target_id,
+                        direction, relevance_weight, review_status, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(link_id) DO UPDATE SET
+                        direction = excluded.direction,
+                        relevance_weight = excluded.relevance_weight,
+                        review_status = excluded.review_status
+                    """,
+                    (
+                        link.get("link_id", str(uuid4())),
+                        str(forecast_id),
+                        link["claim_id"],
+                        link["target_kind"],
+                        link["target_id"],
+                        link["direction"],
+                        link["relevance_weight"],
+                        link["review_status"],
+                        now,
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE forecast_forecasts
+                SET status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (ForecastStatus.EVIDENCE_READY.value, now, str(forecast_id)),
+            )
+            self.append_audit(
+                connection,
+                forecast_id,
+                "evidence_upserted",
+                {
+                    "pack_id": str(pack_id),
+                    "extraction_batch_id": extraction_batch_id,
+                    "source_count": len(sources),
+                    "claim_count": len(claims),
+                },
+            )
+            self.append_audit(
+                connection,
+                forecast_id,
+                "evidence_extracted",
+                {"source_count": len(sources), "claim_count": len(claims)},
+            )
+        return self.get_sources(forecast_id), self.get_claims(forecast_id)
+
     def get_sources(self, forecast_id: UUID) -> list[sqlite3.Row]:
         with self.connect() as connection:
             return connection.execute(
                 """
                 SELECT * FROM forecast_sources
-                WHERE forecast_id = ? AND source_classification = 'public'
+                WHERE forecast_id = ?
                 ORDER BY created_at, title
+                """,
+                (str(forecast_id),),
+            ).fetchall()
+
+    def get_active_sources(self, forecast_id: UUID) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT sources.* FROM forecast_sources AS sources
+                LEFT JOIN forecast_research_packs AS packs
+                  ON packs.pack_id = sources.pack_id
+                WHERE sources.forecast_id = ?
+                  AND (sources.pack_id IS NULL OR packs.is_active = 1)
+                ORDER BY sources.created_at, sources.title
                 """,
                 (str(forecast_id),),
             ).fetchall()
@@ -1022,8 +1808,22 @@ class ForecastRepository:
             return connection.execute(
                 """
                 SELECT * FROM forecast_claims
-                WHERE forecast_id = ? AND source_classification = 'public'
+                WHERE forecast_id = ?
                 ORDER BY created_at, text
+                """,
+                (str(forecast_id),),
+            ).fetchall()
+
+    def get_active_claims(self, forecast_id: UUID) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT claims.* FROM forecast_claims AS claims
+                LEFT JOIN forecast_research_packs AS packs
+                  ON packs.pack_id = claims.pack_id
+                WHERE claims.forecast_id = ?
+                  AND (claims.pack_id IS NULL OR packs.is_active = 1)
+                ORDER BY claims.created_at, claims.text
                 """,
                 (str(forecast_id),),
             ).fetchall()
@@ -1089,6 +1889,57 @@ class ForecastRepository:
             )
         return self.get_scenarios(forecast_id)
 
+    def upsert_scenarios(
+        self,
+        *,
+        forecast_id: UUID,
+        scenarios: list[dict[str, Any]],
+    ) -> list[sqlite3.Row]:
+        now = utc_now().isoformat()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for scenario in scenarios:
+                connection.execute(
+                    """
+                    INSERT INTO forecast_scenarios (
+                        scenario_id, forecast_id, outcome_id, label, description,
+                        normalized_weight, validity_status, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(scenario_id) DO UPDATE SET
+                        outcome_id = excluded.outcome_id,
+                        label = excluded.label,
+                        description = excluded.description,
+                        normalized_weight = excluded.normalized_weight,
+                        validity_status = excluded.validity_status
+                    """,
+                    (
+                        scenario["scenario_id"],
+                        str(forecast_id),
+                        scenario["outcome_id"],
+                        scenario["label"],
+                        scenario["description"],
+                        scenario["normalized_weight"],
+                        scenario["validity_status"],
+                        now,
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE forecast_forecasts
+                SET status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (ForecastStatus.SCENARIOS_READY.value, now, str(forecast_id)),
+            )
+            self.append_audit(
+                connection,
+                forecast_id,
+                "scenarios_upserted",
+                {"scenario_count": len(scenarios)},
+            )
+        return self.get_scenarios(forecast_id)
+
     def get_scenarios(self, forecast_id: UUID) -> list[sqlite3.Row]:
         with self.connect() as connection:
             return connection.execute(
@@ -1100,8 +1951,247 @@ class ForecastRepository:
                 (str(forecast_id),),
             ).fetchall()
 
-    def get_approved_target_links(self, forecast_id: UUID) -> list[sqlite3.Row]:
+    def replace_drivers(
+        self,
+        *,
+        forecast_id: UUID,
+        drivers: list[dict[str, Any]],
+    ) -> list[sqlite3.Row]:
+        now = utc_now().isoformat()
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM forecast_drivers WHERE forecast_id = ?",
+                (str(forecast_id),),
+            )
+            for driver in drivers:
+                driver_id = driver["driver_id"]
+                connection.execute(
+                    """
+                    INSERT INTO forecast_drivers (
+                        driver_id, forecast_id, name, description, sort_order,
+                        created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        driver_id,
+                        str(forecast_id),
+                        driver["name"],
+                        driver["description"],
+                        driver.get("sort_order", 0),
+                        now,
+                        now,
+                    ),
+                )
+                for state in driver.get("states", []):
+                    connection.execute(
+                        """
+                        INSERT INTO forecast_driver_states (
+                            state_id, driver_id, label, description, sort_order,
+                            created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            state["state_id"],
+                            driver_id,
+                            state["label"],
+                            state["description"],
+                            state.get("sort_order", 0),
+                            now,
+                            now,
+                        ),
+                    )
+            self.append_audit(
+                connection,
+                forecast_id,
+                "drivers_replaced",
+                {"driver_count": len(drivers)},
+            )
+        return self.get_drivers(forecast_id)
+
+    def get_drivers(self, forecast_id: UUID) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM forecast_drivers
+                WHERE forecast_id = ?
+                ORDER BY sort_order, name
+                """,
+                (str(forecast_id),),
+            ).fetchall()
+
+    def get_driver_states(self, forecast_id: UUID) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT states.*
+                FROM forecast_driver_states states
+                JOIN forecast_drivers drivers ON drivers.driver_id = states.driver_id
+                WHERE drivers.forecast_id = ?
+                ORDER BY drivers.sort_order, states.sort_order, states.label
+                """,
+                (str(forecast_id),),
+            ).fetchall()
+
+    def replace_scenario_driver_links(
+        self,
+        *,
+        links: list[dict[str, str]],
+    ) -> None:
+        scenario_ids = {link["scenario_id"] for link in links}
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for scenario_id in scenario_ids:
+                connection.execute(
+                    "DELETE FROM forecast_scenario_driver_states WHERE scenario_id = ?",
+                    (scenario_id,),
+                )
+            for link in links:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO forecast_scenario_driver_states (
+                        scenario_id, state_id
+                    )
+                    VALUES (?, ?)
+                    """,
+                    (link["scenario_id"], link["state_id"]),
+                )
+
+    def get_scenario_driver_state_ids(self, scenario_id: UUID) -> list[UUID]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT state_id FROM forecast_scenario_driver_states
+                WHERE scenario_id = ?
+                ORDER BY state_id
+                """,
+                (str(scenario_id),),
+            ).fetchall()
+        return [UUID(row["state_id"]) for row in rows]
+
+    def replace_analog_events(
+        self,
+        *,
+        forecast_id: UUID,
+        pack_id: UUID | None,
+        analog_events: list[dict[str, Any]],
+    ) -> list[sqlite3.Row]:
+        now = utc_now().isoformat()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM forecast_analog_events WHERE forecast_id = ?",
+                (str(forecast_id),),
+            )
+            for event in analog_events:
+                connection.execute(
+                    """
+                    INSERT INTO forecast_analog_events (
+                        analog_event_id, forecast_id, pack_id, title,
+                        matched_outcome_id, weight, rationale, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.get("analog_event_id", str(uuid4())),
+                        str(forecast_id),
+                        str(pack_id) if pack_id else None,
+                        event["title"],
+                        event["matched_outcome_id"],
+                        event["weight"],
+                        event.get("rationale", ""),
+                        now,
+                        now,
+                    ),
+                )
+            self.append_audit(
+                connection,
+                forecast_id,
+                "analog_events_replaced",
+                {"analog_event_count": len(analog_events)},
+            )
+        return self.get_analog_events(forecast_id)
+
+    def get_analog_events(self, forecast_id: UUID) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM forecast_analog_events
+                WHERE forecast_id = ?
+                ORDER BY created_at, title
+                """,
+                (str(forecast_id),),
+            ).fetchall()
+
+    def replace_cross_impact(
+        self,
+        *,
+        forecast_id: UUID,
+        impacts: list[dict[str, Any]],
+    ) -> list[sqlite3.Row]:
+        now = utc_now().isoformat()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM forecast_cross_impact WHERE forecast_id = ?",
+                (str(forecast_id),),
+            )
+            for impact in impacts:
+                connection.execute(
+                    """
+                    INSERT INTO forecast_cross_impact (
+                        cross_impact_id, forecast_id, source_outcome_id,
+                        target_outcome_id, delta, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        impact.get("cross_impact_id", str(uuid4())),
+                        str(forecast_id),
+                        impact["source_outcome_id"],
+                        impact["target_outcome_id"],
+                        impact["delta"],
+                        now,
+                        now,
+                    ),
+                )
+        return self.get_cross_impact(forecast_id)
+
+    def get_cross_impact(self, forecast_id: UUID) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM forecast_cross_impact
+                WHERE forecast_id = ?
+                ORDER BY source_outcome_id, target_outcome_id
+                """,
+                (str(forecast_id),),
+            ).fetchall()
+
+    def get_approved_target_links(
+        self,
+        forecast_id: UUID,
+        *,
+        active_claims_only: bool = False,
+    ) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            if active_claims_only:
+                return connection.execute(
+                    """
+                    SELECT links.* FROM forecast_claim_target_links AS links
+                    JOIN forecast_claims AS claims
+                      ON claims.claim_id = links.claim_id
+                    LEFT JOIN forecast_research_packs AS packs
+                      ON packs.pack_id = claims.pack_id
+                    WHERE links.forecast_id = ?
+                      AND links.review_status = 'approved'
+                      AND (claims.pack_id IS NULL OR packs.is_active = 1)
+                    ORDER BY links.target_kind, links.target_id, links.claim_id
+                    """,
+                    (str(forecast_id),),
+                ).fetchall()
             return connection.execute(
                 """
                 SELECT * FROM forecast_claim_target_links
@@ -1135,7 +2225,13 @@ class ForecastRepository:
                 (str(forecast_id),),
             ).fetchone()
             if existing is not None:
-                return existing
+                if (
+                    existing["engine_version"] == engine_version
+                    and existing["input_snapshot_hash"] == input_snapshot_hash
+                    and existing["engine_code_hash"] == engine_code_hash
+                ):
+                    return existing
+                raise ValueError("draft_estimate_set_exists")
             connection.execute(
                 """
                 INSERT INTO forecast_estimate_sets (
@@ -1262,6 +2358,24 @@ class ForecastRepository:
                 (str(estimate_set_id),),
             ).fetchall()
 
+    def get_estimate_dicts(self, estimate_set_id: UUID) -> list[dict[str, Any]]:
+        return [
+            {
+                "target_kind": row["target_kind"],
+                "target_id": row["target_id"],
+                "prior": row["prior"],
+                "evidence_update": row["evidence_update"],
+                "cross_impact_adjustment": row["cross_impact_adjustment"],
+                "simulation_adjustment": row["simulation_adjustment"],
+                "calibration_adjustment": row["calibration_adjustment"],
+                "human_adjustment": row["human_adjustment"],
+                "final_probability": row["final_probability"],
+                "uncertainty_range": _load(row["uncertainty_range_json"], {}),
+                "components": _load(row["components_json"], {}),
+            }
+            for row in self.get_estimates(estimate_set_id)
+        ]
+
     def approve_estimate_set(
         self,
         forecast_id: UUID,
@@ -1322,16 +2436,82 @@ class ForecastRepository:
             )
         return approved_count
 
+    def add_review_record(
+        self,
+        *,
+        forecast_id: UUID,
+        action: str,
+        comment: str | None = None,
+        reviewer: str | None = None,
+        reviewer_auth_subject: str | None = None,
+        policy_decision_id: UUID | None = None,
+        review_reason: str | None = None,
+        estimate_set_id: UUID | None = None,
+        version_id: UUID | None = None,
+    ) -> None:
+        now = utc_now().isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO forecast_reviews (
+                    review_id, forecast_id, estimate_set_id, version_id, action,
+                    comment, reviewer, reviewer_auth_subject, policy_decision_id,
+                    review_reason, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    str(forecast_id),
+                    str(estimate_set_id) if estimate_set_id else None,
+                    str(version_id) if version_id else None,
+                    action,
+                    comment,
+                    reviewer,
+                    reviewer_auth_subject,
+                    str(policy_decision_id) if policy_decision_id else None,
+                    review_reason,
+                    now,
+                ),
+            )
+            self.append_audit(
+                connection,
+                forecast_id,
+                "review_recorded",
+                {
+                    "action": action,
+                    "reviewer": reviewer,
+                    "policy_decision_id": (
+                        str(policy_decision_id) if policy_decision_id else None
+                    ),
+                    "review_reason": review_reason,
+                },
+            )
+
     def estimate_set_has_approval(self, forecast_id: UUID, estimate_set_id: UUID) -> bool:
         with self.connect() as connection:
+            estimate_set = connection.execute(
+                """
+                SELECT engine_version FROM forecast_estimate_sets
+                WHERE estimate_set_id = ? AND forecast_id = ?
+                """,
+                (str(estimate_set_id), str(forecast_id)),
+            ).fetchone()
+            if estimate_set is None:
+                return False
+            approval_action = (
+                "approve_probability_publication"
+                if estimate_set["engine_version"] == "phase_b_v1"
+                else "approve_phase_a_version"
+            )
             row = connection.execute(
                 """
                 SELECT 1 FROM forecast_reviews
                 WHERE forecast_id = ? AND estimate_set_id = ?
-                  AND action = 'approve_phase_a_version'
+                  AND action = ?
                 LIMIT 1
                 """,
-                (str(forecast_id), str(estimate_set_id)),
+                (str(forecast_id), str(estimate_set_id), approval_action),
             ).fetchone()
         return row is not None
 

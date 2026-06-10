@@ -214,6 +214,20 @@ const DAG_STATUS_LABEL: Record<DagNodeStatus, string> = {
   blocked: "停止",
 };
 
+// Mirrors StatusPill labels (not exported) for screen-reader announcements.
+const RUN_STATUS_LABEL: Record<RunStatus, string> = {
+  queued: "待機中",
+  submitted: "処理中",
+  waiting_deep_research: "調査中",
+  collecting: "収集中",
+  reviewing: "レビュー中",
+  needs_action: "対応待ち",
+  needs_human_review: "要対応",
+  completed: "完了",
+  cancelled: "キャンセル",
+  failed: "失敗",
+};
+
 const CHECKPOINT_KIND_LABEL: Record<string, string> = {
   deep_research_collected: "Deep Research収集後",
   review_recorded: "LLMレビュー後",
@@ -1604,6 +1618,16 @@ export function RunMonitor({ runId }: RunMonitorProps) {
       })
     : [];
 
+  // Screen-reader progress summary. Built from values already shown visually so
+  // assistive tech can follow the long-running poll. Kept to meaningful,
+  // slow-changing units (status / phase counts / item totals) to avoid the
+  // chatter that fast-updating seconds would cause.
+  const deepResearchRuns = progress?.deep_research_runs ?? sortedAttempts.length;
+  const reviewRuns = progress?.total_reviews ?? sortedReviews.length;
+  const progressAnnouncement = `状態: ${RUN_STATUS_LABEL[status]} / Deep Research ${deepResearchRuns}回 / レビュー ${reviewRuns}回${
+    itemsTotal > 0 ? ` / 回答 ${itemsAnswered}/${itemsTotal}件` : ""
+  }${blockersUnresolved > 0 ? ` / 未解決Blocker ${blockersUnresolved}件` : ""}`;
+
   // ── Cancel action ─────────────────────────────────────────────────────────
 
   async function handleCancel() {
@@ -1973,6 +1997,10 @@ export function RunMonitor({ runId }: RunMonitorProps) {
           <CostMeter estimated={estimatedCost} />
         </div>
       </div>
+
+      <p className="sr-only" aria-live="polite" role="status">
+        {progressAnnouncement}
+      </p>
 
       <ExecutionDag
         nodes={dagData.nodes}

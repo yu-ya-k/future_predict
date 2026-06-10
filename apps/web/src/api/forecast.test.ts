@@ -1,12 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  computeProbabilities,
   createForecast,
   createForecastFramingDraft,
   dispatchCurrentStatePack,
+  dispatchDefaultResearchPacks,
   getManualResearchPackPrompt,
   getForecastEstimateSet,
   importManualResearchPack,
+  rerunForecastResearchPack,
 } from "./forecast";
 
 function jsonResponse(data: unknown, status = 200): Response {
@@ -73,6 +76,101 @@ describe("forecast API client", () => {
       "http://localhost:8000/forecasts/forecast-1/research-packs",
       expect.objectContaining({
         headers: expect.objectContaining({ "Idempotency-Key": "stable-pack-key" }),
+      }),
+    );
+  });
+
+  it("sends Phase B research pack and probability command contracts", async () => {
+    const packResponse = {
+      pack_id: "pack-1",
+      forecast_id: "forecast-1",
+      research_run_id: "run-1",
+      pack_role: "current_state",
+      tool_profile: "public",
+      status: "running",
+      policy_decision_id: "policy-1",
+      attempt_no: 1,
+      is_active: true,
+      data_classification: "public",
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ packs: [packResponse] }))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          ...packResponse,
+          pack_id: "pack-2",
+          research_run_id: "run-2",
+          attempt_no: 2,
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          estimate_set_id: "estimate-set-1",
+          forecast_id: "forecast-1",
+          status: "draft",
+          approved: false,
+          engine_version: "phase_b_v1",
+          input_snapshot_hash: "snapshot-hash-1",
+          engine_code_hash: "engine-hash-1",
+          random_seed: 0,
+          normalization_group_id: "norm-1",
+          estimates: [],
+        }),
+      );
+    globalThis.fetch = fetchMock;
+
+    await dispatchDefaultResearchPacks("forecast-1", {
+      idempotencyKey: "stable-defaults-key",
+    });
+    await rerunForecastResearchPack(
+      "forecast-1",
+      "pack-1",
+      { expected_active_pack_id: "pack-1", max_tool_calls: 8 },
+      { idempotencyKey: "stable-rerun-key" },
+    );
+    await computeProbabilities(
+      "forecast-1",
+      { engine_version: "phase_b_v1" },
+      { idempotencyKey: "stable-compute-key" },
+    );
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://localhost:8000/forecasts/forecast-1/research-packs/defaults",
+      expect.objectContaining({
+        method: "POST",
+        body: undefined,
+        headers: expect.objectContaining({
+          "Idempotency-Key": "stable-defaults-key",
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://localhost:8000/forecasts/forecast-1/research-packs/pack-1/rerun",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          expected_active_pack_id: "pack-1",
+          max_tool_calls: 8,
+        }),
+        headers: expect.objectContaining({
+          "Content-Type": "application/json",
+          "Idempotency-Key": "stable-rerun-key",
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      "http://localhost:8000/forecasts/forecast-1/probabilities/compute",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ engine_version: "phase_b_v1" }),
+        headers: expect.objectContaining({
+          "Content-Type": "application/json",
+          "Idempotency-Key": "stable-compute-key",
+        }),
       }),
     );
   });

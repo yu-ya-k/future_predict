@@ -1646,90 +1646,7 @@ class ResearchRepository:
     def add_attempt(self, run_id: UUID, attempt: ResearchAttempt) -> None:
         now = utc_now().isoformat()
         with self.connect() as connection:
-            existing = connection.execute(
-                """
-                SELECT id, prompt, response_id
-                FROM research_attempts
-                WHERE run_id = ?
-                  AND attempt_no = ?
-                ORDER BY created_at ASC
-                LIMIT 1
-                """,
-                (str(run_id), attempt.run_no),
-            ).fetchone()
-            if existing is None:
-                attempt_id = str(uuid4())
-                connection.execute(
-                    """
-                    INSERT INTO research_attempts (
-                        id, run_id, attempt_no, response_id, model, source, prompt,
-                        output_text, status, error, tool_calls, citations,
-                        raw_response_artifact_path, created_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        attempt_id,
-                        str(run_id),
-                        attempt.run_no,
-                        attempt.response_id,
-                        attempt.model,
-                        attempt.source,
-                        attempt.prompt,
-                        attempt.report,
-                        attempt.status,
-                        attempt.error,
-                        attempt.model_dump_json(include={"tool_calls_summary"}),
-                        attempt.model_dump_json(include={"citations"}),
-                        attempt.raw_response_artifact_path,
-                        now,
-                    ),
-                )
-                history_step = "attempt_recorded"
-            else:
-                attempt_id = existing["id"]
-                submitted_prompt = existing["prompt"] or attempt.prompt
-                response_id = attempt.response_id or existing["response_id"]
-                connection.execute(
-                    """
-                    UPDATE research_attempts
-                    SET response_id = ?,
-                        model = ?,
-                        source = ?,
-                        prompt = ?,
-                        output_text = ?,
-                        status = ?,
-                        error = ?,
-                        tool_calls = ?,
-                        citations = ?,
-                        raw_response_artifact_path = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        response_id,
-                        attempt.model,
-                        attempt.source,
-                        submitted_prompt,
-                        attempt.report,
-                        attempt.status,
-                        attempt.error,
-                        attempt.model_dump_json(include={"tool_calls_summary"}),
-                        attempt.model_dump_json(include={"citations"}),
-                        attempt.raw_response_artifact_path,
-                        attempt_id,
-                    ),
-                )
-                history_step = "attempt_updated"
-            for citation in attempt.citations:
-                self._insert_citation(connection, run_id, citation, attempt_id=attempt_id)
-            for tool_call in attempt.tool_calls_summary:
-                self._insert_tool_call(
-                    connection,
-                    run_id,
-                    response_id=attempt.response_id,
-                    step="deep_research",
-                    tool_call=tool_call,
-                )
+            history_step = self._upsert_attempt(connection, run_id, attempt, now=now)
             self.append_history(
                 connection,
                 run_id,
@@ -1741,6 +1658,80 @@ class ResearchRepository:
                     "source": attempt.source,
                 },
             )
+
+    def record_deep_research_collection_and_update_run_if_status(
+        self,
+        run_id: UUID,
+        allowed_statuses: set[RunStatus],
+        *,
+        attempt: ResearchAttempt,
+        cost_event: CostEvent,
+        checkpoint: dict[str, Any],
+        history_event: dict[str, Any],
+        **fields: Any,
+    ) -> ResearchRunRecord | None:
+        if not allowed_statuses or not fields:
+            return None
+
+        now = utc_now().isoformat()
+        fields["updated_at"] = now
+        columns = ", ".join(f"{key} = ?" for key in fields)
+        status_placeholders = ", ".join("?" for _ in allowed_statuses)
+        update_values = [self._db_value(value) for value in fields.values()]
+        update_values.append(str(run_id))
+        update_values.extend(status.value for status in allowed_statuses)
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run_row = connection.execute(
+                "SELECT status FROM research_runs WHERE id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if run_row is None:
+                raise KeyError(str(run_id))
+            if run_row["status"] not in {status.value for status in allowed_statuses}:
+                return None
+
+            self._insert_checkpoint(
+                connection,
+                run_id,
+                created_at=now,
+                **checkpoint,
+            )
+            history_step = self._upsert_attempt(connection, run_id, attempt, now=now)
+            self.append_history(
+                connection,
+                run_id,
+                {
+                    "step": history_step,
+                    "run_no": attempt.run_no,
+                    "status": attempt.status,
+                    "response_id": attempt.response_id,
+                    "source": attempt.source,
+                },
+            )
+            self._insert_cost_event(connection, run_id, cost_event, now=now)
+            self.append_history(connection, run_id, history_event)
+
+            cursor = connection.execute(
+                f"""
+                UPDATE research_runs
+                SET {columns}
+                WHERE id = ?
+                  AND status IN ({status_placeholders})
+                """,
+                update_values,
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("research_run_status_changed")
+            row = connection.execute(
+                "SELECT * FROM research_runs WHERE id = ?",
+                (str(run_id),),
+            ).fetchone()
+
+        if row is None:
+            raise KeyError(str(run_id))
+        return self._row_to_run(row)
 
     def add_review(
         self,
@@ -1843,28 +1834,12 @@ class ResearchRepository:
 
     def add_cost_event(self, run_id: UUID, cost_event: CostEvent) -> bool:
         with self.connect() as connection:
-            cursor = connection.execute(
-                """
-                INSERT OR IGNORE INTO research_cost_events (
-                    id, run_id, step, model, response_id, input_tokens, output_tokens,
-                    tool_calls, estimated_cost_usd, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(uuid4()),
-                    str(run_id),
-                    cost_event.step,
-                    cost_event.model,
-                    cost_event.response_id,
-                    cost_event.input_tokens,
-                    cost_event.output_tokens,
-                    cost_event.tool_calls,
-                    cost_event.estimated_cost_usd,
-                    utc_now().isoformat(),
-                ),
+            return self._insert_cost_event(
+                connection,
+                run_id,
+                cost_event,
+                now=utc_now().isoformat(),
             )
-            return cursor.rowcount == 1
 
     def get_attempts(self, run_id: UUID) -> list[ResearchAttempt]:
         with self.connect() as connection:
@@ -2337,6 +2312,110 @@ class ResearchRepository:
                     "result_sha256": result_sha256,
                 },
             )
+            row = connection.execute(
+                "SELECT * FROM research_runs WHERE id = ?",
+                (str(run_id),),
+            ).fetchone()
+
+        if row is None:
+            raise KeyError(str(run_id))
+        return self._row_to_run(row)
+
+    def complete_manual_rerun_request_and_update_run(
+        self,
+        run_id: UUID,
+        *,
+        rerun_id: str,
+        result_sha256: str,
+        allowed_statuses: set[RunStatus],
+        attempt: ResearchAttempt,
+        checkpoint: dict[str, Any],
+        collected_history_event: dict[str, Any],
+        **fields: Any,
+    ) -> ResearchRunRecord | None:
+        if not allowed_statuses or not fields:
+            return None
+
+        now = utc_now().isoformat()
+        fields["updated_at"] = now
+        columns = ", ".join(f"{key} = ?" for key in fields)
+        status_placeholders = ", ".join("?" for _ in allowed_statuses)
+        run_values = [self._db_value(value) for value in fields.values()]
+        run_values.extend(
+            [
+                str(run_id),
+                *[status.value for status in allowed_statuses],
+                str(run_id),
+                rerun_id,
+            ]
+        )
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                f"""
+                UPDATE research_runs
+                SET {columns}
+                WHERE id = ?
+                  AND status IN ({status_placeholders})
+                  AND EXISTS (
+                      SELECT 1
+                      FROM manual_rerun_requests
+                      WHERE run_id = ?
+                        AND rerun_id = ?
+                        AND status = 'pending'
+                  )
+                """,
+                run_values,
+            )
+            if cursor.rowcount != 1:
+                return None
+
+            self._insert_checkpoint(
+                connection,
+                run_id,
+                created_at=now,
+                **checkpoint,
+            )
+            history_step = self._upsert_attempt(connection, run_id, attempt, now=now)
+            self.append_history(
+                connection,
+                run_id,
+                {
+                    "step": history_step,
+                    "run_no": attempt.run_no,
+                    "status": attempt.status,
+                    "response_id": attempt.response_id,
+                    "source": attempt.source,
+                },
+            )
+
+            cursor = connection.execute(
+                """
+                UPDATE manual_rerun_requests
+                SET status = 'accepted',
+                    result_sha256 = ?,
+                    updated_at = ?,
+                    consumed_at = ?
+                WHERE run_id = ?
+                  AND rerun_id = ?
+                  AND status = 'pending'
+                """,
+                (result_sha256, now, now, str(run_id), rerun_id),
+            )
+            if cursor.rowcount != 1:
+                raise sqlite3.IntegrityError("pending manual rerun was not accepted")
+
+            self.append_history(
+                connection,
+                run_id,
+                {
+                    "step": "manual_rerun_result_accepted",
+                    "rerun_id": rerun_id,
+                    "result_sha256": result_sha256,
+                },
+            )
+            self.append_history(connection, run_id, collected_history_event)
             row = connection.execute(
                 "SELECT * FROM research_runs WHERE id = ?",
                 (str(run_id),),
@@ -3010,6 +3089,171 @@ class ResearchRepository:
                 citation.retrieved_at,
                 utc_now().isoformat(),
             ),
+        )
+
+    def _insert_cost_event(
+        self,
+        connection: sqlite3.Connection,
+        run_id: UUID,
+        cost_event: CostEvent,
+        *,
+        now: str,
+    ) -> bool:
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO research_cost_events (
+                id, run_id, step, model, response_id, input_tokens, output_tokens,
+                tool_calls, estimated_cost_usd, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid4()),
+                str(run_id),
+                cost_event.step,
+                cost_event.model,
+                cost_event.response_id,
+                cost_event.input_tokens,
+                cost_event.output_tokens,
+                cost_event.tool_calls,
+                cost_event.estimated_cost_usd,
+                now,
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def _upsert_attempt(
+        self,
+        connection: sqlite3.Connection,
+        run_id: UUID,
+        attempt: ResearchAttempt,
+        *,
+        now: str,
+    ) -> str:
+        existing = connection.execute(
+            """
+            SELECT id, prompt, response_id
+            FROM research_attempts
+            WHERE run_id = ?
+              AND attempt_no = ?
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (str(run_id), attempt.run_no),
+        ).fetchone()
+        if existing is None:
+            attempt_id = str(uuid4())
+            connection.execute(
+                """
+                INSERT INTO research_attempts (
+                    id, run_id, attempt_no, response_id, model, source, prompt,
+                    output_text, status, error, tool_calls, citations,
+                    raw_response_artifact_path, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    str(run_id),
+                    attempt.run_no,
+                    attempt.response_id,
+                    attempt.model,
+                    attempt.source,
+                    attempt.prompt,
+                    attempt.report,
+                    attempt.status,
+                    attempt.error,
+                    attempt.model_dump_json(include={"tool_calls_summary"}),
+                    attempt.model_dump_json(include={"citations"}),
+                    attempt.raw_response_artifact_path,
+                    now,
+                ),
+            )
+            history_step = "attempt_recorded"
+        else:
+            attempt_id = existing["id"]
+            submitted_prompt = existing["prompt"] or attempt.prompt
+            response_id = attempt.response_id or existing["response_id"]
+            connection.execute(
+                """
+                UPDATE research_attempts
+                SET response_id = ?,
+                    model = ?,
+                    source = ?,
+                    prompt = ?,
+                    output_text = ?,
+                    status = ?,
+                    error = ?,
+                    tool_calls = ?,
+                    citations = ?,
+                    raw_response_artifact_path = ?
+                WHERE id = ?
+                """,
+                (
+                    response_id,
+                    attempt.model,
+                    attempt.source,
+                    submitted_prompt,
+                    attempt.report,
+                    attempt.status,
+                    attempt.error,
+                    attempt.model_dump_json(include={"tool_calls_summary"}),
+                    attempt.model_dump_json(include={"citations"}),
+                    attempt.raw_response_artifact_path,
+                    attempt_id,
+                ),
+            )
+            connection.execute(
+                "DELETE FROM research_citations WHERE attempt_id = ?",
+                (attempt_id,),
+            )
+            for old_response_id in {existing["response_id"], attempt.response_id}:
+                self._delete_tool_calls_for_response(
+                    connection,
+                    run_id,
+                    step="deep_research",
+                    response_id=old_response_id,
+                )
+            history_step = "attempt_updated"
+        for citation in attempt.citations:
+            self._insert_citation(connection, run_id, citation, attempt_id=attempt_id)
+        for tool_call in attempt.tool_calls_summary:
+            self._insert_tool_call(
+                connection,
+                run_id,
+                response_id=attempt.response_id,
+                step="deep_research",
+                tool_call=tool_call,
+            )
+        return history_step
+
+    def _delete_tool_calls_for_response(
+        self,
+        connection: sqlite3.Connection,
+        run_id: UUID,
+        *,
+        step: str,
+        response_id: str | None,
+    ) -> None:
+        if response_id is None:
+            connection.execute(
+                """
+                DELETE FROM research_tool_calls
+                WHERE run_id = ?
+                  AND step = ?
+                  AND response_id IS NULL
+                """,
+                (str(run_id), step),
+            )
+            return
+        connection.execute(
+            """
+            DELETE FROM research_tool_calls
+            WHERE run_id = ?
+              AND step = ?
+              AND response_id = ?
+            """,
+            (str(run_id), step, response_id),
         )
 
     def _insert_tool_call(

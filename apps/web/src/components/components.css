@@ -408,6 +408,13 @@
 
 /* ── 3-9 MetricCard ────────────────────────────────────────────────────────── */
 
+/* Responsive grid for laying out multiple MetricCards */
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: var(--space-3);
+}
+
 .metric-card {
   display: flex;
   flex-direction: column;
@@ -466,6 +473,13 @@
   width: 100%;
 }
 
+.decision-action-cell {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  width: 100%;
+}
+
 .decision-button {
   display: flex;
   flex-direction: column;
@@ -477,9 +491,15 @@
   text-align: left;
   transition:
     background var(--duration-fast) var(--ease-out),
-    border-color var(--duration-fast) var(--ease-out);
+    border-color var(--duration-fast) var(--ease-out),
+    transform var(--duration-fast) var(--ease-out);
   position: relative;
   width: auto;
+}
+
+/* Pressed state — subtle downward nudge across all tone variants */
+.decision-button:active:not(:disabled):not(.decision-button--disabled) {
+  transform: translateY(1px);
 }
 
 .decision-button--block {

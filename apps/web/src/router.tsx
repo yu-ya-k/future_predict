@@ -28,6 +28,7 @@ import {
   useCallback,
   useEffect,
   useState,
+  type AriaAttributes,
   type CSSProperties,
   type MouseEvent,
   type ReactNode,
@@ -203,6 +204,7 @@ interface LinkProps {
   style?: CSSProperties;
   children: ReactNode;
   "aria-label"?: string;
+  "aria-current"?: AriaAttributes["aria-current"];
 }
 
 export function Link({ to, className, children, ...rest }: LinkProps) {

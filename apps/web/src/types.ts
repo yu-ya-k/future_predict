@@ -139,7 +139,7 @@ export interface ResearchRunOptions {
 }
 
 export interface CreateResearchRunRequest {
-  user_prompt: string; // 1-50000 chars
+  user_prompt: string; // 1-120000 chars
   options?: ResearchRunOptions;
 }
 
@@ -571,7 +571,7 @@ export function isTerminal(status: RunStatus): boolean {
   return TERMINAL_STATUSES.has(status);
 }
 
-// ── Forecast PhaseA ─────────────────────────────────────────────────────────
+// ── Forecast PhaseA / PhaseB ────────────────────────────────────────────────
 
 export type ForecastStatus =
   | "framing_pending"
@@ -582,6 +582,17 @@ export type ForecastStatus =
   | "draft_ready"
   | "committed"
   | "resolved";
+
+export type ForecastPackRole =
+  | "current_state"
+  | "base_rate"
+  | "drivers"
+  | "counter_evidence"
+  | "signals";
+
+export type ForecastToolProfile = "public" | "private" | "synthesis";
+
+export type ForecastConfidentialityClass = "public" | "internal" | "restricted";
 
 export interface ForecastOutcome {
   outcome_id: string;
@@ -608,6 +619,20 @@ export interface ForecastSummary {
 export interface ForecastCurrentResearchPack {
   pack_id: string;
   research_run_id: string;
+  pack_role?: ForecastPackRole;
+  tool_profile?: ForecastToolProfile;
+  attempt_no?: number;
+  is_active?: boolean;
+  rerun_of_pack_id?: string | null;
+  policy_decision_id?: string | null;
+  data_classification?: ForecastConfidentialityClass;
+  timeout_sec?: number | null;
+  estimated_cost_budget_usd?: number | null;
+  vector_store_ids?: string[];
+  mcp_server_ids?: string[];
+  cache_key?: string | null;
+  rerun_policy?: string | null;
+  pack_request_id?: string | null;
   pack_status: string;
   effective_status: string;
   research_run_status: string;
@@ -634,6 +659,7 @@ export interface ForecastDetail extends ForecastSummary {
   outcomes: ForecastOutcome[];
   current_research_pack?: ForecastCurrentResearchPack | null;
   current_research_pack_status?: string | null;
+  research_packs?: ForecastCurrentResearchPack[];
   approved_claim_target_link_count: number;
 }
 
@@ -646,7 +672,7 @@ export interface ForecastCreateRequest {
   resolution_criteria?: string;
   resolution_sources?: string[];
   decision_context?: string | null;
-  confidentiality_class?: "public" | "restricted";
+  confidentiality_class?: ForecastConfidentialityClass;
   outcomes?: string[];
 }
 
@@ -702,10 +728,22 @@ export interface ForecastFramingDraftResponse {
 }
 
 export interface ForecastReviewRequest {
-  action: "approve_framing" | "approve_phase_a_version" | "approve_claim_target_links";
+  action:
+    | "approve_framing"
+    | "approve_phase_a_version"
+    | "approve_claim_target_links"
+    | "approve_private_data_use"
+    | "approve_probability_publication"
+    | "override_probability_with_reason"
+    | "approve_external_report"
+    | "approve_trusted_source";
   comment?: string | null;
   estimate_set_id?: string | null;
   version_id?: string | null;
+  reviewer?: string | null;
+  reviewer_auth_subject?: string | null;
+  policy_decision_id?: string | null;
+  review_reason?: string | null;
 }
 
 export interface ForecastReviewResponse {
@@ -720,10 +758,25 @@ export interface ResearchPackResponse {
   pack_id: string;
   forecast_id: string;
   research_run_id: string;
-  pack_role: "current_state";
-  tool_profile: "public";
+  pack_role: ForecastPackRole;
+  tool_profile: ForecastToolProfile;
   status: string;
   policy_decision_id: string;
+  attempt_no: number;
+  is_active: boolean;
+  data_classification: ForecastConfidentialityClass;
+}
+
+export interface ResearchPackDefaultsResponse {
+  packs: ResearchPackResponse[];
+}
+
+export interface ResearchPackRerunRequest {
+  expected_active_pack_id: string;
+  max_tool_calls?: number;
+  background?: boolean;
+  timeout_sec?: number | null;
+  estimated_cost_budget_usd?: number | null;
 }
 
 export interface ManualResearchPackPromptResponse {
@@ -732,8 +785,8 @@ export interface ManualResearchPackPromptResponse {
   prompt: string;
   prompt_sha256: string;
   prompt_version: string;
-  pack_role: "current_state";
-  tool_profile: "public";
+  pack_role: ForecastPackRole;
+  tool_profile: ForecastToolProfile;
   max_report_chars: number;
   max_file_bytes: number;
   pack_id?: string | null;
@@ -749,6 +802,8 @@ export interface ForecastSource {
   url?: string | null;
   source_type: string;
   source_classification: string;
+  data_classification: ForecastConfidentialityClass;
+  origin_tool_profile: ForecastToolProfile;
   reliability_score: number;
 }
 
@@ -763,6 +818,8 @@ export interface ForecastClaim {
   independence_group: string;
   source_ids: string[];
   review_status: string;
+  data_classification: ForecastConfidentialityClass;
+  origin_tool_profile: ForecastToolProfile;
 }
 
 export interface EvidenceExtractResponse {
@@ -780,6 +837,7 @@ export interface ForecastScenario {
   probability?: number | null;
   normalized_weight: number;
   validity_status: string;
+  driver_state_ids: string[];
 }
 
 export interface ScenarioGenerateResponse {
@@ -813,6 +871,23 @@ export interface EstimateSetResponse {
   random_seed: number;
   normalization_group_id: string;
   estimates: ProbabilityEstimate[];
+}
+
+export interface ComputeProbabilitiesRequest {
+  engine_version?: "phase_a_v1" | "phase_b_v1" | null;
+}
+
+export interface ForecastTrustedSource {
+  trusted_source_id: string;
+  identifier: string;
+  status: "pending" | "approved" | "revoked" | "expired";
+  approved_by?: string | null;
+  approved_at?: string | null;
+  expires_at?: string | null;
+  allowed_profiles: ForecastToolProfile[];
+  allowed_pack_roles: ForecastPackRole[];
+  allowed_tool_names: string[];
+  owner_team_id?: string | null;
 }
 
 export interface CommitVersionResponse {

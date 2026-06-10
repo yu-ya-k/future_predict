@@ -356,8 +356,6 @@ export function NewForecast() {
 
   async function onGenerateDraft() {
     const requestRoughQuestion = roughQuestion;
-    const shouldCaptureOriginalPrompt =
-      !draftResponse && !originalExecutionPrompt.trim();
     setError(null);
     setState("drafting");
     setDraftResponse(null);
@@ -376,9 +374,7 @@ export function NewForecast() {
           idempotencyKey: idempotencyKeys.current.draft,
         },
       );
-      if (shouldCaptureOriginalPrompt) {
-        setOriginalExecutionPrompt(requestRoughQuestion);
-      }
+      setOriginalExecutionPrompt(requestRoughQuestion);
       applyDraftResponse(response);
     } catch (err) {
       setError(formatForecastError(err));

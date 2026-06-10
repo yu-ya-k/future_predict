@@ -184,6 +184,7 @@ interface QueueFetchErrorProps {
   connectionUnstable: boolean;
   retrying: boolean;
   onRetry: () => void;
+  title?: string;
 }
 
 function QueueFetchError({
@@ -191,11 +192,12 @@ function QueueFetchError({
   connectionUnstable,
   retrying,
   onRetry,
+  title = "要対応の取得に失敗しました",
 }: QueueFetchErrorProps) {
   return (
     <div className="queue-empty-compact" role="alert">
       <span className="queue-empty-compact__title">
-        {connectionUnstable ? "接続が不安定です" : "要対応の取得に失敗しました"}
+        {connectionUnstable ? "接続が不安定です" : title}
       </span>
       <span className="queue-empty-compact__description">
         {formatQueueFetchError(error)}
@@ -244,6 +246,27 @@ function formatQueueFetchError(error: unknown): string {
   return "要対応キューを取得できませんでした。";
 }
 
+function formatTrackedRunPollError(error: unknown): string {
+  if (error instanceof ApiError) {
+    return error.detail ?? error.message;
+  }
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return "進行中runの状態を取得できませんでした。";
+}
+
+class TrackedRunPollError extends Error {
+  constructor(readonly failures: Array<{ runId: string; error: unknown }>) {
+    super(
+      failures.length === 1 && failures[0]
+        ? `run ${failures[0].runId} の状態取得に失敗しました。${formatTrackedRunPollError(failures[0].error)}`
+        : `${failures.length}件の進行中runの状態取得に失敗しました。`,
+    );
+    this.name = "TrackedRunPollError";
+  }
+}
+
 // ── Dashboard live polling for non-terminal tracked runs ──────────────────────
 
 function useTrackedRunStatuses(trackedRuns: TrackedRun[]) {
@@ -258,6 +281,7 @@ function useTrackedRunStatuses(trackedRuns: TrackedRun[]) {
       );
 
       const updates = new Map<string, ResearchRunStatusResponse>();
+      const failures: Array<{ runId: string; error: unknown }> = [];
       results.forEach((result, i) => {
         const run = activeRuns[i];
         if (result.status === "fulfilled") {
@@ -268,8 +292,17 @@ function useTrackedRunStatuses(trackedRuns: TrackedRun[]) {
           });
         } else if (result.reason instanceof ApiError && result.reason.isNotFound) {
           untrackRun(run.run_id);
+        } else {
+          failures.push({ runId: run.run_id, error: result.reason });
         }
       });
+
+      if (failures.length > 0) {
+        if (updates.size > 0) {
+          setStatuses(updates);
+        }
+        throw new TrackedRunPollError(failures);
+      }
 
       return updates;
     },
@@ -277,7 +310,13 @@ function useTrackedRunStatuses(trackedRuns: TrackedRun[]) {
     [activeRuns.map((r) => r.run_id).join(",")],
   );
 
-  const { data } = usePolling({
+  const {
+    data,
+    error,
+    loading,
+    connectionUnstable,
+    refetch,
+  } = usePolling({
     fetcher: fetchAll,
     key: activeRuns.map((r) => r.run_id).join(","),
     interval: () => TRACKED_RUN_INTERVAL,
@@ -289,7 +328,7 @@ function useTrackedRunStatuses(trackedRuns: TrackedRun[]) {
     if (data) setStatuses(data);
   }, [data]);
 
-  return statuses;
+  return { statuses, error, loading, connectionUnstable, refetch };
 }
 
 // ── Main Dashboard component ──────────────────────────────────────────────────
@@ -341,7 +380,13 @@ export function Dashboard() {
   });
 
   // Live statuses for non-terminal tracked runs
-  const liveStatuses = useTrackedRunStatuses(trackedRuns);
+  const {
+    statuses: liveStatuses,
+    error: trackedRunError,
+    loading: trackedRunLoading,
+    connectionUnstable: trackedRunConnectionUnstable,
+    refetch: refetchTrackedRuns,
+  } = useTrackedRunStatuses(trackedRuns);
 
   // Partition tracked runs
   const activeRuns = trackedRuns.filter(
@@ -441,6 +486,16 @@ export function Dashboard() {
             + 新規リサーチ
           </button>
         </div>
+
+        {trackedRunError !== undefined && (
+          <QueueFetchError
+            error={trackedRunError}
+            connectionUnstable={trackedRunConnectionUnstable}
+            retrying={trackedRunLoading}
+            onRetry={refetchTrackedRuns}
+            title="進行中runの取得に失敗しました"
+          />
+        )}
 
         {visibleActiveRuns.length === 0 ? (
           <EmptyState

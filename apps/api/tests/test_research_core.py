@@ -552,6 +552,11 @@ def test_phase_4_graph_uses_v2_human_review_actions() -> None:
         config=config,
     )
     assert "__interrupt__" in initial
+    interrupt_payload = initial["__interrupt__"][0].value
+    allowed_actions = interrupt_payload["allowed_actions"]
+    assert HumanReviewAction.REQUEST_TARGETED_RERUN.value in allowed_actions
+    assert HumanReviewAction.REQUEST_MANUAL_TARGETED_RERUN.value not in allowed_actions
+    assert HumanReviewAction.REQUEST_MANUAL_FULL_RERUN.value not in allowed_actions
 
     resumed = graph.invoke(
         Command(resume={"action": HumanReviewAction.REQUEST_TARGETED_RERUN.value}),

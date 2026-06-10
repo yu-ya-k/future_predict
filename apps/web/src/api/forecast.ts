@@ -1,5 +1,6 @@
 import type {
   CommitVersionResponse,
+  ComputeProbabilitiesRequest,
   EstimateSetResponse,
   EvidenceExtractResponse,
   ForecastAuditResponse,
@@ -12,6 +13,8 @@ import type {
   ForecastReviewRequest,
   ForecastReviewResponse,
   ForecastSummary,
+  ResearchPackDefaultsResponse,
+  ResearchPackRerunRequest,
   ResearchPackResponse,
   ResolveForecastResponse,
   ScenarioGenerateResponse,
@@ -106,6 +109,40 @@ export function dispatchCurrentStatePack(
   });
 }
 
+export function listForecastResearchPacks(
+  forecastId: string,
+  signal?: AbortSignal,
+): Promise<ResearchPackResponse[]> {
+  return apiClient.request(`${BASE}/${forecastId}/research-packs`, { signal });
+}
+
+export function dispatchDefaultResearchPacks(
+  forecastId: string,
+  input?: AbortSignal | ForecastCommandOptions,
+): Promise<ResearchPackDefaultsResponse> {
+  const options = optionsFrom(input);
+  return apiClient.request(`${BASE}/${forecastId}/research-packs/defaults`, {
+    method: "POST",
+    signal: options.signal,
+    idempotencyKey: commandKey("forecast-packs-defaults", options),
+  });
+}
+
+export function rerunForecastResearchPack(
+  forecastId: string,
+  packId: string,
+  request: ResearchPackRerunRequest,
+  input?: AbortSignal | ForecastCommandOptions,
+): Promise<ResearchPackResponse> {
+  const options = optionsFrom(input);
+  return apiClient.request(`${BASE}/${forecastId}/research-packs/${packId}/rerun`, {
+    method: "POST",
+    body: request,
+    signal: options.signal,
+    idempotencyKey: commandKey("forecast-pack-rerun", options),
+  });
+}
+
 export function getManualResearchPackPrompt(
   forecastId: string,
   signal?: AbortSignal,
@@ -169,11 +206,22 @@ export function generateScenarios(
 
 export function computeProbabilities(
   forecastId: string,
-  input?: AbortSignal | ForecastCommandOptions,
+  requestOrInput?: ComputeProbabilitiesRequest | AbortSignal | ForecastCommandOptions,
+  maybeInput?: AbortSignal | ForecastCommandOptions,
 ): Promise<EstimateSetResponse> {
-  const options = optionsFrom(input);
+  const hasRequest =
+    requestOrInput &&
+    !(typeof AbortSignal !== "undefined" && requestOrInput instanceof AbortSignal) &&
+    "engine_version" in requestOrInput;
+  const request = hasRequest ? (requestOrInput as ComputeProbabilitiesRequest) : {};
+  const options = optionsFrom(
+    hasRequest
+      ? maybeInput
+      : (requestOrInput as AbortSignal | ForecastCommandOptions | undefined),
+  );
   return apiClient.request(`${BASE}/${forecastId}/probabilities/compute`, {
     method: "POST",
+    body: request,
     signal: options.signal,
     idempotencyKey: commandKey("forecast-probability", options),
   });

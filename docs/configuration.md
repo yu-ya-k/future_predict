@@ -39,6 +39,8 @@ The repository and artifact store create parent directories as needed.
 | `RESEARCH_POLLER_ENABLED` | `true` | Starts `ResearchPoller` during FastAPI lifespan. |
 | `RESEARCH_POLLER_INTERVAL_SECONDS` | `5` | Delay between poller ticks. |
 | `RESEARCH_DEEP_RESEARCH_TIMEOUT_SECONDS` | `7200` | Marks waiting Deep Research runs as timed out after this many seconds. |
+| `RESEARCH_DEEP_RESEARCH_SUBMIT_TIMEOUT_SECONDS` | `120` | Bounds Deep Research submission calls before the run is moved to human review. |
+| `RESEARCH_DEEP_RESEARCH_SUBMIT_STALE_SECONDS` | `300` | Requeues stale local submission claims after this many seconds so polling can recover after a worker interruption. |
 | `RESEARCH_DEEP_RESEARCH_COLLECTING_STALE_SECONDS` | `60` | Requeues a stale local `collecting` claim after this many seconds so polling can recover after a worker interruption. |
 | `RESEARCH_REVIEW_TIMEOUT_SECONDS` | `180` | Bounds GPT-5.5 review calls and marks stale `reviewing` runs as `review_timeout`. |
 | `RESEARCH_REVIEW_MAX_REPORT_CHARS` | `50000` | Caps report text sent to the reviewer. Long reports are truncated with a marker. |
@@ -64,6 +66,18 @@ treat API `422` responses as the final validation result.
 Poller intervals, timeout values, and stale-claim windows must be greater than
 zero. Report character limits and manual import byte limits must be at least
 `1`; citation limits can be `0` or higher.
+
+## Forecast
+
+| Variable | Default | Used for |
+| --- | --- | --- |
+| `FORECAST_ENABLED` | `true` | Enables Forecast endpoints and workflows. Set to `false` for a feature-level rollback. |
+| `FORECAST_ARTIFACT_DIR` | `.data/forecast-runs` | Local artifact root for Forecast pack outputs, evidence extraction outputs, probability snapshots, and committed versions. |
+| `FORECAST_MAX_CONCURRENT_PACKS` | `1` | Maximum Forecast research packs submitted concurrently by the orchestrator. |
+
+Forecast stores its tables in the shared Research SQLite database and writes
+artifacts under `FORECAST_ARTIFACT_DIR`. The artifact store creates parent
+directories as needed.
 
 ## Default Guard Limits
 

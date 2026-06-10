@@ -82,6 +82,24 @@ function formatBlockedReason(reason?: string | null): string | undefined {
   return BLOCKED_REASON_LABELS[reason] ?? `停止理由: ${reason}`;
 }
 
+/**
+ * Actions that finalize the run irreversibly or spend additional budget. These
+ * require an explicit inline confirmation step before resumeRun() fires, so a
+ * single mis-click on the 2-column decision grid cannot commit them.
+ */
+const CONFIRM_REQUIRED_ACTIONS = new Set<HumanReviewAction>([
+  "approve",
+  "approve_with_limitation",
+  "reject",
+  "request_full_rerun",
+  "request_targeted_rerun",
+  "request_manual_full_rerun",
+]);
+
+function requiresConfirmation(action: HumanReviewAction): boolean {
+  return CONFIRM_REQUIRED_ACTIONS.has(action);
+}
+
 function expectedOutputLabel(kind?: string | null, scope?: string | null): string {
   if (kind === "complete_replacement_report" || scope === "full_rerun") {
     return "完成版レポート全文";
@@ -164,6 +182,9 @@ export function HumanReview({ runId }: HumanReviewProps) {
   const [comment, setComment] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [confirmingAction, setConfirmingAction] = useState<HumanReviewAction | null>(
+    null,
+  );
   const [manualResultText, setManualResultText] = useState("");
   const [manualResultFile, setManualResultFile] = useState<File | null>(null);
   const [manualUploadMode, setManualUploadMode] = useState<"text" | "file">("text");
@@ -179,6 +200,35 @@ export function HumanReview({ runId }: HumanReviewProps) {
   const requestGenerationRef = useRef(0);
   const suggestedPromptRef = useRef<HTMLTextAreaElement | null>(null);
   const pendingPromptRef = useRef<HTMLTextAreaElement | null>(null);
+  const confirmButtonRef = useRef<HTMLButtonElement | null>(null);
+  // Remembers which action's trigger button opened the confirm gate so focus
+  // can return to it when the gate closes without navigating away.
+  const confirmTriggerActionRef = useRef<HumanReviewAction | null>(null);
+
+  // Open the inline confirm gate and record the triggering action so its
+  // decision button can reclaim focus when the gate closes.
+  function openConfirmGate(action: HumanReviewAction) {
+    confirmTriggerActionRef.current = action;
+    setConfirmingAction(action);
+  }
+
+  // Move focus to the confirm action when an inline confirmation opens so the
+  // reviewer can complete or cancel it with the keyboard alone. When the gate
+  // closes while staying on-page (cancel via やめる/Escape, or a failed submit),
+  // restore focus to the triggering decision button so focus does not fall back
+  // to <body> (WCAG 2.4.3).
+  useEffect(() => {
+    if (confirmingAction) {
+      confirmButtonRef.current?.focus();
+      return;
+    }
+    const triggerAction = confirmTriggerActionRef.current;
+    if (!triggerAction) return;
+    confirmTriggerActionRef.current = null;
+    document
+      .querySelector<HTMLButtonElement>(`[data-action="${triggerAction}"]`)
+      ?.focus();
+  }, [confirmingAction]);
 
   async function fetchPayload() {
     abortRef.current?.abort();
@@ -214,6 +264,8 @@ export function HumanReview({ runId }: HumanReviewProps) {
   }
 
   useEffect(() => {
+    confirmTriggerActionRef.current = null;
+    setConfirmingAction(null);
     void fetchPayload();
     return () => {
       requestGenerationRef.current += 1;
@@ -223,6 +275,7 @@ export function HumanReview({ runId }: HumanReviewProps) {
   }, [runId]);
 
   async function handleDecision(action: HumanReviewAction) {
+    setConfirmingAction(null);
     setSubmitting(true);
     setSubmitError(null);
     try {
@@ -405,20 +458,77 @@ export function HumanReview({ runId }: HumanReviewProps) {
     consequence: string,
     tone: "success" | "warning" | "danger" | "neutral",
     options: { costHint?: string; guardMessage?: string } = {},
-  ) => (
-    <DecisionButton
-      action={action}
-      label={label}
-      consequence={consequence}
-      tone={tone}
-      costHint={options.costHint}
-      guardMessage={options.guardMessage}
-      disabled={!isAllowed(action) || submitting}
-      disabledReason={disabledReason(action)}
-      block
-      onClick={() => void handleDecision(action)}
-    />
-  );
+  ) => {
+    const gated = requiresConfirmation(action);
+    const disabled = !isAllowed(action) || submitting;
+    const confirming = gated && confirmingAction === action;
+    const confirmConfirmClass = tone === "danger" ? "btn-danger" : "btn-primary";
+
+    return (
+      <div className="decision-action-cell">
+        <DecisionButton
+          action={action}
+          label={label}
+          consequence={consequence}
+          tone={tone}
+          costHint={options.costHint}
+          guardMessage={confirming ? undefined : options.guardMessage}
+          disabled={disabled}
+          disabledReason={disabledReason(action)}
+          block
+          onClick={
+            gated
+              ? () => openConfirmGate(action)
+              : () => void handleDecision(action)
+          }
+        />
+        {confirming && (
+          <div
+            className="decision-confirm"
+            role="group"
+            aria-label={`${label}の確認`}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.stopPropagation();
+                setConfirmingAction(null);
+              }
+            }}
+          >
+            <p className="decision-button__consequence">
+              本当に「{label}」を実行しますか？{consequence}
+            </p>
+            {options.costHint && (
+              <p className="decision-button__cost-hint">{options.costHint}</p>
+            )}
+            {options.guardMessage && (
+              <p className="decision-button__guard" role="note">
+                {options.guardMessage}
+              </p>
+            )}
+            <div className="form-actions">
+              <button
+                type="button"
+                ref={confirmButtonRef}
+                className={confirmConfirmClass}
+                disabled={submitting}
+                onClick={() => void handleDecision(action)}
+              >
+                実行する
+              </button>
+              <button
+                type="button"
+                className="btn-secondary"
+                disabled={submitting}
+                onClick={() => setConfirmingAction(null)}
+              >
+                やめる
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div className="screen-review">
@@ -430,7 +540,9 @@ export function HumanReview({ runId }: HumanReviewProps) {
       {/* ── Stop-reason banner ────────────────────────── */}
       <div className="review-reason-banner" role="note">
         <span className="review-reason-label">停止理由</span>
-        <p className="review-reason-text">{payload.reason}</p>
+        <p className="review-reason-text">
+          {BLOCKED_REASON_LABELS[payload.reason] ?? payload.reason}
+        </p>
         {reasonSummary && (
           <p className="review-reason-summary">{reasonSummary}</p>
         )}

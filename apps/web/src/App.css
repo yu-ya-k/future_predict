@@ -31,27 +31,7 @@ body {
   color: var(--ink);
 }
 
-/* ── Skip link ─────────────────────────────────────────────────── */
-
-.skip-link {
-  position: absolute;
-  top: -100%;
-  left: var(--space-4);
-  z-index: var(--z-modal);
-  padding: var(--inset-sm);
-  background: var(--surface);
-  border: var(--border-emphasis);
-  border-radius: var(--radius-sm);
-  color: var(--ink);
-  font-size: var(--text-label);
-  text-decoration: none;
-}
-
-.skip-link:focus {
-  top: var(--space-4);
-  outline: none;
-  box-shadow: var(--focus-ring);
-}
+/* Skip link is defined once in base.css (with transition). Do not redefine here. */
 
 /* ── App header (sticky) ────────────────────────────────────────── */
 
@@ -105,6 +85,9 @@ body {
 }
 
 .nav-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-sm);
   color: var(--ink-soft);
@@ -288,6 +271,12 @@ body {
   border-color: var(--accent-hover);
 }
 
+.btn-primary:active:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-hover) 88%, var(--ink) 12%);
+  border-color: color-mix(in srgb, var(--accent-hover) 88%, var(--ink) 12%);
+  transition-duration: var(--duration-fast);
+}
+
 .btn-secondary {
   background: var(--surface);
   color: var(--ink);
@@ -298,6 +287,11 @@ body {
   background: var(--surface-raised);
 }
 
+.btn-secondary:active:not(:disabled) {
+  background: color-mix(in srgb, var(--surface-raised) 82%, var(--ink) 18%);
+  transition-duration: var(--duration-fast);
+}
+
 .btn-danger {
   background: var(--error-bg);
   color: var(--error);
@@ -306,6 +300,11 @@ body {
 
 .btn-danger:hover {
   background: var(--error-border);
+}
+
+.btn-danger:active:not(:disabled) {
+  background: color-mix(in srgb, var(--error-border) 80%, var(--error) 20%);
+  transition-duration: var(--duration-fast);
 }
 
 .btn-primary:disabled,
@@ -432,6 +431,7 @@ body {
   color: var(--ink);
 }
 
+.field input,
 .field textarea,
 .field select {
   width: 100%;
@@ -447,6 +447,7 @@ body {
   resize: vertical;
 }
 
+.field input:focus,
 .field textarea:focus,
 .field select:focus {
   outline: none;
@@ -693,7 +694,7 @@ body {
   border-radius: var(--radius-sm);
   background: var(--surface);
   color: var(--ink);
-  font-weight: var(--weight-semibold);
+  font-weight: var(--weight-medium);
   text-align: left;
 }
 
@@ -1772,6 +1773,15 @@ body {
   gap: var(--space-3);
 }
 
+.run-grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
 /* Run card */
 .run-card {
   position: relative;
@@ -2144,7 +2154,7 @@ body {
 
 .manual-rerun-note {
   margin: 0 0 var(--space-3);
-  color: var(--danger);
+  color: var(--error);
   font-size: var(--text-label);
 }
 
@@ -3547,10 +3557,10 @@ body {
 .report-history-error {
   margin-bottom: var(--space-4);
   padding: var(--inset-sm);
-  border: 0.5px solid var(--danger-border);
+  border: 0.5px solid var(--error-border);
   border-radius: var(--radius-sm);
-  background: var(--danger-bg);
-  color: var(--danger);
+  background: var(--error-bg);
+  color: var(--error);
   font-size: var(--text-label);
 }
 
@@ -3623,6 +3633,8 @@ body {
 }
 
 .audit-tab {
+  display: inline-flex;
+  align-items: center;
   padding: var(--space-3) var(--space-4);
   background: none;
   border: none;
@@ -3632,7 +3644,7 @@ body {
   font-weight: var(--weight-medium);
   cursor: pointer;
   white-space: nowrap;
-  min-height: 0;
+  min-height: 44px;
   transition: color var(--duration-fast) var(--ease-out),
     border-color var(--duration-fast) var(--ease-out);
 }

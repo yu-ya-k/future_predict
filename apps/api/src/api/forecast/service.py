@@ -4,34 +4,33 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any
-from uuid import UUID, uuid4
+from typing import Any, cast
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import ValidationError
 
 from api.config import Settings
+from api.forecast import probability
 from api.forecast.artifacts import ForecastArtifactStore
 from api.forecast.errors import ForecastConflict
-from api.forecast.policy import evaluate_forecast_policy
-from api.forecast.probability.phase_a_v1 import (
-    ENGINE_VERSION,
-    RANDOM_SEED,
-    SCORER_VERSION,
-    canonical_json_bytes,
-    compute_phase_a_estimates,
-    engine_code_hash,
-    log_score,
-    multiclass_brier,
-    snapshot_hash,
+from api.forecast.pack_orchestration import (
+    cache_key_for_pack,
+    default_pack_requests,
+    resolve_forecast_tools,
 )
+from api.forecast.policy import evaluate_forecast_policy
 from api.forecast.repository import ForecastRepository, ResearchPackAlreadyExists
 from api.forecast.research_packs import (
     CURRENT_STATE_PROMPT_VERSION,
+    PHASE_B_PACK_PROMPT_VERSION,
     build_current_state_prompt,
+    build_research_pack_prompt,
 )
 from api.forecast.schemas import (
     ClaimRecord,
     CommitVersionResponse,
+    ComputeProbabilitiesRequest,
+    ConfidentialityClass,
     ForecastAuditEvent,
     ForecastAuditResponse,
     ForecastCreateRequest,
@@ -47,12 +46,19 @@ from api.forecast.schemas import (
     ManualResearchPackPromptResponse,
     PackRole,
     ProbabilityEstimateRecord,
+    ResearchPackDefaultsResponse,
     ResearchPackRequest,
+    ResearchPackRerunRequest,
     ResearchPackResponse,
     ResolveForecastResponse,
     ScenarioRecord,
     SourceRecord,
     ToolProfile,
+)
+from api.forecast.trust import (
+    ensure_reviewer_for_action,
+    ensure_trusted_sources_allowed,
+    require_policy_tools_match,
 )
 from api.research.query_policy import contains_sensitive_terms
 from api.research.schemas import (
@@ -88,6 +94,9 @@ class ForecastOrchestrator:
     def _ensure_enabled(self) -> None:
         if not self.settings.forecast_enabled:
             raise ForecastConflict("forecast_disabled", "Forecast API is disabled.")
+
+    def ensure_enabled(self) -> None:
+        self._ensure_enabled()
 
     @staticmethod
     def _ensure_not_resolved(forecast: ForecastDetail) -> None:
@@ -203,12 +212,14 @@ class ForecastOrchestrator:
         )
 
     def list_forecasts(self) -> list[ForecastSummary]:
+        self._ensure_enabled()
         return [
             ForecastSummary(**ForecastRepository.forecast_row_to_dict(row))
             for row in self.repository.list_forecasts()
         ]
 
     def get_forecast(self, forecast_id: UUID) -> ForecastDetail:
+        self._ensure_enabled()
         row = self.repository.get_forecast(forecast_id)
         base = ForecastRepository.forecast_row_to_dict(row)
         outcomes = [
@@ -219,7 +230,8 @@ class ForecastOrchestrator:
             )
         ]
         packs = self.repository.list_packs(forecast_id)
-        current_pack_row = self._reconcile_research_pack(packs[-1]) if packs else None
+        reconciled_packs = [self._reconcile_research_pack(pack) for pack in packs]
+        current_pack_row = reconciled_packs[-1] if reconciled_packs else None
         current_pack = (
             self._current_research_pack_summary(current_pack_row)
             if current_pack_row is not None
@@ -232,8 +244,14 @@ class ForecastOrchestrator:
             current_research_pack_status=(
                 current_pack.effective_status if current_pack is not None else None
             ),
+            research_packs=[
+                self._current_research_pack_summary(pack) for pack in reconciled_packs
+            ],
             approved_claim_target_link_count=len(
-                self.repository.get_approved_target_links(forecast_id)
+                self.repository.get_approved_target_links(
+                    forecast_id,
+                    active_claims_only=True,
+                )
             ),
         )
 
@@ -357,6 +375,8 @@ class ForecastOrchestrator:
         return ForecastCurrentResearchPack(
             pack_id=UUID(pack["pack_id"]),
             research_run_id=run_id,
+            pack_role=PackRole(pack["pack_role"]),
+            tool_profile=ToolProfile(pack["tool_profile"]),
             pack_status=pack_status,
             effective_status=effective_status,
             research_run_status=run.status.value,
@@ -412,6 +432,12 @@ class ForecastOrchestrator:
                 "Estimate set does not belong to this forecast.",
                 {"estimate_set_id": str(estimate_set_id)},
             )
+        if estimate_set["engine_version"] != "phase_a_v1":
+            raise ForecastConflict(
+                "approval_required",
+                "Phase B estimate sets require approve_probability_publication.",
+                {"estimate_set_id": str(estimate_set_id)},
+            )
         self.repository.approve_estimate_set(
             forecast_id,
             estimate_set_id=estimate_set_id,
@@ -432,6 +458,43 @@ class ForecastOrchestrator:
         self.repository.approve_claim_target_links(forecast.forecast_id, comment=comment)
         return self.get_forecast(forecast_id)
 
+    def record_phase_b_review(
+        self,
+        forecast_id: UUID,
+        *,
+        action: str,
+        comment: str | None,
+        reviewer: str | None,
+        reviewer_auth_subject: str | None,
+        policy_decision_id: UUID | None,
+        review_reason: str | None,
+        estimate_set_id: UUID | None,
+        version_id: UUID | None,
+    ) -> ForecastDetail:
+        forecast = self.get_forecast(forecast_id)
+        self._ensure_enabled()
+        ensure_reviewer_for_action(action, reviewer)
+        if estimate_set_id is not None:
+            estimate_set = self.repository.get_estimate_set(estimate_set_id)
+            if UUID(estimate_set["forecast_id"]) != forecast.forecast_id:
+                raise ForecastConflict(
+                    "approval_required",
+                    "Estimate set does not belong to this forecast.",
+                    {"estimate_set_id": str(estimate_set_id)},
+                )
+        self.repository.add_review_record(
+            forecast_id=forecast.forecast_id,
+            action=action,
+            comment=comment,
+            reviewer=reviewer,
+            reviewer_auth_subject=reviewer_auth_subject,
+            policy_decision_id=policy_decision_id,
+            review_reason=review_reason,
+            estimate_set_id=estimate_set_id,
+            version_id=version_id,
+        )
+        return self.get_forecast(forecast_id)
+
     def dispatch_research_pack(
         self,
         forecast_id: UUID,
@@ -447,46 +510,287 @@ class ForecastOrchestrator:
                 "framing_not_approved",
                 "Approve the latest framing before dispatching research packs.",
             )
-        if forecast.confidentiality_class != "public":
+        if request.tool_profile == ToolProfile.SYNTHESIS:
             raise ForecastConflict(
-                "policy_requires_revision",
-                "PhaseA only supports public forecasts.",
+                "synthesis_not_dispatchable",
+                "Synthesis profile cannot submit Deep Research packs.",
             )
-        if (
-            request.pack_role != PackRole.CURRENT_STATE
-            or request.tool_profile != ToolProfile.PUBLIC
-        ):
-            raise ForecastConflict(
-                "policy_requires_revision",
-                "PhaseA only supports public current_state research packs.",
-            )
-        existing = self.repository.list_packs(forecast_id)
+        existing = [
+            pack
+            for pack in self.repository.list_packs(forecast_id)
+            if pack["pack_role"] == request.pack_role.value
+            and pack["tool_profile"] == request.tool_profile.value
+            and bool(pack["is_active"])
+        ]
         if existing:
             return _pack_response(self._reconcile_research_pack(existing[-1]))
-        if forecast.status != ForecastStatus.FRAMING_APPROVED:
+        if forecast.status not in {
+            ForecastStatus.FRAMING_APPROVED,
+            ForecastStatus.PACK_RUNNING,
+        }:
             raise ForecastConflict(
                 "forecast_already_started",
-                "A PhaseA research pack can only be dispatched once.",
+                "Research packs can only be dispatched before evidence extraction.",
             )
-        prompt = build_current_state_prompt(forecast)
-        policy = evaluate_forecast_policy(prompt, profile=request.tool_profile.value)
+        return self._dispatch_research_pack_after_gates(forecast, request)
+
+    def dispatch_default_research_packs(
+        self,
+        forecast_id: UUID,
+    ) -> ResearchPackDefaultsResponse:
+        packs = [
+            self.dispatch_research_pack(forecast_id, request, idempotency_key=None)
+            for request in default_pack_requests()
+        ]
+        return ResearchPackDefaultsResponse(packs=packs)
+
+    def rerun_research_pack(
+        self,
+        forecast_id: UUID,
+        pack_id: UUID,
+        request: ResearchPackRerunRequest,
+    ) -> ResearchPackResponse:
+        forecast = self.get_forecast(forecast_id)
+        self._ensure_mutable(forecast)
+        if request.expected_active_pack_id != pack_id:
+            raise ForecastConflict(
+                "active_pack_changed",
+                "Expected active pack does not match the requested pack.",
+            )
+        current = self.repository.get_pack(pack_id)
+        if UUID(current["forecast_id"]) != forecast_id or not current["is_active"]:
+            raise ForecastConflict(
+                "active_pack_changed",
+                "Active pack changed before rerun.",
+                {"expected_active_pack_id": str(pack_id)},
+            )
+        pack_request = ResearchPackRequest(
+            pack_role=PackRole(current["pack_role"]),
+            tool_profile=ToolProfile(current["tool_profile"]),
+            max_tool_calls=request.max_tool_calls,
+            background=request.background,
+            data_classification=current["data_classification"],
+            vector_store_ids=json.loads(current["vector_store_ids_json"] or "[]"),
+            mcp_server_ids=json.loads(current["mcp_server_ids_json"] or "[]"),
+            timeout_sec=request.timeout_sec,
+            estimated_cost_budget_usd=request.estimated_cost_budget_usd,
+        )
+        return self._dispatch_research_pack_after_gates(
+            forecast,
+            pack_request,
+            rerun_of_pack_id=pack_id,
+            attempt_no=int(current["attempt_no"]) + 1,
+            rerun_policy="explicit_rerun",
+            replace_active_pack_id=pack_id,
+        )
+
+    def list_research_packs(self, forecast_id: UUID) -> list[ResearchPackResponse]:
+        self._ensure_enabled()
+        self.repository.get_forecast(forecast_id)
+        return [
+            _pack_response(self._reconcile_research_pack(pack))
+            for pack in self.repository.list_packs(forecast_id)
+        ]
+
+    def _record_blocked_pack_request(
+        self,
+        forecast: ForecastDetail,
+        request: ResearchPackRequest,
+        *,
+        reason: str,
+        policy_decision_id: UUID | None = None,
+    ) -> None:
+        self.repository.add_pack_request(
+            forecast_id=forecast.forecast_id,
+            pack_role=request.pack_role.value,
+            tool_profile=request.tool_profile.value,
+            data_classification=request.data_classification.value,
+            status="blocked",
+            reason=reason,
+            policy_decision_id=policy_decision_id,
+            request_payload=request.model_dump(mode="json"),
+        )
+
+    def _check_pack_timeout_and_cost(
+        self,
+        forecast: ForecastDetail,
+        request: ResearchPackRequest,
+    ) -> None:
+        if (
+            request.timeout_sec is not None
+            and request.timeout_sec > self.settings.research_deep_research_timeout_seconds
+        ):
+            self._record_blocked_pack_request(
+                forecast,
+                request,
+                reason="timeout_budget_exceeded",
+            )
+            raise ForecastConflict(
+                "timeout_budget_exceeded",
+                "Requested Forecast pack timeout exceeds the configured limit.",
+                {
+                    "timeout_sec": request.timeout_sec,
+                    "max_timeout_sec": self.settings.research_deep_research_timeout_seconds,
+                },
+            )
+        if request.estimated_cost_budget_usd is None:
+            return
+        estimated_tool_cost = (
+            request.max_tool_calls * self.settings.research_web_search_cost_per_call
+        )
+        if estimated_tool_cost > request.estimated_cost_budget_usd:
+            self._record_blocked_pack_request(
+                forecast,
+                request,
+                reason="cost_budget_exceeded",
+            )
+            raise ForecastConflict(
+                "cost_budget_exceeded",
+                "Estimated Forecast pack tool cost exceeds the requested budget.",
+                {
+                    "estimated_cost_usd": estimated_tool_cost,
+                    "estimated_cost_budget_usd": request.estimated_cost_budget_usd,
+                },
+            )
+
+    def _ensure_private_vector_store_ids_allowed(
+        self,
+        forecast: ForecastDetail,
+        request: ResearchPackRequest,
+    ) -> None:
+        if request.tool_profile != ToolProfile.PRIVATE:
+            return
+        allowed_ids = set(self.settings.research_private_vector_store_allowlist)
+        requested_ids = set(request.vector_store_ids)
+        if not allowed_ids or not requested_ids.issubset(allowed_ids):
+            self._record_blocked_pack_request(
+                forecast,
+                request,
+                reason="private_vector_store_not_allowlisted",
+            )
+            raise ForecastConflict(
+                "private_vector_store_not_allowlisted",
+                "Private Forecast pack vector_store_ids must be allowlisted.",
+                {
+                    "requested_vector_store_ids": sorted(requested_ids),
+                    "allowed_vector_store_ids": sorted(allowed_ids),
+                },
+            )
+
+    def _dispatch_research_pack_after_gates(
+        self,
+        forecast: ForecastDetail,
+        request: ResearchPackRequest,
+        *,
+        rerun_of_pack_id: UUID | None = None,
+        attempt_no: int = 1,
+        rerun_policy: str | None = None,
+        replace_active_pack_id: UUID | None = None,
+    ) -> ResearchPackResponse:
+        if (
+            request.data_classification == "restricted"
+            and request.background
+        ):
+            self._record_blocked_pack_request(
+                forecast,
+                request,
+                reason="background_mode_violates_zdr",
+            )
+            raise ForecastConflict(
+                "background_mode_violates_zdr",
+                "Restricted Forecast packs cannot use background Deep Research.",
+            )
+        resolved_tools = resolve_forecast_tools(request)
+        if request.tool_profile == ToolProfile.PRIVATE and not request.vector_store_ids:
+            self._record_blocked_pack_request(
+                forecast,
+                request,
+                reason="private_vector_store_required",
+            )
+            raise ForecastConflict(
+                "private_vector_store_required",
+                "Private Forecast packs require allowlisted vector_store_ids.",
+            )
+        self._ensure_private_vector_store_ids_allowed(forecast, request)
+        self._check_pack_timeout_and_cost(forecast, request)
+        try:
+            ensure_trusted_sources_allowed(
+                self.repository,
+                identifiers=request.trusted_source_identifiers,
+                tool_profile=request.tool_profile,
+                pack_role=request.pack_role,
+                tool_names=[
+                    str(tool.get("type", ""))
+                    for tool in resolved_tools.tools
+                    if tool.get("type")
+                ],
+                vector_store_ids=resolved_tools.vector_store_ids,
+                mcp_server_ids=resolved_tools.mcp_server_ids,
+            )
+        except ForecastConflict as error:
+            self._record_blocked_pack_request(
+                forecast,
+                request,
+                reason=error.code,
+            )
+            raise
+        prompt = build_research_pack_prompt(
+            forecast,
+            pack_role=request.pack_role,
+            tool_profile=request.tool_profile.value,
+        )
+        policy = evaluate_forecast_policy(
+            prompt,
+            profile=request.tool_profile.value,
+            data_classification=request.data_classification.value,
+            resolved_tools=resolved_tools.tools,
+            background=request.background,
+        )
         policy_decision_id = self.repository.add_policy_decision(
-            forecast_id=forecast_id,
+            forecast_id=forecast.forecast_id,
             profile=request.tool_profile.value,
             status=policy.status,
             reason=policy.reason,
             prompt_hash=policy.prompt_hash,
+            decision=policy.status,
+            policy_version="phase_b_v1",
+            data_classification=request.data_classification.value,
+            resolved_tools=resolved_tools.tools,
+            vector_store_ids=resolved_tools.vector_store_ids,
+            mcp_server_ids=resolved_tools.mcp_server_ids,
+            background=request.background,
+            blocked_terms=getattr(policy, "blocked_terms", []),
         )
         if policy.status == "blocked":
+            self.repository.add_pack_request(
+                forecast_id=forecast.forecast_id,
+                pack_role=request.pack_role.value,
+                tool_profile=request.tool_profile.value,
+                data_classification=request.data_classification.value,
+                status="blocked",
+                reason=policy.reason,
+                policy_decision_id=policy_decision_id,
+                request_payload=request.model_dump(mode="json"),
+            )
             raise ForecastConflict(
                 "policy_blocked",
                 policy.reason or "Forecast research pack was blocked by policy.",
                 {"policy_decision_id": str(policy_decision_id)},
             )
         if policy.status == "require_human_review":
+            self.repository.add_pack_request(
+                forecast_id=forecast.forecast_id,
+                pack_role=request.pack_role.value,
+                tool_profile=request.tool_profile.value,
+                data_classification=request.data_classification.value,
+                status="awaiting_review",
+                reason=policy.reason,
+                policy_decision_id=policy_decision_id,
+                request_payload=request.model_dump(mode="json"),
+            )
             raise ForecastConflict(
                 "policy_requires_revision",
-                policy.reason or "Policy requires revision for PhaseA.",
+                policy.reason or "Policy requires Forecast review.",
                 {"policy_decision_id": str(policy_decision_id)},
             )
 
@@ -499,7 +803,7 @@ class ForecastOrchestrator:
         )
         try:
             pack = self.repository.add_research_pack(
-                forecast_id=forecast_id,
+                forecast_id=forecast.forecast_id,
                 research_run_id=run.id,
                 pack_role=request.pack_role.value,
                 tool_profile=request.tool_profile.value,
@@ -509,18 +813,59 @@ class ForecastOrchestrator:
                     "deep_research_deployment",
                     None,
                 ),
-                prompt_version=CURRENT_STATE_PROMPT_VERSION,
+                prompt_version=(
+                    CURRENT_STATE_PROMPT_VERSION
+                    if request.pack_role == PackRole.CURRENT_STATE
+                    else PHASE_B_PACK_PROMPT_VERSION
+                ),
                 max_tool_calls=request.max_tool_calls,
                 policy_decision_id=policy_decision_id,
+                attempt_no=attempt_no,
+                rerun_of_pack_id=rerun_of_pack_id,
+                timeout_sec=request.timeout_sec,
+                estimated_cost_budget_usd=request.estimated_cost_budget_usd,
+                vector_store_ids=resolved_tools.vector_store_ids,
+                mcp_server_ids=resolved_tools.mcp_server_ids,
+                cache_key=cache_key_for_pack(
+                    forecast_id=str(forecast.forecast_id),
+                    pack_role=request.pack_role,
+                    tool_profile=request.tool_profile,
+                    data_classification=request.data_classification,
+                    prompt_hash=policy.prompt_hash,
+                ),
+                rerun_policy=rerun_policy,
+                data_classification=request.data_classification.value,
+                replace_active_pack_id=replace_active_pack_id,
             )
         except ResearchPackAlreadyExists as error:
             self.research.repository.delete_run(run.id)
             return _pack_response(self._reconcile_research_pack(error.existing_pack))
+        except ValueError as error:
+            self.research.repository.delete_run(run.id)
+            if str(error) == "active_pack_changed":
+                raise ForecastConflict(
+                    "active_pack_changed",
+                    "Active pack changed before rerun.",
+                    {
+                        "expected_active_pack_id": (
+                            str(replace_active_pack_id)
+                            if replace_active_pack_id is not None
+                            else None
+                        )
+                    },
+                ) from error
+            raise
+        require_policy_tools_match(
+            self.repository,
+            policy_decision_id=policy_decision_id,
+            resolved_tools=resolved_tools.tools,
+        )
         submitted = self.research.submit_deep_research(
             run.id,
-            tool_profile="public",
-            background=True,
+            tool_profile=request.tool_profile.value,
+            background=request.background,
             policy_decision_id=str(policy_decision_id),
+            vector_store_ids=resolved_tools.vector_store_ids,
         )
         if submitted.status == RunStatus.WAITING_DEEP_RESEARCH:
             if submitted.pending_deep_research_response_id:
@@ -969,92 +1314,254 @@ class ForecastOrchestrator:
                 "pack_not_completed",
                 "Research pack must complete before evidence extraction.",
             )
-        pack = self._single_completed_pack(forecast.forecast_id)
-        run = self.research.repository.get_run(UUID(pack["research_run_id"]))
-        if run.status != RunStatus.COMPLETED:
-            raise ForecastConflict(
-                "pack_not_completed",
-                "Research pack must complete before evidence extraction.",
-                {"research_run_id": str(run.id), "status": run.status.value},
-            )
-        report = (run.final_report or run.report or "").strip()
-        if not report:
-            raise ForecastConflict(
-                "pack_not_completed",
-                "Research pack completed without a report.",
-                {"research_run_id": str(run.id)},
-            )
-        source_id = str(uuid4())
-        sources = [
-            {
-                "source_id": source_id,
-                "title": "Current-state Deep Research report",
-                "publisher": "Deep Research",
-                "url": None,
-                "source_type": "research_report",
-                "source_classification": ToolProfile.PUBLIC.value,
-                "reliability_score": 0.72,
-                "metadata": {"research_run_id": str(run.id)},
-            }
-        ]
+        completed_packs = self._completed_evidence_packs(forecast.forecast_id)
+        reports: list[tuple[Any, Any, str, str]] = []
+        for pack in completed_packs:
+            run = self.research.repository.get_run(UUID(pack["research_run_id"]))
+            report = (run.final_report or run.report or "").strip()
+            if not report:
+                raise ForecastConflict(
+                    "pack_not_completed",
+                    "Research pack completed without a report.",
+                    {"research_run_id": str(run.id)},
+                )
+            report_hash = hashlib.sha256(report.encode("utf-8")).hexdigest()
+            reports.append((pack, run, report, report_hash))
+
+        sources: list[dict[str, Any]] = []
         outcomes = forecast.outcomes
-        lines = _claim_lines(report)
         claims: list[dict[str, Any]] = []
         links: list[dict[str, Any]] = []
-        for index, line in enumerate(lines[: max(1, min(len(lines), 12))]):
-            outcome = outcomes[index % len(outcomes)]
-            independence_group = _publisher_group(line, index)
-            cluster_id = hashlib.sha256(
-                f"{_fingerprint(line)}:{independence_group}".encode()
-            ).hexdigest()
-            claim_id = str(uuid4())
-            claims.append(
+        for pack, run, report, report_hash in reports:
+            pack_id = UUID(pack["pack_id"])
+            source_id = str(uuid5(NAMESPACE_URL, f"forecast-source:{pack_id}:{report_hash}"))
+            sources.append(
                 {
-                    "claim_id": claim_id,
-                    "text": line,
-                    "claim_type": "current_state",
-                    "polarity": 1,
-                    "evidence_strength": 0.65,
+                    "source_id": source_id,
+                    "pack_id": str(pack_id),
+                    "title": f"{pack['pack_role']} Deep Research report",
+                    "publisher": "Deep Research",
+                    "url": None,
+                    "source_type": "research_report",
+                    "source_classification": pack["data_classification"],
+                    "data_classification": pack["data_classification"],
+                    "origin_tool_profile": pack["tool_profile"],
                     "reliability_score": 0.72,
-                    "cluster_id": cluster_id,
-                    "independence_group": independence_group,
-                    "source_classification": ToolProfile.PUBLIC.value,
-                    "extraction_model": "deterministic_phase_a_extractor",
-                    "extraction_prompt_version": "phase_a_claims_v1",
-                    "review_status": "approved",
-                    "source_ids": [source_id],
+                    "report_artifact_hash": report_hash,
+                    "metadata": {
+                        "research_run_id": str(run.id),
+                        "pack_id": str(pack_id),
+                        "pack_role": pack["pack_role"],
+                    },
                 }
             )
-            links.append(
-                {
-                    "claim_id": claim_id,
-                    "target_kind": "outcome",
-                    "target_id": str(outcome.outcome_id),
-                    "direction": 1,
-                    "relevance_weight": 1.0,
-                    "review_status": "pending",
-                }
-            )
+            lines = _claim_lines(report)
+            for index, line in enumerate(lines[: max(1, min(len(lines), 12))]):
+                outcome = outcomes[index % len(outcomes)]
+                independence_group = _publisher_group(line, index)
+                cluster_id = hashlib.sha256(
+                    f"{_fingerprint(line)}:{independence_group}".encode()
+                ).hexdigest()
+                claim_id = str(
+                    uuid5(NAMESPACE_URL, f"forecast-claim:{pack_id}:{report_hash}:{index}")
+                )
+                claims.append(
+                    {
+                        "claim_id": claim_id,
+                        "text": line,
+                        "claim_type": pack["pack_role"],
+                        "polarity": 1,
+                        "evidence_strength": 0.65,
+                        "reliability_score": 0.72,
+                        "cluster_id": cluster_id,
+                        "independence_group": independence_group,
+                        "source_classification": pack["data_classification"],
+                        "data_classification": pack["data_classification"],
+                        "origin_tool_profile": pack["tool_profile"],
+                        "pack_id": str(pack_id),
+                        "report_artifact_hash": report_hash,
+                        "extraction_model": "deterministic_phase_b_extractor",
+                        "extraction_prompt_version": "phase_b_claims_v1",
+                        "review_status": "approved",
+                        "source_ids": [source_id],
+                    }
+                )
+                links.append(
+                    {
+                        "link_id": str(
+                            uuid5(
+                                NAMESPACE_URL,
+                                f"forecast-link:{claim_id}:outcome:{outcome.outcome_id}",
+                            )
+                        ),
+                        "claim_id": claim_id,
+                        "target_kind": "outcome",
+                        "target_id": str(outcome.outcome_id),
+                        "direction": 1,
+                        "relevance_weight": 1.0,
+                        "review_status": "pending",
+                    }
+                )
         if not claims:
             raise ForecastConflict(
                 "pack_not_completed",
                 "No source-linked claims could be extracted from the completed pack.",
             )
-        self.repository.mark_pack_completed(
-            pack_id=UUID(pack["pack_id"]),
-            report_artifact_hash=hashlib.sha256(report.encode("utf-8")).hexdigest(),
-        )
-        source_rows, claim_rows = self.repository.replace_evidence(
+        for pack, _run, _report, report_hash in reports:
+            self.repository.mark_pack_completed(
+                pack_id=UUID(pack["pack_id"]),
+                report_artifact_hash=report_hash,
+            )
+        extraction_batch_id = hashlib.sha256(
+            ":".join(sorted(item[3] for item in reports)).encode("utf-8")
+        ).hexdigest()
+        source_rows, claim_rows = self.repository.upsert_evidence_batch(
             forecast_id=forecast.forecast_id,
-            pack_id=UUID(pack["pack_id"]),
+            pack_id=UUID(reports[0][0]["pack_id"]),
+            extraction_batch_id=extraction_batch_id,
+            report_artifact_hash=extraction_batch_id,
             sources=sources,
             claims=claims,
             links=links,
         )
+        self._derive_phase_b_structures_from_reports(forecast, reports)
         return (
             [_source_response(row) for row in source_rows],
             [_claim_response(self.repository, row) for row in claim_rows],
         )
+
+    def _completed_evidence_packs(self, forecast_id: UUID) -> list[Any]:
+        active = [
+            self._reconcile_research_pack(pack)
+            for pack in self.repository.list_active_packs(forecast_id)
+        ]
+        if not active:
+            raise ForecastConflict(
+                "pack_not_completed",
+                "Dispatch and complete research packs first.",
+            )
+        active_pairs = {(pack["pack_role"], pack["tool_profile"]) for pack in active}
+        required_pairs = {
+            (role.value, ToolProfile.PUBLIC.value)
+            for role in (
+                PackRole.CURRENT_STATE,
+                PackRole.BASE_RATE,
+                PackRole.DRIVERS,
+                PackRole.COUNTER_EVIDENCE,
+                PackRole.SIGNALS,
+            )
+        }
+        phase_a_pair = {(PackRole.CURRENT_STATE.value, ToolProfile.PUBLIC.value)}
+        if active_pairs == phase_a_pair:
+            required = [active[-1]]
+        else:
+            missing_pairs = sorted(required_pairs - active_pairs)
+            if missing_pairs:
+                raise ForecastConflict(
+                    "pack_not_completed",
+                    "Required active Phase B default packs must exist before evidence extraction.",
+                    {
+                        "missing_packs": [
+                            {"pack_role": role, "tool_profile": profile}
+                            for role, profile in missing_pairs
+                        ]
+                    },
+                )
+            required = [
+                pack
+                for pack in active
+                if (pack["pack_role"], pack["tool_profile"]) in required_pairs
+            ]
+        incomplete: list[dict[str, str]] = []
+        for pack in required:
+            run = self.research.repository.get_run(UUID(pack["research_run_id"]))
+            if pack["status"] != "completed" and run.status != RunStatus.COMPLETED:
+                incomplete.append(
+                    {
+                        "pack_id": pack["pack_id"],
+                        "pack_role": pack["pack_role"],
+                        "status": pack["status"],
+                        "research_run_status": run.status.value,
+                    }
+                )
+        if incomplete:
+            raise ForecastConflict(
+                "pack_not_completed",
+                "Required active research packs must complete before evidence extraction.",
+                {"incomplete_packs": incomplete},
+            )
+        return required
+
+    def _derive_phase_b_structures_from_reports(
+        self,
+        forecast: ForecastDetail,
+        reports: list[tuple[Any, Any, str, str]],
+    ) -> None:
+        by_role = {pack["pack_role"]: (pack, report) for pack, _run, report, _hash in reports}
+        if PackRole.BASE_RATE.value in by_role:
+            pack, report = by_role[PackRole.BASE_RATE.value]
+            lines = _claim_lines(report) or ["Base-rate analog"]
+            analog_events = [
+                {
+                    "analog_event_id": str(
+                        uuid5(
+                            NAMESPACE_URL,
+                            f"forecast-analog:{forecast.forecast_id}:{index}:{outcome.outcome_id}",
+                        )
+                    ),
+                    "title": lines[index % len(lines)][:200],
+                    "matched_outcome_id": str(outcome.outcome_id),
+                    "weight": 1.0,
+                    "rationale": "Deterministic base-rate analog extracted from base_rate pack.",
+                }
+                for index, outcome in enumerate(forecast.outcomes)
+            ]
+            self.repository.replace_analog_events(
+                forecast_id=forecast.forecast_id,
+                pack_id=UUID(pack["pack_id"]),
+                analog_events=analog_events,
+            )
+        if PackRole.DRIVERS.value in by_role:
+            _pack, report = by_role[PackRole.DRIVERS.value]
+            lines = _claim_lines(report)[:3] or [forecast.question]
+            drivers: list[dict[str, Any]] = []
+            for index, line in enumerate(lines):
+                driver_id = str(
+                    uuid5(
+                        NAMESPACE_URL,
+                        f"forecast-driver:{forecast.forecast_id}:{_fingerprint(line)}:{index}",
+                    )
+                )
+                drivers.append(
+                    {
+                        "driver_id": driver_id,
+                        "name": line[:80],
+                        "description": line[:1000],
+                        "sort_order": index,
+                        "states": [
+                            {
+                                "state_id": str(
+                                    uuid5(NAMESPACE_URL, f"{driver_id}:low")
+                                ),
+                                "label": "Low",
+                                "description": f"Low intensity for {line[:120]}",
+                                "sort_order": 0,
+                            },
+                            {
+                                "state_id": str(
+                                    uuid5(NAMESPACE_URL, f"{driver_id}:high")
+                                ),
+                                "label": "High",
+                                "description": f"High intensity for {line[:120]}",
+                                "sort_order": 1,
+                            },
+                        ],
+                    }
+                )
+            self.repository.replace_drivers(
+                forecast_id=forecast.forecast_id,
+                drivers=drivers,
+            )
 
     def generate_scenarios(self, forecast_id: UUID) -> list[ScenarioRecord]:
         forecast = self.get_forecast(forecast_id)
@@ -1070,42 +1577,104 @@ class ForecastOrchestrator:
                 "evidence_not_ready",
                 "Extract evidence before generating scenarios.",
             )
-        scenarios = [
-            {
-                "scenario_id": str(uuid4()),
-                "outcome_id": str(outcome.outcome_id),
-                "label": outcome.label,
-                "description": f"Scenario in which the forecast resolves as: {outcome.definition}",
-                "normalized_weight": 1.0,
-                "validity_status": "valid",
-            }
-            for outcome in forecast.outcomes
-        ]
-        rows = self.repository.replace_scenarios(
+        driver_states = self.repository.get_driver_states(forecast.forecast_id)
+        scenario_driver_links: list[dict[str, str]] = []
+        if driver_states:
+            states_by_driver: dict[str, list[Any]] = {}
+            for state in driver_states:
+                states_by_driver.setdefault(state["driver_id"], []).append(state)
+            selected_state_groups = list(states_by_driver.values())[:2]
+            combinations: list[list[Any]] = [[]]
+            for group in selected_state_groups:
+                combinations = [prefix + [state] for prefix in combinations for state in group[:2]]
+            combinations = combinations[:4] or [[driver_states[0]]]
+            scenarios: list[dict[str, Any]] = []
+            for outcome in forecast.outcomes:
+                for index, states in enumerate(combinations):
+                    state_label = " / ".join(state["label"] for state in states)
+                    scenario_id = str(
+                        uuid5(
+                            NAMESPACE_URL,
+                            f"forecast-scenario:{forecast.forecast_id}:{outcome.outcome_id}:{index}:{state_label}",
+                        )
+                    )
+                    scenarios.append(
+                        {
+                            "scenario_id": scenario_id,
+                            "outcome_id": str(outcome.outcome_id),
+                            "label": f"{outcome.label}: {state_label}",
+                            "description": (
+                                f"{outcome.definition} Driver states: {state_label}."
+                            ),
+                            "normalized_weight": 1.0,
+                            "validity_status": "valid",
+                        }
+                    )
+                    for state in states:
+                        scenario_driver_links.append(
+                            {"scenario_id": scenario_id, "state_id": state["state_id"]}
+                        )
+        else:
+            scenarios = [
+                {
+                    "scenario_id": str(
+                        uuid5(
+                            NAMESPACE_URL,
+                            f"forecast-scenario:{forecast.forecast_id}:{outcome.outcome_id}:phase-a",
+                        )
+                    ),
+                    "outcome_id": str(outcome.outcome_id),
+                    "label": outcome.label,
+                    "description": (
+                        "Scenario in which the forecast resolves as: "
+                        f"{outcome.definition}"
+                    ),
+                    "normalized_weight": 1.0,
+                    "validity_status": "valid",
+                }
+                for outcome in forecast.outcomes
+            ]
+        _validate_scenarios_for_outcomes(forecast, scenarios, scenario_driver_links)
+        rows = self.repository.upsert_scenarios(
             forecast_id=forecast.forecast_id,
             scenarios=scenarios,
         )
-        return [_scenario_response(row) for row in rows]
+        if scenario_driver_links:
+            self.repository.replace_scenario_driver_links(links=scenario_driver_links)
+        return [_scenario_response_with_links(self.repository, row) for row in rows]
 
-    def compute_probabilities(self, forecast_id: UUID) -> dict[str, Any]:
+    def compute_probabilities(
+        self,
+        forecast_id: UUID,
+        request: ComputeProbabilitiesRequest | None = None,
+    ) -> dict[str, Any]:
         forecast = self.get_forecast(forecast_id)
         self._ensure_mutable(forecast)
         _ensure_forecast_has_outcomes(forecast)
-        if not self.repository.get_claims(forecast.forecast_id):
+        if not self.repository.get_active_claims(forecast.forecast_id):
             raise ForecastConflict("evidence_not_ready", "Extract evidence first.")
         if not self.repository.get_scenarios(forecast.forecast_id):
             raise ForecastConflict("scenarios_not_ready", "Generate scenarios first.")
-        approved_links = self.repository.get_approved_target_links(forecast.forecast_id)
+        approved_links = self.repository.get_approved_target_links(
+            forecast.forecast_id,
+            active_claims_only=True,
+        )
         if not approved_links:
             raise ForecastConflict(
                 "claim_targets_not_approved",
                 "Approve claim-target links before computing probabilities.",
             )
-        snapshot = self._canonical_snapshot(forecast)
-        input_hash = snapshot_hash(snapshot)
+        engine = probability.get_engine(request.engine_version if request else None)
+        snapshot = self._canonical_snapshot(forecast, engine_version=engine.engine_version)
+        input_hash = engine.snapshot_hash(snapshot)
+        engine_code_hash = engine.engine_code_hash()
         existing = self.repository.get_draft_estimate_set(forecast.forecast_id)
         if existing is not None:
-            if existing["input_snapshot_hash"] == input_hash:
+            if (
+                existing["input_snapshot_hash"] == input_hash
+                and existing["engine_version"] == engine.engine_version
+                and existing["engine_code_hash"] == engine_code_hash
+            ):
                 return self.estimate_set_response(UUID(existing["estimate_set_id"]))
             raise ForecastConflict(
                 "draft_estimate_set_exists",
@@ -1114,19 +1683,49 @@ class ForecastOrchestrator:
                     "estimate_set_id": existing["estimate_set_id"],
                     "existing_input_snapshot_hash": existing["input_snapshot_hash"],
                     "new_input_snapshot_hash": input_hash,
+                    "existing_engine_version": existing["engine_version"],
+                    "new_engine_version": engine.engine_version,
+                    "existing_engine_code_hash": existing["engine_code_hash"],
+                    "new_engine_code_hash": engine_code_hash,
                 },
             )
-        estimates = compute_phase_a_estimates(snapshot=snapshot)
-        estimate_set = self.repository.create_draft_estimate_set(
-            forecast_id=forecast.forecast_id,
-            engine_version=ENGINE_VERSION,
-            input_snapshot_hash=input_hash,
-            engine_code_hash=engine_code_hash(),
-            random_seed=RANDOM_SEED,
-            normalization_group_id=forecast.outcomes[0].normalization_group_id,
-            snapshot=snapshot,
-            estimates=estimates,
-        )
+        estimates = engine.compute(snapshot=snapshot)
+        try:
+            estimate_set = self.repository.create_draft_estimate_set(
+                forecast_id=forecast.forecast_id,
+                engine_version=engine.engine_version,
+                input_snapshot_hash=input_hash,
+                engine_code_hash=engine_code_hash,
+                random_seed=engine.random_seed,
+                normalization_group_id=forecast.outcomes[0].normalization_group_id,
+                snapshot=snapshot,
+                estimates=estimates,
+            )
+        except ValueError as error:
+            if str(error) == "draft_estimate_set_exists":
+                existing = self.repository.get_draft_estimate_set(forecast.forecast_id)
+                raise ForecastConflict(
+                    "draft_estimate_set_exists",
+                    "A draft estimate set already exists for different inputs.",
+                    {
+                        "estimate_set_id": (
+                            existing["estimate_set_id"] if existing is not None else None
+                        ),
+                        "existing_input_snapshot_hash": (
+                            existing["input_snapshot_hash"] if existing is not None else None
+                        ),
+                        "new_input_snapshot_hash": input_hash,
+                        "existing_engine_version": (
+                            existing["engine_version"] if existing is not None else None
+                        ),
+                        "new_engine_version": engine.engine_version,
+                        "existing_engine_code_hash": (
+                            existing["engine_code_hash"] if existing is not None else None
+                        ),
+                        "new_engine_code_hash": engine_code_hash,
+                    },
+                ) from error
+            raise
         return self.estimate_set_response(UUID(estimate_set["estimate_set_id"]))
 
     def estimate_set_response(self, estimate_set_id: UUID) -> dict[str, Any]:
@@ -1165,6 +1764,7 @@ class ForecastOrchestrator:
         }
 
     def current_estimate_set_response(self, forecast_id: UUID) -> dict[str, Any]:
+        self._ensure_enabled()
         self.repository.get_forecast(forecast_id)
         estimate_set = self.repository.get_current_estimate_set(forecast_id)
         if estimate_set is None:
@@ -1206,11 +1806,27 @@ class ForecastOrchestrator:
                 },
             )
         snapshot = _json_load(estimate_set["snapshot_json"])
+        if forecast.confidentiality_class == "public" and _snapshot_has_non_public_evidence(
+            snapshot
+        ):
+            raise ForecastConflict(
+                "classification_mismatch",
+                "Public Forecast versions cannot include internal or restricted evidence.",
+            )
+        artifact_profile = (
+            "private"
+            if forecast.confidentiality_class != "public"
+            or _snapshot_has_non_public_evidence(snapshot)
+            else "public"
+        )
         path, digest, _bytes = self.artifacts.save_bytes(
             forecast_id,
-            "public",
+            artifact_profile,
             f"versions/{estimate_set_id}.snapshot.json",
-            canonical_json_bytes(snapshot),
+            probability.canonical_json_bytes(
+                snapshot,
+                engine_version=estimate_set["engine_version"],
+            ),
         )
         if digest != estimate_set["input_snapshot_hash"]:
             Path(path).unlink(missing_ok=True)
@@ -1276,14 +1892,26 @@ class ForecastOrchestrator:
         version = self.repository.get_versions(forecast.forecast_id)[-1]
         snapshot_bytes = Path(version["snapshot_artifact_path"]).read_bytes()
         snapshot = json.loads(snapshot_bytes.decode("utf-8"))
-        if snapshot_hash(snapshot) != version["input_snapshot_hash"]:
+        estimate_set = self.repository.get_estimate_set(UUID(version["estimate_set_id"]))
+        engine = probability.get_engine(estimate_set["engine_version"])
+        if engine.snapshot_hash(snapshot) != version["input_snapshot_hash"]:
             raise ForecastConflict(
                 "approval_required",
                 "Committed snapshot artifact hash does not match the version record.",
             )
-        estimates = compute_phase_a_estimates(snapshot=snapshot)
-        brier = multiclass_brier(estimates, actual_outcome_id=str(outcome_id))
-        log = log_score(estimates, actual_outcome_id=str(outcome_id))
+        if estimate_set["engine_code_hash"] != snapshot.get("engine_code_hash"):
+            raise ForecastConflict(
+                "approval_required",
+                "Committed snapshot engine hash does not match the estimate set.",
+            )
+        estimates = self.repository.get_estimate_dicts(
+            UUID(estimate_set["estimate_set_id"])
+        )
+        brier, log, scorer_version = probability.score(
+            estimates=estimates,
+            actual_outcome_id=str(outcome_id),
+            engine_version=engine.engine_version,
+        )
         try:
             resolution = self.repository.resolve_forecast(
                 forecast_id=forecast.forecast_id,
@@ -1291,7 +1919,7 @@ class ForecastOrchestrator:
                 outcome_id=outcome_id,
                 multiclass_brier=brier,
                 log_score=log,
-                scorer_version=SCORER_VERSION,
+                scorer_version=scorer_version,
                 notes=resolution_notes,
             )
         except ValueError as error:
@@ -1311,6 +1939,7 @@ class ForecastOrchestrator:
         )
 
     def get_audit(self, forecast_id: UUID) -> ForecastAuditResponse:
+        self._ensure_enabled()
         self.repository.get_forecast(forecast_id)
         audit = self.repository.get_audit(forecast_id)
         return ForecastAuditResponse(
@@ -1339,7 +1968,13 @@ class ForecastOrchestrator:
             )
         return packs[-1]
 
-    def _canonical_snapshot(self, forecast: ForecastDetail) -> dict[str, Any]:
+    def _canonical_snapshot(
+        self,
+        forecast: ForecastDetail,
+        *,
+        engine_version: str,
+    ) -> dict[str, Any]:
+        engine = probability.get_engine(engine_version)
         outcomes = [
             {
                 "outcome_id": str(outcome.outcome_id),
@@ -1360,6 +1995,12 @@ class ForecastOrchestrator:
                 "description": row["description"],
                 "normalized_weight": row["normalized_weight"],
                 "validity_status": row["validity_status"],
+                "driver_state_ids": [
+                    str(state_id)
+                    for state_id in self.repository.get_scenario_driver_state_ids(
+                        UUID(row["scenario_id"])
+                    )
+                ],
             }
             for row in self.repository.get_scenarios(forecast.forecast_id)
         ]
@@ -1382,10 +2023,16 @@ class ForecastOrchestrator:
                     for source_id in self.repository.get_claim_source_ids(UUID(row["claim_id"]))
                 ],
                 "review_status": row["review_status"],
+                "data_classification": row["data_classification"],
+                "origin_tool_profile": row["origin_tool_profile"],
+                "pack_id": row["pack_id"],
+                "extraction_batch_id": row["extraction_batch_id"],
+                "report_artifact_hash": row["report_artifact_hash"],
             }
-            for row in self.repository.get_claims(forecast.forecast_id)
+            for row in self.repository.get_active_claims(forecast.forecast_id)
         ]
         claims = sorted(claims, key=lambda item: item["claim_id"])
+        active_claim_ids = {str(claim["claim_id"]) for claim in claims}
         sources = [
             {
                 "source_id": row["source_id"],
@@ -1394,11 +2041,20 @@ class ForecastOrchestrator:
                 "url": row["url"],
                 "source_type": row["source_type"],
                 "source_classification": row["source_classification"],
+                "data_classification": row["data_classification"],
+                "origin_tool_profile": row["origin_tool_profile"],
                 "reliability_score": row["reliability_score"],
             }
-            for row in self.repository.get_sources(forecast.forecast_id)
+            for row in self.repository.get_active_sources(forecast.forecast_id)
         ]
         sources = sorted(sources, key=lambda item: item["source_id"])
+        active_source_ids = {str(source["source_id"]) for source in sources}
+        for claim in claims:
+            claim["source_ids"] = [
+                source_id
+                for source_id in claim["source_ids"]
+                if source_id in active_source_ids
+            ]
         links = [
             {
                 "claim_id": row["claim_id"],
@@ -1408,8 +2064,11 @@ class ForecastOrchestrator:
                 "relevance_weight": row["relevance_weight"],
                 "review_status": row["review_status"],
             }
-            for row in self.repository.get_approved_target_links(forecast.forecast_id)
-            if row["target_kind"] == "outcome"
+            for row in self.repository.get_approved_target_links(
+                forecast.forecast_id,
+                active_claims_only=True,
+            )
+            if row["target_kind"] == "outcome" and row["claim_id"] in active_claim_ids
         ]
         links = sorted(
             links,
@@ -1428,22 +2087,72 @@ class ForecastOrchestrator:
                 "tool_profile": row["tool_profile"],
                 "prompt_version": row["prompt_version"],
                 "report_artifact_hash": row["report_artifact_hash"],
+                "attempt_no": row["attempt_no"],
+                "is_active": bool(row["is_active"]),
+                "data_classification": row["data_classification"],
             }
-            for row in self.repository.list_packs(forecast.forecast_id)
+            for row in self.repository.list_active_packs(forecast.forecast_id)
         ]
         packs = sorted(packs, key=lambda item: item["pack_id"])
+        drivers = [
+            {
+                "driver_id": row["driver_id"],
+                "name": row["name"],
+                "description": row["description"],
+                "sort_order": row["sort_order"],
+            }
+            for row in self.repository.get_drivers(forecast.forecast_id)
+        ]
+        driver_states = [
+            {
+                "state_id": row["state_id"],
+                "driver_id": row["driver_id"],
+                "label": row["label"],
+                "description": row["description"],
+                "sort_order": row["sort_order"],
+            }
+            for row in self.repository.get_driver_states(forecast.forecast_id)
+        ]
+        analog_events = [
+            {
+                "analog_event_id": row["analog_event_id"],
+                "pack_id": row["pack_id"],
+                "title": row["title"],
+                "matched_outcome_id": row["matched_outcome_id"],
+                "weight": row["weight"],
+                "rationale": row["rationale"],
+                "active": True,
+            }
+            for row in self.repository.get_analog_events(forecast.forecast_id)
+        ]
+        cross_impact = [
+            {
+                "cross_impact_id": row["cross_impact_id"],
+                "source_outcome_id": row["source_outcome_id"],
+                "target_outcome_id": row["target_outcome_id"],
+                "delta": row["delta"],
+            }
+            for row in self.repository.get_cross_impact(forecast.forecast_id)
+        ]
         return {
-            "engine_version": ENGINE_VERSION,
-            "engine_code_hash": engine_code_hash(),
+            "engine_version": engine.engine_version,
+            "engine_code_hash": engine.engine_code_hash(),
             "prompt_versions": {
                 "current_state": CURRENT_STATE_PROMPT_VERSION,
                 "extractor": "phase_a_claims_v1",
-                "scenario": "phase_a_scenarios_v1",
+                "scenario": (
+                    "phase_b_morphological_scenarios_v1"
+                    if engine.engine_version == "phase_b_v1"
+                    else "phase_a_scenarios_v1"
+                ),
             },
             "kappa": 1.0,
+            "kappa_evidence": 1.0,
+            "kappa_cross_impact": 1.0,
             "clamp": 3.0,
             "epsilon_floor": 1e-9,
-            "random_seed": RANDOM_SEED,
+            "random_seed": engine.random_seed,
+            "perturbation_runs": 200,
             "forecast": {
                 "forecast_id": str(forecast.forecast_id),
                 "question": forecast.question,
@@ -1456,6 +2165,10 @@ class ForecastOrchestrator:
             "sources": sources,
             "approved_target_links": links,
             "packs": packs,
+            "drivers": drivers,
+            "driver_states": driver_states,
+            "analog_events": analog_events,
+            "cross_impact": cross_impact,
         }
 
 
@@ -1470,7 +2183,14 @@ def _outcome_response(row: Any) -> ForecastOutcome:
     )
 
 
+def _row_keys(row: Any) -> set[str]:
+    if not hasattr(row, "keys"):
+        return set()
+    return set(cast(list[str], row.keys()))
+
+
 def _pack_response(row: Any) -> ResearchPackResponse:
+    keys = _row_keys(row)
     return ResearchPackResponse(
         pack_id=UUID(row["pack_id"]),
         forecast_id=UUID(row["forecast_id"]),
@@ -1479,22 +2199,41 @@ def _pack_response(row: Any) -> ResearchPackResponse:
         tool_profile=ToolProfile(row["tool_profile"]),
         status=row["status"],
         policy_decision_id=UUID(row["policy_decision_id"]),
+        attempt_no=int(row["attempt_no"]) if "attempt_no" in keys else 1,
+        is_active=bool(row["is_active"]) if "is_active" in keys else True,
+        data_classification=ConfidentialityClass(
+            row["data_classification"]
+            if "data_classification" in keys
+            else ConfidentialityClass.PUBLIC.value
+        ),
     )
 
 
 def _source_response(row: Any) -> SourceRecord:
+    keys = _row_keys(row)
     return SourceRecord(
         source_id=UUID(row["source_id"]),
         title=row["title"],
         publisher=row["publisher"],
         url=row["url"],
         source_type=row["source_type"],
-        source_classification=ToolProfile(row["source_classification"]),
+        source_classification=row["source_classification"],
+        data_classification=ConfidentialityClass(
+            row["data_classification"]
+            if "data_classification" in keys
+            else ConfidentialityClass.PUBLIC.value
+        ),
+        origin_tool_profile=ToolProfile(
+            row["origin_tool_profile"]
+            if "origin_tool_profile" in keys
+            else row["source_classification"]
+        ),
         reliability_score=row["reliability_score"],
     )
 
 
 def _claim_response(repository: ForecastRepository, row: Any) -> ClaimRecord:
+    keys = _row_keys(row)
     return ClaimRecord(
         claim_id=UUID(row["claim_id"]),
         text=row["text"],
@@ -1506,6 +2245,16 @@ def _claim_response(repository: ForecastRepository, row: Any) -> ClaimRecord:
         independence_group=row["independence_group"],
         source_ids=repository.get_claim_source_ids(UUID(row["claim_id"])),
         review_status=row["review_status"],
+        data_classification=ConfidentialityClass(
+            row["data_classification"]
+            if "data_classification" in keys
+            else ConfidentialityClass.PUBLIC.value
+        ),
+        origin_tool_profile=ToolProfile(
+            row["origin_tool_profile"]
+            if "origin_tool_profile" in keys
+            else row["source_classification"]
+        ),
     )
 
 
@@ -1519,6 +2268,71 @@ def _scenario_response(row: Any) -> ScenarioRecord:
         normalized_weight=row["normalized_weight"],
         validity_status=row["validity_status"],
     )
+
+
+def _scenario_response_with_links(
+    repository: ForecastRepository,
+    row: Any,
+) -> ScenarioRecord:
+    response = _scenario_response(row)
+    return response.model_copy(
+        update={
+            "driver_state_ids": repository.get_scenario_driver_state_ids(
+                UUID(row["scenario_id"])
+            )
+        }
+    )
+
+
+def _validate_scenarios_for_outcomes(
+    forecast: ForecastDetail,
+    scenarios: list[dict[str, Any]],
+    scenario_driver_links: list[dict[str, str]],
+) -> None:
+    outcome_ids = {str(outcome.outcome_id) for outcome in forecast.outcomes}
+    valid_by_outcome: dict[str, list[dict[str, Any]]] = {
+        outcome_id: [] for outcome_id in outcome_ids
+    }
+    for scenario in scenarios:
+        outcome_id = str(scenario["outcome_id"])
+        if outcome_id not in outcome_ids:
+            raise ForecastConflict(
+                "scenario_validation_failed",
+                "Scenario outcome link is invalid.",
+                {"outcome_id": outcome_id},
+            )
+        if scenario.get("validity_status", "valid") == "valid":
+            valid_by_outcome[outcome_id].append(scenario)
+    missing = [
+        outcome_id for outcome_id, valid in valid_by_outcome.items() if not valid
+    ]
+    if missing:
+        raise ForecastConflict(
+            "scenario_validation_failed",
+            "Each outcome requires at least one valid scenario.",
+            {"outcome_ids": missing},
+        )
+    for outcome_id, valid in valid_by_outcome.items():
+        if sum(float(item.get("normalized_weight", 0.0)) for item in valid) <= 0:
+            raise ForecastConflict(
+                "scenario_validation_failed",
+                "Valid scenario weights must be positive within each outcome.",
+                {"outcome_id": outcome_id},
+            )
+    if scenario_driver_links:
+        linked_scenarios = {link["scenario_id"] for link in scenario_driver_links}
+        unlinked = [
+            scenario["scenario_id"]
+            for scenario in scenarios
+            if scenario.get("validity_status", "valid") == "valid"
+            and scenario["scenario_id"] not in linked_scenarios
+        ]
+        if unlinked:
+            raise ForecastConflict(
+                "scenario_validation_failed",
+                "Morphological scenarios require at least one driver-state link.",
+                {"scenario_ids": unlinked},
+            )
 
 
 def _ensure_framing_inputs_are_public(request: ForecastFramingDraftRequest) -> None:
@@ -1726,7 +2540,7 @@ def _framing_create_payload(
         resolution_criteria=draft.resolution_criteria,
         resolution_sources=draft.resolution_sources,
         decision_context=draft.decision_context,
-        confidentiality_class="public",
+        confidentiality_class=ConfidentialityClass.PUBLIC,
         outcomes=draft.outcomes,
     )
 
@@ -1789,3 +2603,19 @@ def _json_load(value: str | None) -> Any:
     if not value:
         return {}
     return json.loads(value)
+
+
+def _snapshot_has_non_public_evidence(snapshot: dict[str, Any]) -> bool:
+    for collection_name in ("sources", "claims"):
+        for item in snapshot.get(collection_name, []):
+            classification = item.get("data_classification") or item.get(
+                "source_classification"
+            )
+            if classification in {"internal", "restricted"}:
+                return True
+            if (
+                item.get("origin_tool_profile") == "synthesis"
+                and classification != "public"
+            ):
+                return True
+    return False

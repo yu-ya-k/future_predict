@@ -72,7 +72,7 @@ def compute_phase_a_estimates(
             str(claim["cluster_id"]),
             str(link["target_kind"]),
             str(link["target_id"]),
-            int(link["direction"]),
+            int(claim.get("polarity", 1)) * int(link["direction"]),
         )
         grouped[key].append(contribution)
 

@@ -250,6 +250,52 @@ describe("App shell", () => {
     render(<App />);
     expect(document.getElementById("main-content")).toBeInTheDocument();
   });
+
+  it("announces, focuses main, and marks aria-current on navigation", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve([]),
+    } as Response);
+
+    render(<App />);
+
+    // First mount must not steal focus or announce a route change.
+    // Target the App-level announcer specifically (aria-atomic) so it is not
+    // confused with any per-screen aria-live region.
+    const liveRegion = document.querySelector(
+      '[aria-live="polite"][aria-atomic="true"]',
+    );
+    expect(liveRegion).not.toBeNull();
+    expect(liveRegion?.textContent).toBe("");
+    expect(document.activeElement).not.toBe(document.getElementById("main-content"));
+
+    // Scope link queries to the nav landmark; screen content may contain other
+    // links whose names include these words.
+    const nav = within(
+      screen.getByRole("navigation", { name: "メインナビゲーション" }),
+    );
+    const dashboardLink = nav.getByRole("link", { name: "ダッシュボード" });
+    const settingsLink = nav.getByRole("link", { name: "設定" });
+    expect(dashboardLink).toHaveAttribute("aria-current", "page");
+    expect(settingsLink).not.toHaveAttribute("aria-current");
+
+    await act(async () => {
+      await userEvent.click(settingsLink);
+    });
+
+    await waitFor(() =>
+      expect(liveRegion?.textContent).toBe("設定に移動しました"),
+    );
+    expect(document.activeElement).toBe(document.getElementById("main-content"));
+    expect(nav.getByRole("link", { name: "設定" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    expect(
+      nav.getByRole("link", { name: "ダッシュボード" }),
+    ).not.toHaveAttribute("aria-current");
+  });
 });
 
 describe("Markdown", () => {
@@ -716,6 +762,135 @@ describe("Dashboard (SCR-2)", () => {
     expect(JSON.parse(localStorage.getItem("dro.trackedRuns") ?? "[]")).toEqual([]);
   });
 
+  it("shows a visible dashboard polling error for non-404 tracked run failures", async () => {
+    localStorage.setItem(
+      "dro.trackedRuns",
+      JSON.stringify([
+        {
+          run_id: "run-poll-fails",
+          title: "状態取得失敗リサーチ",
+          max_total_iterations: 5,
+          created_at: new Date().toISOString(),
+          last_status: "waiting_deep_research",
+        },
+      ]),
+    );
+    globalThis.fetch = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/research-runs/human-reviews")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith("/research-runs/run-poll-fails")) {
+        return Promise.resolve({
+          ok: false,
+          status: 500,
+          json: () => Promise.resolve({ detail: "Status service unavailable" }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({}),
+      } as Response);
+    });
+
+    render(<App />);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("進行中runの取得に失敗しました");
+    expect(alert).toHaveTextContent(
+      "run run-poll-fails の状態取得に失敗しました。Status service unavailable",
+    );
+    expect(screen.getByText("状態取得失敗リサーチ")).toBeInTheDocument();
+    expect(JSON.parse(localStorage.getItem("dro.trackedRuns") ?? "[]")).toHaveLength(1);
+  });
+
+  it("keeps successful tracked-run polling updates when another run fails", async () => {
+    localStorage.setItem(
+      "dro.trackedRuns",
+      JSON.stringify([
+        {
+          run_id: "run-poll-succeeds",
+          title: "状態更新成功リサーチ",
+          max_total_iterations: 5,
+          created_at: new Date().toISOString(),
+          last_status: "waiting_deep_research",
+        },
+        {
+          run_id: "run-poll-fails",
+          title: "状態取得失敗リサーチ",
+          max_total_iterations: 5,
+          created_at: new Date().toISOString(),
+          last_status: "waiting_deep_research",
+        },
+      ]),
+    );
+    globalThis.fetch = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/research-runs/human-reviews")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith("/research-runs/run-poll-succeeds")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              run_id: "run-poll-succeeds",
+              status: "reviewing",
+              done_reason: null,
+              needs_human_review: false,
+              progress: {
+                targeted_rerun_runs: 1,
+                llm_patch_runs: 0,
+                total_reviews: 3,
+                latest_verdict: "needs_more_evidence",
+                latest_score: 68,
+                total_tool_calls: 4,
+                estimated_cost_usd: 0.04,
+              },
+            }),
+        } as Response);
+      }
+      if (url.endsWith("/research-runs/run-poll-fails")) {
+        return Promise.resolve({
+          ok: false,
+          status: 500,
+          json: () => Promise.resolve({ detail: "Status service unavailable" }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({}),
+      } as Response);
+    });
+
+    render(<App />);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("進行中runの取得に失敗しました");
+    expect(alert).toHaveTextContent(
+      "run run-poll-fails の状態取得に失敗しました。Status service unavailable",
+    );
+
+    const activeSection = screen.getByRole("heading", { name: "進行中" }).closest("section");
+    expect(activeSection).not.toBeNull();
+    await waitFor(() =>
+      expect(within(activeSection as HTMLElement).getByText("レビュー 3回")).toBeInTheDocument(),
+    );
+    expect(within(activeSection as HTMLElement).getByText("状態更新成功リサーチ")).toBeInTheDocument();
+    expect(within(activeSection as HTMLElement).getByText("状態取得失敗リサーチ")).toBeInTheDocument();
+  });
+
   it("does not duplicate a queued human-review run in the active tracked list", async () => {
     const runId = "queued-review-run";
     localStorage.setItem(
@@ -1011,6 +1186,39 @@ describe("NewResearch (SCR-1)", () => {
       max_total_iterations: 5,
       max_total_tool_calls: 120,
     });
+  });
+
+  it("allows API prompts above the manual import prompt limit", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 202,
+      json: () =>
+        Promise.resolve({
+          run_id: "run-long-api-prompt-test",
+          thread_id: "thread-1",
+          status: "queued",
+          created_at: new Date().toISOString(),
+        }),
+    } as Response);
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    const longPrompt = "a".repeat(50_001);
+    fireEvent.change(screen.getByRole("textbox", { name: /リサーチ内容/i }), {
+      target: { value: longPrompt },
+    });
+
+    const button = screen.getByRole("button", { name: /リサーチを開始/i });
+    expect(button).not.toBeDisabled();
+    expect(screen.getByText("残り 69,999 文字")).toBeInTheDocument();
+
+    await userEvent.click(button);
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const body = JSON.parse(String(init.body)) as { user_prompt: string };
+    expect(body.user_prompt).toBe(longPrompt);
   });
 
   it("normalizes stale saved factory defaults before submitting", async () => {
@@ -4304,6 +4512,57 @@ describe("ReportViewer (SCR-5)", () => {
     expect(screen.queryByText("2回目のDeep Research出力")).not.toBeInTheDocument();
   });
 
+  it("returns from a selected Deep Research attempt to the final report", async () => {
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/citations`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/attempts`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve([
+              makeAttempt(1, "# 1回目のDeep Research出力"),
+              makeAttempt(2, "# 2回目のDeep Research出力"),
+            ]),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            run_id: runId,
+            status: "completed",
+            final_report: "# 最新版レポート",
+            report: "# 下書き",
+            warnings: [],
+          }),
+      } as Response);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("最新版レポート")).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole("button", { name: /1回目/ }));
+
+    expect(window.location.hash).toBe(`#/runs/${runId}/report?tab=research&attempt=1`);
+    expect(await screen.findByText("1回目のDeep Research出力")).toBeInTheDocument();
+    expect(screen.queryByText("最新版レポート")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /最終レポート/ }));
+
+    expect(window.location.hash).toBe(`#/runs/${runId}/report`);
+    expect(await screen.findByText("最新版レポート")).toBeInTheDocument();
+    expect(screen.queryByText("1回目のDeep Research出力")).not.toBeInTheDocument();
+  });
+
   it("downloads the requested Deep Research attempt as markdown", async () => {
     window.location.hash = `#/runs/${runId}/report?tab=research&attempt=1`;
     const createObjectURL = vi.fn((blob: Blob) => {
@@ -4579,7 +4838,8 @@ describe("ReportViewer (SCR-5)", () => {
     expect(screen.getByText("この試行はまだ取得中か、履歴がまだ同期されていません。"))
       .toBeInTheDocument();
     expect(screen.queryByText("1回目のDeep Research出力")).not.toBeInTheDocument();
-    expect(screen.queryByText("最終レポート")).not.toBeInTheDocument();
+    const reportBody = screen.getByRole("main", { name: "Deep Research出力" });
+    expect(within(reportBody).queryByText("最終レポート")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "MD ダウンロード" })).toBeDisabled();
   });
 
@@ -5032,6 +5292,7 @@ describe("HumanReview (SCR-4)", () => {
       expectedOutputKind: "targeted_delta_sections",
       reason: "review_route_needs_targeted_rerun",
       uploadStep: "既存レポートへ追加する差分セクションをアップロードする",
+      gated: false,
     },
     {
       action: "request_manual_full_rerun",
@@ -5040,6 +5301,7 @@ describe("HumanReview (SCR-4)", () => {
       expectedOutputKind: "complete_replacement_report",
       reason: "review_route_needs_full_rerun",
       uploadStep: "完成版レポート全文をアップロードする",
+      gated: true,
     },
   ] as const)(
     "refetches HumanReview after $action so the pending manual rerun flow appears",
@@ -5050,6 +5312,7 @@ describe("HumanReview (SCR-4)", () => {
       expectedOutputKind,
       reason,
       uploadStep,
+      gated,
     }) => {
       let payloadFetches = 0;
       const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -5110,6 +5373,12 @@ describe("HumanReview (SCR-4)", () => {
       await userEvent.click(
         await screen.findByRole("button", { name: buttonName }),
       );
+      if (gated) {
+        // Irreversible / budget-spending actions require an inline confirm.
+        await userEvent.click(
+          await screen.findByRole("button", { name: "実行する" }),
+        );
+      }
 
       await waitFor(() =>
         expect(fetchMock).toHaveBeenCalledWith(
@@ -5181,10 +5450,17 @@ describe("HumanReview (SCR-4)", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("max_full_rerun_runs_reached")).toBeInTheDocument();
+    // The stop-reason banner is now localized via BLOCKED_REASON_LABELS.
+    await screen.findAllByText("API Full rerun回数の上限に達しています。");
     expect(screen.getByText(/LLMレビューは完了しています/)).toBeInTheDocument();
     expect(screen.getByText(/API自動Full rerunは上限/)).toBeInTheDocument();
-    expect(screen.getByText("API Full rerun回数の上限に達しています。")).toBeInTheDocument();
+    // Appears exactly twice: the stop-reason banner plus the single disabled
+    // request_full_rerun action's blocked-reason note. No other action_state
+    // carries max_full_rerun_runs_reached, so a third occurrence would signal a
+    // duplicate render.
+    expect(
+      screen.getAllByText("API Full rerun回数の上限に達しています。"),
+    ).toHaveLength(2);
     const fullRerunButton = screen.getByRole("button", { name: /APIで全面再調査/i });
     expect(fullRerunButton).toBeDisabled();
     const fullDescriptionIds = fullRerunButton
@@ -5234,7 +5510,15 @@ describe("HumanReview (SCR-4)", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("max_targeted_rerun_runs_reached")).toBeInTheDocument();
+    // The stop-reason banner is now localized via BLOCKED_REASON_LABELS.
+    // Appears exactly twice: the stop-reason banner plus the single disabled
+    // request_targeted_rerun action's blocked-reason note. No other action_state
+    // carries max_targeted_rerun_runs_reached, so a third occurrence would signal
+    // a duplicate render.
+    await screen.findAllByText("API Targeted rerun回数の上限に達しています。");
+    expect(
+      screen.getAllByText("API Targeted rerun回数の上限に達しています。"),
+    ).toHaveLength(2);
     expect(screen.getByText(/API自動Targeted rerunは上限/)).toBeInTheDocument();
     const targetedRerunButton = screen.getByRole("button", {
       name: /APIで部分再調査/i,
@@ -5827,6 +6111,10 @@ describe("HumanReview (SCR-4)", () => {
     );
     expect(approveBtn).not.toBeNull();
     await userEvent.click(approveBtn as HTMLButtonElement);
+    // approve is irreversible and now requires an inline confirmation step.
+    await userEvent.click(
+      await screen.findByRole("button", { name: "実行する" }),
+    );
 
     expect(fetchMock).toHaveBeenCalledWith(
       `http://localhost:8000/research-runs/${runId}/resume`,
@@ -5834,6 +6122,149 @@ describe("HumanReview (SCR-4)", () => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
       }),
+    );
+  });
+
+  it("does not resume until the confirm gate is confirmed", async () => {
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/human-review`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(makePayload(["approve", "reject"])),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/resume`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              run_id: runId,
+              status: "completed",
+              done_reason: "human_approved",
+              needs_human_review: false,
+            }),
+        } as Response);
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await screen.findByText("承認");
+    const approveBtn = document.querySelector<HTMLButtonElement>(
+      'button[data-action="approve"]',
+    );
+    expect(approveBtn).not.toBeNull();
+
+    // First click only opens the confirm gate; it must NOT fire resume.
+    await userEvent.click(approveBtn as HTMLButtonElement);
+
+    expect(screen.getByText("本当に「承認」を実行しますか？現状で最終化")).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      `http://localhost:8000/research-runs/${runId}/resume`,
+      expect.anything(),
+    );
+
+    // Only confirming via 実行する fires the resume request.
+    await userEvent.click(screen.getByRole("button", { name: "実行する" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        `http://localhost:8000/research-runs/${runId}/resume`,
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+    const resumeCall = fetchMock.mock.calls.find(([input]) =>
+      String(input).endsWith(`/research-runs/${runId}/resume`),
+    );
+    expect(JSON.parse(String((resumeCall?.[1] as RequestInit).body))).toEqual({
+      action: "approve",
+      comment: null,
+    });
+  });
+
+  it("cancels the confirm gate via やめる without resuming and restores focus", async () => {
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/human-review`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(makePayload(["approve", "reject"])),
+        } as Response);
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await screen.findByText("承認");
+    const approveBtn = document.querySelector<HTMLButtonElement>(
+      'button[data-action="approve"]',
+    );
+    expect(approveBtn).not.toBeNull();
+
+    await userEvent.click(approveBtn as HTMLButtonElement);
+    expect(screen.getByText("本当に「承認」を実行しますか？現状で最終化")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "やめる" }));
+
+    expect(
+      screen.queryByText("本当に「承認」を実行しますか？現状で最終化"),
+    ).not.toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      `http://localhost:8000/research-runs/${runId}/resume`,
+      expect.anything(),
+    );
+    expect(document.activeElement).toBe(
+      document.querySelector('button[data-action="approve"]'),
+    );
+  });
+
+  it("cancels the confirm gate via Escape without resuming and restores focus", async () => {
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/human-review`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(makePayload(["approve", "reject"])),
+        } as Response);
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await screen.findByText("承認");
+    const approveBtn = document.querySelector<HTMLButtonElement>(
+      'button[data-action="approve"]',
+    );
+    expect(approveBtn).not.toBeNull();
+
+    await userEvent.click(approveBtn as HTMLButtonElement);
+    const group = screen.getByRole("group", { name: "承認の確認" });
+    expect(
+      within(group).getByText("本当に「承認」を実行しますか？現状で最終化"),
+    ).toBeInTheDocument();
+
+    fireEvent.keyDown(group, { key: "Escape" });
+
+    expect(
+      screen.queryByText("本当に「承認」を実行しますか？現状で最終化"),
+    ).not.toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      `http://localhost:8000/research-runs/${runId}/resume`,
+      expect.anything(),
+    );
+    expect(document.activeElement).toBe(
+      document.querySelector('button[data-action="approve"]'),
     );
   });
 
