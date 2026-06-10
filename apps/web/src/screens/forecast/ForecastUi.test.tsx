@@ -3773,7 +3773,7 @@ describe("Forecast UI", () => {
           path === "/forecasts/forecast-1/review" &&
           init?.method === "POST"
         ) {
-          expect(JSON.parse(String(init.body))).toMatchObject({
+          expect(JSON.parse(String(init.body))).toEqual({
             action: "approve_phase_a_version",
             estimate_set_id: "estimate-set-1",
           });
@@ -3812,6 +3812,10 @@ describe("Forecast UI", () => {
       screen.getByRole("button", { name: "推定結果を承認" }),
     ).toBeEnabled();
     expect(screen.queryByRole("button", { name: "予測版を確定" })).toBeNull();
+    expect(screen.queryByRole("textbox", { name: /承認者/ })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "確率公開を承認" }),
+    ).toBeNull();
 
     await userEvent.click(
       screen.getByRole("button", { name: "推定結果を承認" }),
@@ -3832,6 +3836,239 @@ describe("Forecast UI", () => {
         ),
       ).toBe(true),
     );
+  });
+
+  it("requires a reviewer and uses probability publication approval for PhaseB estimates", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    let phaseBApproved = false;
+    let status: ForecastDetail["status"] = "draft_ready";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status,
+              research_packs: completedPhaseBPacks(),
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/estimate-set" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            estimateSet({
+              approved: phaseBApproved,
+              engine_version: "phase_b_v1",
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/review" &&
+          init?.method === "POST"
+        ) {
+          phaseBApproved = true;
+          return jsonResponse({
+            forecast_id: "forecast-1",
+            action: "approve_probability_publication",
+            status: "draft_ready",
+            estimate_set_id: "estimate-set-1",
+          });
+        }
+        if (
+          path === "/forecasts/forecast-1/versions/commit" &&
+          init?.method === "POST"
+        ) {
+          expect(phaseBApproved).toBe(true);
+          status = "committed";
+          return jsonResponse({
+            version_id: "version-1",
+            forecast_id: "forecast-1",
+            estimate_set_id: "estimate-set-1",
+            input_snapshot_hash: "snapshot-hash-1",
+            snapshot_artifact_path: ".data/forecast-runs/version-1.json",
+            committed_at: "2026-06-08T01:00:00Z",
+          });
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    expect(await screen.findByText("snapshot-hash-1")).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "確率公開の承認待ちです" }),
+    ).toBeInTheDocument();
+    const flow = await screen.findByRole("region", {
+      name: "全体フロー",
+    });
+    const flowList = within(flow).getByRole("list", {
+      name: "Forecast実行フロー",
+    });
+    const flowItems = within(flowList)
+      .getAllByRole("listitem")
+      .filter((item) => item.parentElement === flowList);
+    expect(
+      within(flowItems[6]).getByRole("heading", {
+        level: 4,
+        name: "確率公開を承認",
+      }),
+    ).toBeInTheDocument();
+    expect(within(flowItems[6]).getByText("確率公開の承認待ち")).toBeInTheDocument();
+    expect(within(flowItems[6]).getByText("次に実行")).toBeInTheDocument();
+    expect(
+      within(flow).queryByRole("heading", {
+        level: 4,
+        name: "推定結果を承認",
+      }),
+    ).toBeNull();
+    const approveButton = screen.getByRole("button", {
+      name: "確率公開を承認",
+    });
+    expect(approveButton).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "予測版を確定" })).toBeNull();
+
+    await userEvent.click(approveButton);
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) =>
+          String(url).endsWith("/forecasts/forecast-1/review") &&
+          init?.method === "POST",
+      ),
+    ).toBe(false);
+
+    const reviewerInput = screen.getByRole("textbox", { name: /承認者/ });
+    await userEvent.type(reviewerInput, "   ");
+    expect(
+      screen.getByRole("button", { name: "確率公開を承認" }),
+    ).toBeDisabled();
+    await userEvent.clear(reviewerInput);
+    await userEvent.type(reviewerInput, "  reviewer@example.com  ");
+    await userEvent.click(
+      screen.getByRole("button", { name: "確率公開を承認" }),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "予測版を確定" })).toBeEnabled(),
+    );
+
+    const reviewCalls = fetchMock.mock.calls.filter(
+      ([url, init]) =>
+        String(url).endsWith("/forecasts/forecast-1/review") &&
+        init?.method === "POST",
+    );
+    expect(reviewCalls).toHaveLength(1);
+    expect(JSON.parse(String(reviewCalls[0]?.[1]?.body))).toEqual({
+      action: "approve_probability_publication",
+      estimate_set_id: "estimate-set-1",
+      reviewer: "reviewer@example.com",
+    });
+    expect(JSON.parse(String(reviewCalls[0]?.[1]?.body))).not.toMatchObject({
+      action: "approve_phase_a_version",
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "予測版を確定" }));
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([url, init]) =>
+            String(url).endsWith("/forecasts/forecast-1/versions/commit") &&
+            init?.method === "POST",
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("restores PhaseB publication approval from the estimate set before commit", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    let status: ForecastDetail["status"] = "draft_ready";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status,
+              research_packs: completedPhaseBPacks(),
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/estimate-set" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            estimateSet({
+              approved: true,
+              engine_version: "phase_b_v1",
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/versions/commit" &&
+          init?.method === "POST"
+        ) {
+          status = "committed";
+          return jsonResponse({
+            version_id: "version-1",
+            forecast_id: "forecast-1",
+            estimate_set_id: "estimate-set-1",
+            input_snapshot_hash: "snapshot-hash-1",
+            snapshot_artifact_path: ".data/forecast-runs/version-1.json",
+            committed_at: "2026-06-08T01:00:00Z",
+          });
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    expect(await screen.findByText("snapshot-hash-1")).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "予測版を確定できます" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: /承認者/ })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "確率公開を承認" }),
+    ).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "予測版を確定" }),
+    ).toBeEnabled();
+
+    await userEvent.click(screen.getByRole("button", { name: "予測版を確定" }));
+
+    const commitCalls = () =>
+      fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          String(url).endsWith("/forecasts/forecast-1/versions/commit") &&
+          init?.method === "POST",
+      );
+    await waitFor(() =>
+      expect(commitCalls()).toHaveLength(1),
+    );
+    expect(JSON.parse(String(commitCalls()[0]?.[1]?.body))).toEqual({
+      estimate_set_id: "estimate-set-1",
+      expected_input_snapshot_hash: "snapshot-hash-1",
+    });
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) =>
+          String(url).endsWith("/forecasts/forecast-1/review") &&
+          init?.method === "POST",
+      ),
+    ).toBe(false);
   });
 
   it("restores claim-target approval from forecast detail after reload", async () => {

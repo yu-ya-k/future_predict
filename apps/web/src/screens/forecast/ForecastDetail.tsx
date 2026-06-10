@@ -423,6 +423,7 @@ function deriveCurrentStep({
   canResolve,
   estimatePresent,
   probabilityEngine,
+  isPhaseBEstimate,
 }: {
   status: ForecastStatus | undefined;
   currentResearchPackStatus: string | null | undefined;
@@ -448,6 +449,7 @@ function deriveCurrentStep({
   canResolve: boolean;
   estimatePresent: boolean;
   probabilityEngine: "phase_a_v1" | "phase_b_v1";
+  isPhaseBEstimate: boolean;
 }): CurrentStepModel {
   if (!status) {
     return {
@@ -622,12 +624,20 @@ function deriveCurrentStep({
 
   if (canApproveEstimate) {
     return {
-      title: "推定結果の承認待ちです",
-      description: "下の推定結果を確認し、問題なければこのまま承認できます。",
+      title: isPhaseBEstimate
+        ? "確率公開の承認待ちです"
+        : "推定結果の承認待ちです",
+      description: isPhaseBEstimate
+        ? "下の推定結果を確認し、承認者を入力して公開承認できます。"
+        : "下の推定結果を確認し、問題なければこのまま承認できます。",
       stateLabel: "承認待ち",
       tone: "ready",
       action: estimatePresent ? "approve" : null,
-      actionLabel: estimatePresent ? "推定結果を承認" : undefined,
+      actionLabel: estimatePresent
+        ? isPhaseBEstimate
+          ? "確率公開を承認"
+          : "推定結果を承認"
+        : undefined,
     };
   }
 
@@ -697,10 +707,11 @@ function forecastExecutionNodes({
   missingDefaultPacks,
   claimTargetsApproved,
   hasEstimate,
-  phaseAApproved,
+  estimateApproved,
   packSubmissionPending,
   busy,
   probabilityEngine,
+  isPhaseBEstimate,
 }: {
   status: ForecastStatus | undefined;
   approvedFraming: boolean;
@@ -715,10 +726,11 @@ function forecastExecutionNodes({
   missingDefaultPacks: number;
   claimTargetsApproved: boolean;
   hasEstimate: boolean;
-  phaseAApproved: boolean;
+  estimateApproved: boolean;
   packSubmissionPending: boolean;
   busy: Command | null;
   probabilityEngine: "phase_a_v1" | "phase_b_v1";
+  isPhaseBEstimate: boolean;
 }): ForecastFlowNode[] {
   const isResolved = status === "resolved";
   const estimateReady = hasEstimate || statusAtLeast(status, "draft_ready");
@@ -771,7 +783,7 @@ function forecastExecutionNodes({
     {
       id: "scenarios",
       title: "シナリオを生成",
-      meta: "結果別のPhaseAシナリオを生成",
+      meta: "結果別のシナリオを生成",
       status: flowStatus({
         done: statusAtLeast(status, "scenarios_ready"),
         active: busy === "scenarios",
@@ -802,13 +814,17 @@ function forecastExecutionNodes({
       tone: "verify",
     },
     {
-      id: "approve-phase-a",
-      title: "推定結果を承認",
-      meta: phaseAApproved ? "PhaseA下書き承認済み" : "下書き推定値の承認待ち",
+      id: "approve-estimate",
+      title: isPhaseBEstimate ? "確率公開を承認" : "推定結果を承認",
+      meta: estimateApproved
+        ? "推定結果承認済み"
+        : isPhaseBEstimate
+          ? "確率公開の承認待ち"
+          : "下書き推定値の承認待ち",
       status: flowStatus({
-        done: phaseAApproved || statusAtLeast(status, "committed"),
+        done: estimateApproved || statusAtLeast(status, "committed"),
         active: busy === "approve",
-        available: status === "draft_ready" && estimateReady && !phaseAApproved,
+        available: status === "draft_ready" && estimateReady && !estimateApproved,
       }),
       tone: "review",
     },
@@ -821,7 +837,7 @@ function forecastExecutionNodes({
       status: flowStatus({
         done: statusAtLeast(status, "committed"),
         active: busy === "commit",
-        available: status === "draft_ready" && phaseAApproved,
+        available: status === "draft_ready" && estimateApproved,
       }),
       tone: "finalize",
     },
@@ -843,7 +859,8 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   const [forecast, setForecast] = useState<ForecastDetailType | null>(null);
   const [estimate, setEstimate] = useState<EstimateSetResponse | null>(null);
   const [claimTargetsApproved, setClaimTargetsApproved] = useState(false);
-  const [phaseAApprovedEstimateId, setPhaseAApprovedEstimateId] = useState<string | null>(null);
+  const [approvedEstimateSetId, setApprovedEstimateSetId] = useState<string | null>(null);
+  const [approvalReviewer, setApprovalReviewer] = useState("");
   const [resolution, setResolution] = useState<ResolveForecastResponse | null>(null);
   const [selectedOutcomeId, setSelectedOutcomeId] = useState("");
   const [resolutionNotes, setResolutionNotes] = useState("");
@@ -884,7 +901,8 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     setForecast(null);
     setEstimate(null);
     setClaimTargetsApproved(false);
-    setPhaseAApprovedEstimateId(null);
+    setApprovedEstimateSetId(null);
+    setApprovalReviewer("");
     setResolution(null);
     setSelectedOutcomeId("");
     setResolutionNotes("");
@@ -1052,7 +1070,8 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       const result = await fn();
       if (step === "claimTargets") setClaimTargetsApproved(true);
       if (step === "approve" && estimate) {
-        setPhaseAApprovedEstimateId(estimate.estimate_set_id);
+        setApprovedEstimateSetId(estimate.estimate_set_id);
+        setApprovalReviewer("");
       }
       if (step === "compute") setEstimate(result as EstimateSetResponse);
       if (step === "resolve") setResolution(result as ResolveForecastResponse);
@@ -1109,13 +1128,29 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
         );
       case "approve":
         if (!estimate) return Promise.resolve();
+        if (!estimate.estimate_set_id) return Promise.resolve();
+        if (
+          estimate.engine_version !== "phase_a_v1" &&
+          estimate.engine_version !== "phase_b_v1"
+        ) {
+          return Promise.resolve();
+        }
+        if (estimate.engine_version === "phase_b_v1" && !approvalReviewer.trim()) {
+          return Promise.resolve();
+        }
         return runStep("approve", () =>
           reviewForecast(
             forecastId,
-            {
-              action: "approve_phase_a_version",
-              estimate_set_id: estimate.estimate_set_id,
-            },
+            estimate.engine_version === "phase_b_v1"
+              ? {
+                  action: "approve_probability_publication",
+                  estimate_set_id: estimate.estimate_set_id,
+                  reviewer: approvalReviewer.trim(),
+                }
+              : {
+                  action: "approve_phase_a_version",
+                  estimate_set_id: estimate.estimate_set_id,
+                },
             { idempotencyKey: idempotencyKeys.current.approve },
           ),
         );
@@ -1267,18 +1302,28 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     claimTargetsApproved ||
     (forecast?.approved_claim_target_link_count ?? 0) > 0 ||
     statusAtLeast(status, "draft_ready");
-  const phaseAApproved =
+  const isPhaseBEstimate = estimate?.engine_version === "phase_b_v1";
+  const hasKnownEstimateEngine =
+    estimate?.engine_version === "phase_a_v1" ||
+    estimate?.engine_version === "phase_b_v1";
+  const estimateApproved =
     statusAtLeast(status, "committed") ||
     Boolean(
       estimate &&
-        (estimate.approved || phaseAApprovedEstimateId === estimate.estimate_set_id),
+        (estimate.approved || approvedEstimateSetId === estimate.estimate_set_id),
     );
   const canApproveClaimTargets =
     status === "scenarios_ready" && !effectiveClaimTargetsApproved;
   const canCompute = status === "scenarios_ready" && effectiveClaimTargetsApproved;
   const canRestoreDraft = status === "draft_ready" && !estimate;
-  const canApproveEstimate = status === "draft_ready" && Boolean(estimate) && !phaseAApproved;
-  const canCommit = status === "draft_ready" && Boolean(estimate) && phaseAApproved;
+  const canApproveEstimate =
+    status === "draft_ready" &&
+    Boolean(estimate?.estimate_set_id) &&
+    hasKnownEstimateEngine &&
+    !estimateApproved;
+  const canSubmitEstimateApproval =
+    canApproveEstimate && (!isPhaseBEstimate || approvalReviewer.trim().length > 0);
+  const canCommit = status === "draft_ready" && Boolean(estimate) && estimateApproved;
   const canResolve = status === "committed" && Boolean(selectedOutcomeId);
   const flowNodes = forecastExecutionNodes({
     status,
@@ -1294,10 +1339,11 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     missingDefaultPacks: forecastProgress.missingDefaultRoles.length,
     claimTargetsApproved: effectiveClaimTargetsApproved,
     hasEstimate: Boolean(estimate),
-    phaseAApproved,
+    estimateApproved,
     packSubmissionPending,
     busy,
     probabilityEngine,
+    isPhaseBEstimate,
   });
   const currentStep = deriveCurrentStep({
     status,
@@ -1325,6 +1371,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     canResolve,
     estimatePresent: Boolean(estimate),
     probabilityEngine,
+    isPhaseBEstimate,
   });
   const researchPackUpdatedLabel = formatStartedAt(
     currentResearchPack?.research_run_updated_at ??
@@ -1481,13 +1528,33 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
               <button
                 type="button"
                 className="btn-primary"
-                disabled={!!busy && currentStep.action !== "refresh"}
+                disabled={
+                  (!!busy && currentStep.action !== "refresh") ||
+                  (currentStep.action === "approve" && !canSubmitEstimateApproval)
+                }
                 onClick={() => handleCurrentStepAction(currentStep.action)}
               >
                 {currentStep.actionLabel}
               </button>
             )}
           </div>
+        )}
+        {canApproveEstimate && isPhaseBEstimate && (
+          <label className="field">
+            <span>承認者</span>
+            <input
+              type="text"
+              value={approvalReviewer}
+              required
+              aria-required="true"
+              maxLength={500}
+              aria-describedby="forecast-approval-reviewer-help"
+              onChange={(event) => setApprovalReviewer(event.target.value)}
+            />
+            <span id="forecast-approval-reviewer-help" className="field-help">
+              承認者は確率公開の監査記録に保存されます。
+            </span>
+          </label>
         )}
         {canRecoverManualPack && (
           <div className="forecast-current-step__action">

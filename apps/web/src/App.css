@@ -431,6 +431,7 @@ body {
   color: var(--ink);
 }
 
+.field input,
 .field textarea,
 .field select {
   width: 100%;
@@ -446,11 +447,18 @@ body {
   resize: vertical;
 }
 
+.field input:focus,
 .field textarea:focus,
 .field select:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: var(--focus-ring);
+}
+
+.field-help {
+  font-size: var(--text-caption);
+  color: var(--ink-faint);
+  line-height: var(--leading-normal);
 }
 
 .button-row,
