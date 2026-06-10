@@ -1,0 +1,215 @@
+/* ================================================================
+   forecast.css
+   Forecast detail probability / outcome visualization styles.
+   Tokens only — no hard-coded colours, sizes or fonts.
+================================================================ */
+
+/* ── Current-step kicker label ───────────────────────────────── */
+.forecast-current-step__kicker {
+  display: block;
+  margin-bottom: var(--space-1);
+  font-family: var(--sans);
+  font-size: var(--text-caption);
+  color: var(--ink-faint);
+  line-height: var(--leading-tight);
+}
+
+/* ── Conclusion summary (top of detail page) ─────────────────── */
+.forecast-conclusion {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.forecast-conclusion__headline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-4);
+}
+
+.forecast-conclusion__label {
+  font-family: var(--sans);
+  font-size: var(--text-label);
+  color: var(--ink-faint);
+  line-height: var(--leading-tight);
+}
+
+.forecast-conclusion__outcome {
+  font-family: var(--serif);
+  font-size: var(--text-xl);
+  font-weight: var(--weight-medium);
+  color: var(--ink);
+  line-height: var(--leading-tight);
+}
+
+.forecast-conclusion__probability {
+  font-family: var(--serif);
+  font-size: var(--text-h1);
+  font-weight: var(--weight-medium);
+  color: var(--pass);
+  line-height: var(--leading-tight);
+}
+
+.forecast-conclusion__interval {
+  font-family: var(--sans);
+  font-size: var(--text-body);
+  color: var(--ink-soft);
+  line-height: var(--leading-normal);
+}
+
+/* ── Probability bar list ────────────────────────────────────── */
+.forecast-prob-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.forecast-prob-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--inset-sm);
+  background: var(--surface-raised);
+  border: var(--border);
+  border-radius: var(--radius);
+}
+
+.forecast-prob-row--top {
+  border: var(--border-accent);
+  background: var(--pass-bg);
+}
+
+.forecast-prob-row__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.forecast-prob-row__label {
+  font-family: var(--sans);
+  font-size: var(--text-body);
+  font-weight: var(--weight-medium);
+  color: var(--ink);
+  line-height: var(--leading-tight);
+}
+
+.forecast-prob-row__lead-tag {
+  margin-left: var(--space-2);
+  font-family: var(--sans);
+  font-size: var(--text-caption);
+  font-weight: var(--weight-regular);
+  color: var(--pass);
+}
+
+.forecast-prob-row__value {
+  font-family: var(--serif);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-medium);
+  color: var(--ink);
+  line-height: var(--leading-tight);
+}
+
+/* The bar track. Probability fill width is set inline via --prob-pct. */
+.forecast-prob-bar {
+  position: relative;
+  width: 100%;
+  height: var(--space-5);
+  background: var(--neutral-bg);
+  border: var(--border);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+}
+
+.forecast-prob-bar__fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: var(--prob-pct, 0%);
+  background: var(--info);
+  border-radius: var(--radius-full);
+}
+
+.forecast-prob-row--top .forecast-prob-bar__fill {
+  background: var(--pass);
+}
+
+/* 80% interval range overlaid on the bar track. */
+.forecast-prob-bar__interval {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--interval-lo, 0%);
+  width: var(--interval-width, 0%);
+  border-left: var(--border-emphasis);
+  border-right: var(--border-emphasis);
+  background: color-mix(in srgb, var(--ink) 12%, transparent);
+}
+
+.forecast-prob-row__breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-4);
+  font-family: var(--sans);
+  font-size: var(--text-caption);
+  color: var(--ink-soft);
+  line-height: var(--leading-normal);
+}
+
+.forecast-prob-row__breakdown dt {
+  display: inline;
+  color: var(--ink-faint);
+}
+
+.forecast-prob-row__breakdown dd {
+  display: inline;
+  margin: 0 0 0 var(--space-1);
+  color: var(--ink);
+}
+
+.forecast-prob-row__interval-text {
+  font-family: var(--sans);
+  font-size: var(--text-caption);
+  color: var(--ink-soft);
+  line-height: var(--leading-normal);
+}
+
+/* ── Debug / provenance disclosure ───────────────────────────── */
+.forecast-debug {
+  margin-top: var(--space-2);
+  font-family: var(--sans);
+  font-size: var(--text-caption);
+  color: var(--ink-faint);
+}
+
+.forecast-debug summary {
+  cursor: pointer;
+  color: var(--ink-soft);
+}
+
+.forecast-debug__grid {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+}
+
+.forecast-debug__grid div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+}
+
+.forecast-debug__grid dt {
+  color: var(--ink-faint);
+}
+
+.forecast-debug__grid dd {
+  margin: 0;
+  font-family: var(--mono);
+  color: var(--ink-soft);
+  word-break: break-all;
+}

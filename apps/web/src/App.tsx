@@ -2,6 +2,8 @@
  * App shell — sticky header, skip link, and router switch.
  */
 
+import { useEffect, useRef, useState } from "react";
+
 import { Link, navigate, routes, useRoute } from "./router";
 import {
   NewResearch,
@@ -36,10 +38,46 @@ function NotFound() {
   );
 }
 
+// ── Screen labels (used for route-change announcements) ─────────────────────────
+
+const SCREEN_LABELS: Record<string, string> = {
+  dashboard: "ダッシュボード",
+  new: "新規リサーチ",
+  monitor: "Runモニター",
+  review: "人間レビュー",
+  report: "レポート",
+  audit: "監査ログ",
+  settings: "設定",
+  forecasts: "Forecasts",
+  "forecast-new": "新規Forecast",
+  "forecast-detail": "Forecast詳細",
+  "forecast-audit": "Forecast監査",
+  "not-found": "ページが見つかりません",
+};
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export function App() {
   const route = useRoute();
+  // Skip the focus shift / announcement on the very first mount so we do not
+  // steal focus from the user when the page initially loads.
+  const isFirstRender = useRef(true);
+  const [routeAnnouncement, setRouteAnnouncement] = useState("");
+
+  useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+    // Move keyboard / screen-reader focus to the main region so SPA route
+    // changes are perceivable. router.tsx already handles scrollTo(0, 0).
+    // <main> has no accessible name (no aria-label), so focusing it does not
+    // announce its content and therefore won't double-speak with the live
+    // region announcement below.
+    document.getElementById("main-content")?.focus();
+    const label = SCREEN_LABELS[route.name] ?? "";
+    setRouteAnnouncement(label ? `${label}に移動しました` : "");
+  }, [route.name]);
 
   function renderScreen() {
     switch (route.name) {
@@ -106,24 +144,32 @@ export function App() {
             <Link
               to={routes().dashboard}
               className={`nav-link${route.name === "dashboard" ? " nav-link--active" : ""}`}
+              aria-current={route.name === "dashboard" ? "page" : undefined}
             >
               ダッシュボード
             </Link>
             <Link
               to={routes().new}
               className={`nav-link${route.name === "new" ? " nav-link--active" : ""}`}
+              aria-current={route.name === "new" ? "page" : undefined}
             >
               新規リサーチ
             </Link>
             <Link
               to={routes().settings}
               className={`nav-link${route.name === "settings" ? " nav-link--active" : ""}`}
+              aria-current={route.name === "settings" ? "page" : undefined}
             >
               設定
             </Link>
             <Link
               to={routes().forecasts}
               className={`nav-link${route.name.startsWith("forecast") || route.name === "forecasts" ? " nav-link--active" : ""}`}
+              aria-current={
+                route.name.startsWith("forecast") || route.name === "forecasts"
+                  ? "page"
+                  : undefined
+              }
             >
               Forecasts
             </Link>
@@ -132,11 +178,18 @@ export function App() {
       </header>
 
       {/* Main content */}
-      <main id="main-content" className="app-main">
+      <main id="main-content" className="app-main" tabIndex={-1}>
         <div className="app-content">
           {renderScreen()}
         </div>
       </main>
+
+      {/* Polite route-change announcement for assistive technology.
+         Uses a bare aria-live region (not role="status") so it never competes
+         with the per-screen status regions that components expose. */}
+      <div className="sr-only" aria-live="polite" aria-atomic="true">
+        {routeAnnouncement}
+      </div>
     </>
   );
 }

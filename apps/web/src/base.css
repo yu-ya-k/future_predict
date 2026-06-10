@@ -89,11 +89,16 @@ select {
   background: var(--surface);
   border: var(--border-emphasis);
   border-radius: var(--radius-sm);
+  color: var(--ink);
+  font-size: var(--text-label);
+  text-decoration: none;
   transition: top var(--duration-fast) var(--ease-out);
 }
 
 .skip-link:focus {
   top: var(--space-3);
+  outline: none;
+  box-shadow: var(--focus-ring);
 }
 
 /* ── Reduced motion (D5-6) ── */

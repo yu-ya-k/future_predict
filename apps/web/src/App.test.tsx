@@ -250,6 +250,52 @@ describe("App shell", () => {
     render(<App />);
     expect(document.getElementById("main-content")).toBeInTheDocument();
   });
+
+  it("announces, focuses main, and marks aria-current on navigation", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve([]),
+    } as Response);
+
+    render(<App />);
+
+    // First mount must not steal focus or announce a route change.
+    // Target the App-level announcer specifically (aria-atomic) so it is not
+    // confused with any per-screen aria-live region.
+    const liveRegion = document.querySelector(
+      '[aria-live="polite"][aria-atomic="true"]',
+    );
+    expect(liveRegion).not.toBeNull();
+    expect(liveRegion?.textContent).toBe("");
+    expect(document.activeElement).not.toBe(document.getElementById("main-content"));
+
+    // Scope link queries to the nav landmark; screen content may contain other
+    // links whose names include these words.
+    const nav = within(
+      screen.getByRole("navigation", { name: "メインナビゲーション" }),
+    );
+    const dashboardLink = nav.getByRole("link", { name: "ダッシュボード" });
+    const settingsLink = nav.getByRole("link", { name: "設定" });
+    expect(dashboardLink).toHaveAttribute("aria-current", "page");
+    expect(settingsLink).not.toHaveAttribute("aria-current");
+
+    await act(async () => {
+      await userEvent.click(settingsLink);
+    });
+
+    await waitFor(() =>
+      expect(liveRegion?.textContent).toBe("設定に移動しました"),
+    );
+    expect(document.activeElement).toBe(document.getElementById("main-content"));
+    expect(nav.getByRole("link", { name: "設定" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    expect(
+      nav.getByRole("link", { name: "ダッシュボード" }),
+    ).not.toHaveAttribute("aria-current");
+  });
 });
 
 describe("Markdown", () => {
@@ -5246,6 +5292,7 @@ describe("HumanReview (SCR-4)", () => {
       expectedOutputKind: "targeted_delta_sections",
       reason: "review_route_needs_targeted_rerun",
       uploadStep: "既存レポートへ追加する差分セクションをアップロードする",
+      gated: false,
     },
     {
       action: "request_manual_full_rerun",
@@ -5254,6 +5301,7 @@ describe("HumanReview (SCR-4)", () => {
       expectedOutputKind: "complete_replacement_report",
       reason: "review_route_needs_full_rerun",
       uploadStep: "完成版レポート全文をアップロードする",
+      gated: true,
     },
   ] as const)(
     "refetches HumanReview after $action so the pending manual rerun flow appears",
@@ -5264,6 +5312,7 @@ describe("HumanReview (SCR-4)", () => {
       expectedOutputKind,
       reason,
       uploadStep,
+      gated,
     }) => {
       let payloadFetches = 0;
       const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -5324,6 +5373,12 @@ describe("HumanReview (SCR-4)", () => {
       await userEvent.click(
         await screen.findByRole("button", { name: buttonName }),
       );
+      if (gated) {
+        // Irreversible / budget-spending actions require an inline confirm.
+        await userEvent.click(
+          await screen.findByRole("button", { name: "実行する" }),
+        );
+      }
 
       await waitFor(() =>
         expect(fetchMock).toHaveBeenCalledWith(
@@ -5395,10 +5450,17 @@ describe("HumanReview (SCR-4)", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("max_full_rerun_runs_reached")).toBeInTheDocument();
+    // The stop-reason banner is now localized via BLOCKED_REASON_LABELS.
+    await screen.findAllByText("API Full rerun回数の上限に達しています。");
     expect(screen.getByText(/LLMレビューは完了しています/)).toBeInTheDocument();
     expect(screen.getByText(/API自動Full rerunは上限/)).toBeInTheDocument();
-    expect(screen.getByText("API Full rerun回数の上限に達しています。")).toBeInTheDocument();
+    // Appears exactly twice: the stop-reason banner plus the single disabled
+    // request_full_rerun action's blocked-reason note. No other action_state
+    // carries max_full_rerun_runs_reached, so a third occurrence would signal a
+    // duplicate render.
+    expect(
+      screen.getAllByText("API Full rerun回数の上限に達しています。"),
+    ).toHaveLength(2);
     const fullRerunButton = screen.getByRole("button", { name: /APIで全面再調査/i });
     expect(fullRerunButton).toBeDisabled();
     const fullDescriptionIds = fullRerunButton
@@ -5448,7 +5510,15 @@ describe("HumanReview (SCR-4)", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("max_targeted_rerun_runs_reached")).toBeInTheDocument();
+    // The stop-reason banner is now localized via BLOCKED_REASON_LABELS.
+    // Appears exactly twice: the stop-reason banner plus the single disabled
+    // request_targeted_rerun action's blocked-reason note. No other action_state
+    // carries max_targeted_rerun_runs_reached, so a third occurrence would signal
+    // a duplicate render.
+    await screen.findAllByText("API Targeted rerun回数の上限に達しています。");
+    expect(
+      screen.getAllByText("API Targeted rerun回数の上限に達しています。"),
+    ).toHaveLength(2);
     expect(screen.getByText(/API自動Targeted rerunは上限/)).toBeInTheDocument();
     const targetedRerunButton = screen.getByRole("button", {
       name: /APIで部分再調査/i,
@@ -6041,6 +6111,10 @@ describe("HumanReview (SCR-4)", () => {
     );
     expect(approveBtn).not.toBeNull();
     await userEvent.click(approveBtn as HTMLButtonElement);
+    // approve is irreversible and now requires an inline confirmation step.
+    await userEvent.click(
+      await screen.findByRole("button", { name: "実行する" }),
+    );
 
     expect(fetchMock).toHaveBeenCalledWith(
       `http://localhost:8000/research-runs/${runId}/resume`,
@@ -6048,6 +6122,149 @@ describe("HumanReview (SCR-4)", () => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
       }),
+    );
+  });
+
+  it("does not resume until the confirm gate is confirmed", async () => {
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/human-review`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(makePayload(["approve", "reject"])),
+        } as Response);
+      }
+      if (url.endsWith(`/research-runs/${runId}/resume`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              run_id: runId,
+              status: "completed",
+              done_reason: "human_approved",
+              needs_human_review: false,
+            }),
+        } as Response);
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await screen.findByText("承認");
+    const approveBtn = document.querySelector<HTMLButtonElement>(
+      'button[data-action="approve"]',
+    );
+    expect(approveBtn).not.toBeNull();
+
+    // First click only opens the confirm gate; it must NOT fire resume.
+    await userEvent.click(approveBtn as HTMLButtonElement);
+
+    expect(screen.getByText("本当に「承認」を実行しますか？現状で最終化")).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      `http://localhost:8000/research-runs/${runId}/resume`,
+      expect.anything(),
+    );
+
+    // Only confirming via 実行する fires the resume request.
+    await userEvent.click(screen.getByRole("button", { name: "実行する" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        `http://localhost:8000/research-runs/${runId}/resume`,
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+    const resumeCall = fetchMock.mock.calls.find(([input]) =>
+      String(input).endsWith(`/research-runs/${runId}/resume`),
+    );
+    expect(JSON.parse(String((resumeCall?.[1] as RequestInit).body))).toEqual({
+      action: "approve",
+      comment: null,
+    });
+  });
+
+  it("cancels the confirm gate via やめる without resuming and restores focus", async () => {
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/human-review`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(makePayload(["approve", "reject"])),
+        } as Response);
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await screen.findByText("承認");
+    const approveBtn = document.querySelector<HTMLButtonElement>(
+      'button[data-action="approve"]',
+    );
+    expect(approveBtn).not.toBeNull();
+
+    await userEvent.click(approveBtn as HTMLButtonElement);
+    expect(screen.getByText("本当に「承認」を実行しますか？現状で最終化")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "やめる" }));
+
+    expect(
+      screen.queryByText("本当に「承認」を実行しますか？現状で最終化"),
+    ).not.toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      `http://localhost:8000/research-runs/${runId}/resume`,
+      expect.anything(),
+    );
+    expect(document.activeElement).toBe(
+      document.querySelector('button[data-action="approve"]'),
+    );
+  });
+
+  it("cancels the confirm gate via Escape without resuming and restores focus", async () => {
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/research-runs/${runId}/human-review`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(makePayload(["approve", "reject"])),
+        } as Response);
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await screen.findByText("承認");
+    const approveBtn = document.querySelector<HTMLButtonElement>(
+      'button[data-action="approve"]',
+    );
+    expect(approveBtn).not.toBeNull();
+
+    await userEvent.click(approveBtn as HTMLButtonElement);
+    const group = screen.getByRole("group", { name: "承認の確認" });
+    expect(
+      within(group).getByText("本当に「承認」を実行しますか？現状で最終化"),
+    ).toBeInTheDocument();
+
+    fireEvent.keyDown(group, { key: "Escape" });
+
+    expect(
+      screen.queryByText("本当に「承認」を実行しますか？現状で最終化"),
+    ).not.toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      `http://localhost:8000/research-runs/${runId}/resume`,
+      expect.anything(),
+    );
+    expect(document.activeElement).toBe(
+      document.querySelector('button[data-action="approve"]'),
     );
   });
 

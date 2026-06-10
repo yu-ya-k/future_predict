@@ -1,9 +1,14 @@
+import type { CSSProperties } from "react";
+
+import { MetricCard } from "../../components";
 import type {
   EstimateSetResponse,
   ForecastCurrentResearchPack,
   ForecastDetail,
   ForecastPackRole,
+  ProbabilityEstimate,
 } from "../../types";
+import { localizePackStatus } from "./forecastStatus";
 
 const DEFAULT_PACK_ROLES: ForecastPackRole[] = [
   "current_state",
@@ -24,6 +29,23 @@ const PACK_LABELS: Record<ForecastPackRole, string> = {
 function percent(value: number | undefined): string {
   if (typeof value !== "number" || Number.isNaN(value)) return "-";
   return `${(value * 100).toFixed(1)}%`;
+}
+
+/** Format an additive adjustment as signed percentage points (e.g. "+3.0pt"). */
+function points(value: number | undefined): string {
+  if (typeof value !== "number" || Number.isNaN(value)) return "-";
+  const pt = value * 100;
+  // Branch on the rounded value so a tiny negative that rounds to zero
+  // renders as "±0.0pt" (the ± path) instead of leaking a "-0.0pt".
+  const rounded = Number(pt.toFixed(1));
+  if (rounded > 0) return `+${rounded.toFixed(1)}pt`;
+  if (rounded < 0) return `-${Math.abs(rounded).toFixed(1)}pt`;
+  return `±${Math.abs(rounded).toFixed(1)}pt`;
+}
+
+function clampPercent(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(100, Math.max(0, value));
 }
 
 function packStatus(pack: ForecastCurrentResearchPack | undefined): string {
@@ -86,10 +108,10 @@ export function PackCollectionPanel({
   return (
     <section className="form-panel" aria-labelledby="forecast-pack-collection-heading">
       <div className="run-card-meta">
-        <span>Phase B Packs</span>
+        <span>公開情報パック</span>
         <span>{completed.length}/5</span>
       </div>
-      <h2 id="forecast-pack-collection-heading">Pack Collection</h2>
+      <h2 id="forecast-pack-collection-heading">公開情報の収集状況</h2>
       <div className="result-list">
         {DEFAULT_PACK_ROLES.map((role) => {
           const pack = byRole.get(role);
@@ -101,15 +123,15 @@ export function PackCollectionPanel({
           return (
             <article key={role} className="run-card">
               <p className="run-card-title">{PACK_LABELS[role]}</p>
-              <p>{status}</p>
+              <p>{pack ? localizePackStatus(status) : "未収集"}</p>
               <p className="run-card-meta">
                 {pack
                   ? `${pack.tool_profile ?? "public"} / ${pack.data_classification ?? "public"} / attempt ${pack.attempt_no ?? 1}`
-                  : "required default pack"}
+                  : "必須の既定パック"}
               </p>
               {pack && (historyCounts.get(role) ?? 0) > 1 && (
                 <p className="run-card-meta">
-                  active {pack.is_active === false ? "no" : "yes"} / history {historyCounts.get(role)}
+                  有効 {pack.is_active === false ? "いいえ" : "はい"} / 履歴 {historyCounts.get(role)}件
                 </p>
               )}
               {pack && onRerunPack && (
@@ -146,20 +168,15 @@ export function EvidenceBoard({ forecast }: { forecast: ForecastDetail | null })
   const completed = packs.filter((pack) => pack.effective_status === "completed").length;
   return (
     <section className="form-panel" aria-labelledby="forecast-evidence-board-heading">
-      <h2 id="forecast-evidence-board-heading">Evidence Board</h2>
+      <h2 id="forecast-evidence-board-heading">証拠ボード</h2>
       <div className="metric-grid">
-        <div className="metric-card">
-          <span className="metric-label">Active packs</span>
-          <strong>{packs.length}</strong>
-        </div>
-        <div className="metric-card">
-          <span className="metric-label">Completed</span>
-          <strong>{completed}</strong>
-        </div>
-        <div className="metric-card">
-          <span className="metric-label">Claim links</span>
-          <strong>{forecast?.approved_claim_target_link_count ?? 0}</strong>
-        </div>
+        <MetricCard label="有効パック数" value={packs.length} unit="件" />
+        <MetricCard label="収集完了" value={completed} unit="件" />
+        <MetricCard
+          label="承認済みの主張対応"
+          value={forecast?.approved_claim_target_link_count ?? 0}
+          unit="件"
+        />
       </div>
     </section>
   );
@@ -175,16 +192,18 @@ export function ScenarioMap({
   const scenarioEstimates = estimate?.estimates.filter((item) => item.target_kind === "scenario") ?? [];
   return (
     <section className="form-panel" aria-labelledby="forecast-scenario-map-heading">
-      <h2 id="forecast-scenario-map-heading">Scenario Map</h2>
+      <h2 id="forecast-scenario-map-heading">シナリオマップ</h2>
       <div className="result-list">
         {(forecast?.outcomes ?? []).map((outcome) => (
           <article key={outcome.outcome_id} className="run-card">
             <p className="run-card-title">{outcome.label}</p>
             <p>{outcome.definition}</p>
             <p className="run-card-meta">
+              シナリオ{" "}
               {scenarioEstimates.filter(
                 (item) => item.components.derived_from_outcome_id === outcome.outcome_id,
-              ).length} scenarios
+              ).length}
+              件
             </p>
           </article>
         ))}
@@ -193,31 +212,121 @@ export function ScenarioMap({
   );
 }
 
-export function ProbabilityPanel({ estimate }: { estimate: EstimateSetResponse | null }) {
-  if (!estimate) return null;
+/** Resolve a probability estimate's target_id to a human-readable outcome label. */
+function outcomeLabel(
+  forecast: ForecastDetail | null,
+  estimate: ProbabilityEstimate,
+): string {
+  if (estimate.target_kind === "outcome") {
+    const outcome = forecast?.outcomes.find(
+      (item) => item.outcome_id === estimate.target_id,
+    );
+    if (outcome) return outcome.label;
+    // Never leak a raw UUID for an unresolved outcome.
+    return "(不明なアウトカム)";
+  }
+  return estimate.target_id;
+}
+
+function ProbabilityRow({
+  label,
+  estimate,
+  isTop,
+}: {
+  label: string;
+  estimate: ProbabilityEstimate;
+  isTop: boolean;
+}) {
+  const probPct = clampPercent(estimate.final_probability * 100);
+  // Render sorted bounds so an inverted lo80 > hi80 never prints backwards.
+  const lo80 = Math.min(estimate.uncertainty_range.lo80, estimate.uncertainty_range.hi80);
+  const hi80 = Math.max(estimate.uncertainty_range.lo80, estimate.uncertainty_range.hi80);
+  const lo = clampPercent(lo80 * 100);
+  const hi = clampPercent(hi80 * 100);
+  const intervalWidth = Math.max(0, hi - lo);
+  const intervalText = `80%予測区間: ${percent(lo80)}〜${percent(hi80)}`;
+  const ariaLabel = `${label}: 確率 ${percent(estimate.final_probability)}、${intervalText}`;
   return (
-    <section className="form-panel" id="forecast-estimate-panel">
-      <div className="run-card-meta">
-        <span>{estimate.engine_version}</span>
-        <span>{estimate.input_snapshot_hash}</span>
+    <article className={`forecast-prob-row${isTop ? " forecast-prob-row--top" : ""}`}>
+      <div className="forecast-prob-row__head">
+        <span className="forecast-prob-row__label">
+          {label}
+          {isTop && <span className="forecast-prob-row__lead-tag">最有力</span>}
+        </span>
+        <span className="forecast-prob-row__value">{percent(estimate.final_probability)}</span>
       </div>
-      <h2>Probability</h2>
-      <div className="result-list">
-        {estimate.estimates.map((item) => (
-          <article key={item.estimate_id} className="run-card">
-            <p className="run-card-title">{item.target_id}</p>
-            <p>{percent(item.final_probability)}</p>
-            <p className="run-card-meta">
-              prior {percent(item.prior)} / evidence {item.evidence_update.toFixed(3)} /
-              cross {item.cross_impact_adjustment.toFixed(3)}
-            </p>
-            <p className="run-card-meta">
-              80% {item.uncertainty_range.lo80.toFixed(3)}-
-              {item.uncertainty_range.hi80.toFixed(3)}
-            </p>
-          </article>
+      <div
+        className="forecast-prob-bar"
+        role="img"
+        aria-label={ariaLabel}
+        style={
+          {
+            "--prob-pct": `${probPct}%`,
+            "--interval-lo": `${lo}%`,
+            "--interval-width": `${intervalWidth}%`,
+          } as CSSProperties
+        }
+      >
+        <div className="forecast-prob-bar__fill" />
+        {intervalWidth > 0 && <div className="forecast-prob-bar__interval" />}
+      </div>
+      <p className="forecast-prob-row__interval-text">{intervalText}</p>
+      <dl className="forecast-prob-row__breakdown">
+        <div>
+          <dt>事前確率</dt>
+          <dd>{percent(estimate.prior)}</dd>
+        </div>
+        <div>
+          <dt>証拠による更新</dt>
+          <dd>{points(estimate.evidence_update)}</dd>
+        </div>
+        <div>
+          <dt>交差影響</dt>
+          <dd>{points(estimate.cross_impact_adjustment)}</dd>
+        </div>
+      </dl>
+    </article>
+  );
+}
+
+export function ProbabilityPanel({
+  forecast,
+  estimate,
+}: {
+  forecast?: ForecastDetail | null;
+  estimate: EstimateSetResponse | null;
+}) {
+  if (!estimate) return null;
+  const sorted = estimate.estimates
+    .filter((item) => item.target_kind === "outcome")
+    .sort((a, b) => b.final_probability - a.final_probability);
+  const topId = sorted[0]?.estimate_id;
+  return (
+    <section className="form-panel" id="forecast-estimate-panel" aria-labelledby="forecast-probability-heading">
+      <h2 id="forecast-probability-heading">確率の内訳</h2>
+      <div className="forecast-prob-list">
+        {sorted.map((item) => (
+          <ProbabilityRow
+            key={item.estimate_id}
+            label={outcomeLabel(forecast ?? null, item)}
+            estimate={item}
+            isTop={item.estimate_id === topId}
+          />
         ))}
       </div>
+      <details className="forecast-debug">
+        <summary>計算エンジン情報</summary>
+        <dl className="forecast-debug__grid">
+          <div>
+            <dt>エンジン</dt>
+            <dd>{estimate.engine_version}</dd>
+          </div>
+          <div>
+            <dt>入力スナップショット</dt>
+            <dd>{estimate.input_snapshot_hash}</dd>
+          </div>
+        </dl>
+      </details>
     </section>
   );
 }
@@ -234,14 +343,23 @@ export function ForecastReport({
         .filter((item) => item.target_kind === "outcome")
         .sort((a, b) => b.final_probability - a.final_probability)[0]
     : undefined;
+  if (!topOutcome) return null;
+  const label = outcomeLabel(forecast, topOutcome);
+  // Render sorted bounds so an inverted lo80 > hi80 never prints backwards.
+  const lo80 = Math.min(topOutcome.uncertainty_range.lo80, topOutcome.uncertainty_range.hi80);
+  const hi80 = Math.max(topOutcome.uncertainty_range.lo80, topOutcome.uncertainty_range.hi80);
+  const intervalText = `${percent(lo80)}〜${percent(hi80)}`;
   return (
-    <section className="form-panel" aria-labelledby="forecast-report-heading">
-      <h2 id="forecast-report-heading">Forecast Report</h2>
-      <p>{forecast ? `Status: ${forecast.status}` : "Status: loading"}</p>
-      <div className="run-card-meta">
-        <span>{forecast?.status ?? "loading"}</span>
-        <span>{topOutcome ? `top ${percent(topOutcome.final_probability)}` : "not computed"}</span>
+    <section className="form-panel forecast-conclusion" aria-labelledby="forecast-report-heading">
+      <h2 id="forecast-report-heading">予測サマリ</h2>
+      <div className="forecast-conclusion__headline">
+        <span className="forecast-conclusion__label">最有力アウトカム</span>
+        <span className="forecast-conclusion__outcome">{label}</span>
+        <span className="forecast-conclusion__probability">
+          {percent(topOutcome.final_probability)}
+        </span>
       </div>
+      <p className="forecast-conclusion__interval">80%予測区間: {intervalText}</p>
     </section>
   );
 }

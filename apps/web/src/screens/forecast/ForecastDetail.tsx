@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import "./forecast.css";
 import {
   commitForecastVersion,
   computeProbabilities,
@@ -14,6 +15,7 @@ import {
   resolveForecast,
   reviewForecast,
 } from "../../api/forecast";
+import { MetricCard } from "../../components";
 import { copyTextToClipboard } from "../../lib/clipboard";
 import { Link, routes } from "../../router";
 import { formatElapsed, useElapsed } from "../../hooks/useElapsed";
@@ -32,6 +34,11 @@ import {
   type ForecastFlowNode,
   type ForecastFlowStatus,
 } from "./ForecastFlowProgress";
+import {
+  forecastStatusLabel,
+  forecastStatusTone,
+  localizePackStatus,
+} from "./forecastStatus";
 import {
   EvidenceBoard,
   ForecastReport,
@@ -126,51 +133,6 @@ function flowStatus({
   if (blocked) return "blocked";
   if (available) return "available";
   return "pending";
-}
-
-function forecastStatusLabel(status: ForecastStatus | undefined): string {
-  switch (status) {
-    case "framing_pending":
-      return "フレーミング待ち";
-    case "framing_approved":
-      return "フレーミング承認済み";
-    case "pack_running":
-      return "公開情報フェーズ";
-    case "evidence_ready":
-      return "証拠抽出済み";
-    case "scenarios_ready":
-      return "シナリオ生成済み";
-    case "draft_ready":
-      return "確率計算済み";
-    case "committed":
-      return "予測版確定済み";
-    case "resolved":
-      return "解決済み";
-    default:
-      return "読み込み中";
-  }
-}
-
-function packStatusLabel(status: string | null | undefined): string {
-  switch (status) {
-    case "submitting":
-      return "サーバーに登録中";
-    case "running":
-      return "実行中";
-    case "completed":
-      return "完了";
-    case "needs_human_review":
-      return "要確認";
-    case "failed":
-      return "失敗";
-    case "cancelled":
-      return "中断";
-    case null:
-    case undefined:
-      return "未収集";
-    default:
-      return status;
-  }
 }
 
 function isRemoteResearchRunning(
@@ -582,7 +544,7 @@ function deriveCurrentStep({
       title,
       description:
         "Research runの詳細で原因や人手確認の要否を確認してください。対応後にこの画面へ戻ると最新状態を確認できます。",
-      stateLabel: packStatusLabel(currentResearchPackStatus),
+      stateLabel: localizePackStatus(currentResearchPackStatus),
       tone: "blocked",
       action: "researchRun",
       actionLabel: "Research run詳細",
@@ -1271,6 +1233,13 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   }
 
   function rerunPack(pack: ForecastCurrentResearchPack) {
+    if (
+      !window.confirm(
+        "このパックを再実行しますか？Deep Researchを再度呼び出すため、追加のコストと時間が発生します。",
+      )
+    ) {
+      return;
+    }
     void runStep("pack", () =>
       rerunForecastResearchPack(
         forecastId,
@@ -1373,7 +1342,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
           : researchPackCompleted
             ? "5 Pack完了"
             : `${forecastProgress.completedDefaultPackCount}/5 Pack完了`
-      : packStatusLabel(currentResearchPackStatus);
+      : localizePackStatus(currentResearchPackStatus);
   const currentStepDetails = [
     { label: "Forecast本体状態", value: forecastDisplayStatus },
     {
@@ -1452,7 +1421,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
           <p className="screen-subtitle">{forecast?.question ?? forecastId}</p>
         </div>
         <div className="forecast-detail-actions">
-          <span className="forecast-status-pill">
+          <span className={`status-pill status-pill--${forecastStatusTone(status)}`}>
             {forecastDisplayStatus}
           </span>
           {researchRunPath && (
@@ -1473,22 +1442,13 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       )}
 
       <div className="metric-grid">
-        <div className="metric-card">
-          <span className="metric-label">Forecast本体</span>
-          <strong>{forecastDisplayStatus}</strong>
-        </div>
-        <div className="metric-card">
-          <span className="metric-label">フレーミング</span>
-          <strong>{forecast?.approved_framing_version ? "承認済み" : "承認待ち"}</strong>
-        </div>
-        <div className="metric-card">
-          <span className="metric-label">公開情報パック</span>
-          <strong>{currentResearchPackDisplayStatus}</strong>
-        </div>
-        <div className="metric-card">
-          <span className="metric-label">確率エンジン</span>
-          <strong>{estimate?.engine_version ?? "未計算"}</strong>
-        </div>
+        <MetricCard label="Forecast本体" value={forecastDisplayStatus} />
+        <MetricCard
+          label="フレーミング"
+          value={forecast?.approved_framing_version ? "承認済み" : "承認待ち"}
+        />
+        <MetricCard label="公開情報パック" value={currentResearchPackDisplayStatus} />
+        <MetricCard label="確率エンジン" value={estimate?.engine_version ?? "未計算"} />
       </div>
 
       <section
@@ -1497,7 +1457,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       >
         <div className="forecast-current-step__header">
           <div>
-            <span className="metric-label">現在のステップ</span>
+            <span className="forecast-current-step__kicker">現在のステップ</span>
             <h2 id="forecast-current-step-heading">{currentStep.title}</h2>
           </div>
           <span className="forecast-current-step__state">
@@ -1725,6 +1685,8 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
         </dl>
       </section>
 
+      <ForecastReport forecast={forecast} estimate={estimate} />
+
       <ForecastFlowProgress
         heading="全体フロー"
         summary="Forecastが解決までのどこにいるかを確認できます。操作は上の現在ステップから行います。"
@@ -1747,9 +1709,8 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
 
       <EvidenceBoard forecast={forecast} />
       <ScenarioMap forecast={forecast} estimate={estimate} />
-      <ForecastReport forecast={forecast} estimate={estimate} />
 
-      <ProbabilityPanel estimate={estimate} />
+      <ProbabilityPanel forecast={forecast} estimate={estimate} />
 
       {(forecast?.status === "committed" || forecast?.status === "resolved") && (
         <div className="form-panel" id="forecast-resolve-panel">

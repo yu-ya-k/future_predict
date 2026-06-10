@@ -8,7 +8,7 @@
   /* ── Base colours ─────────────────────────────────────────── */
   --ink: #1b1a17; /* primary text */
   --ink-soft: #56524a; /* secondary text */
-  --ink-faint: #8c887e; /* caption, notes */
+  --ink-faint: #6f6b62; /* caption, notes — darkened for WCAG AA (>=4.5:1 on paper/surface) */
   --paper: #fbfaf6; /* base background (washi) */
   --surface: #ffffff; /* cards, panels */
   --surface-raised: #f7f5ef; /* nested surface */
@@ -39,7 +39,7 @@
   --deep-border: #f0b9a5;
 
   /* human_review / stop — Amber-deep (not an error) */
-  --human: #b8770c;
+  --human: #8a5a09; /* darkened for WCAG AA text contrast (>=4.5:1 on paper/surface) */
   --human-bg: #faedd6;
   --human-border: #f0cd8a;
 
@@ -71,7 +71,9 @@
 
   /* scale */
   --text-h1: 22px;
+  --text-xl: 20px; /* sub-h1 heading (e.g. forecast current-step h2) */
   --text-h2: 18px;
+  --text-lg: 18px; /* large section heading (e.g. manual-pack header h3) */
   --text-h3: 16px;
   --text-body: 15.5px;
   --text-label: 13px;

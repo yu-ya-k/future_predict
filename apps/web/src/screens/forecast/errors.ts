@@ -1,6 +1,9 @@
 import { ApiError } from "../../api/client";
 import { FRAMING_ROUGH_QUESTION_MAX_LENGTH } from "./constants";
 
+const UNEXPECTED_ERROR_MESSAGE =
+  "予期しないエラーが発生しました。時間をおいて再読み込みしてください。問題が続く場合は管理者にお問い合わせください。";
+
 interface ValidationIssue {
   type?: unknown;
   loc?: unknown;
@@ -63,10 +66,34 @@ export function formatForecastError(error: unknown): string {
       return "すでに公開情報パックがあります。最新状態を再読み込みしてください。";
     }
 
-    const message = error.code ? `${error.code}: ${error.message}` : error.message;
-    if (!error.details || Object.keys(error.details).length === 0) return message;
-    return `${message}\nDetails: ${JSON.stringify(error.details)}`;
+    // Typed, actionable errors (e.g. forecast command 409s such as
+    // policy_requires_revision) carry a code and often structured details the
+    // operator needs to act on, so surface them. Errors with no code fall back
+    // to a friendly sentence rather than dumping an opaque payload.
+    const serverMessage = error.message.trim();
+    if (error.code) {
+      const lines = [
+        serverMessage && serverMessage !== error.code
+          ? `${error.code}: ${serverMessage}`
+          : error.code,
+      ];
+      if (error.details && Object.keys(error.details).length > 0) {
+        lines.push(`詳細: ${JSON.stringify(error.details, null, 2)}`);
+      }
+      return lines.join("\n");
+    }
+    // Without a code we cannot translate, so we surface the server-provided
+    // message (e.g. a 4xx/5xx `detail` such as "Draft model unavailable."),
+    // which operators rely on. The one exception is a network failure
+    // (status 0), whose message is the client-side English "Network error"
+    // string and must not leak to users.
+    if (serverMessage && error.status !== 0) {
+      return serverMessage;
+    }
+    return UNEXPECTED_ERROR_MESSAGE;
   }
-  if (error instanceof Error) return error.message;
-  return "Unknown error";
+  if (error instanceof Error) {
+    return UNEXPECTED_ERROR_MESSAGE;
+  }
+  return UNEXPECTED_ERROR_MESSAGE;
 }

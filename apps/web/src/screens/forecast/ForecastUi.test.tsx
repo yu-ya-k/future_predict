@@ -1667,6 +1667,8 @@ describe("Forecast UI", () => {
 
     render(<App />);
 
+    // Pack rerun now asks for confirmation before re-invoking Deep Research.
+    vi.spyOn(window, "confirm").mockReturnValue(true);
     expect(await screen.findByText(/attempt 2/)).toBeInTheDocument();
     await userEvent.click(
       screen.getByRole("button", { name: "Current State を再実行" }),
@@ -3510,6 +3512,242 @@ describe("Forecast UI", () => {
         String(url).endsWith("/forecasts/forecast-1/probabilities/compute"),
       ),
     ).toBe(false);
+  });
+
+  it("visualizes outcome probabilities without leaking scenario UUIDs", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const scenarioTargetId = "8f1d2c3b-4a5e-6f70-8192-a3b4c5d6e7f8";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(forecastDetail({ status: "draft_ready" }));
+        }
+        if (
+          path === "/forecasts/forecast-1/estimate-set" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            estimateSet({
+              estimates: [
+                {
+                  estimate_id: "estimate-yes",
+                  target_kind: "outcome",
+                  target_id: "outcome-yes",
+                  prior: 0.5,
+                  evidence_update: 0.05,
+                  cross_impact_adjustment: 0,
+                  simulation_adjustment: 0,
+                  calibration_adjustment: 0,
+                  human_adjustment: 0,
+                  final_probability: 0.27,
+                  uncertainty_range: { lo80: 0.2, hi80: 0.34 },
+                  components: { clamp_applied: false },
+                },
+                {
+                  estimate_id: "estimate-no",
+                  target_kind: "outcome",
+                  target_id: "outcome-no",
+                  prior: 0.5,
+                  evidence_update: 0.2,
+                  cross_impact_adjustment: 0,
+                  simulation_adjustment: 0,
+                  calibration_adjustment: 0,
+                  human_adjustment: 0,
+                  final_probability: 0.73,
+                  uncertainty_range: { lo80: 0.63, hi80: 0.83 },
+                  components: { clamp_applied: false },
+                },
+                {
+                  estimate_id: "estimate-scenario",
+                  target_kind: "scenario",
+                  target_id: scenarioTargetId,
+                  prior: 0.4,
+                  evidence_update: 0,
+                  cross_impact_adjustment: 0,
+                  simulation_adjustment: 0,
+                  calibration_adjustment: 0,
+                  human_adjustment: 0,
+                  final_probability: 0.4,
+                  uncertainty_range: { lo80: 0.3, hi80: 0.5 },
+                  components: { derived_from_outcome_id: "outcome-no" },
+                },
+              ],
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    // Summary panel ("予測サマリ") highlights the top outcome and its probability.
+    const summary = await screen.findByRole("region", { name: "予測サマリ" });
+    expect(within(summary).getByText(NON_BINARY_OUTCOMES[1])).toBeInTheDocument();
+    expect(within(summary).getByText("73.0%")).toBeInTheDocument();
+
+    // Breakdown panel ("確率の内訳") repeats the top outcome label and percentage.
+    const breakdown = screen.getByRole("region", { name: "確率の内訳" });
+    expect(
+      within(breakdown).getByText(NON_BINARY_OUTCOMES[1]),
+    ).toBeInTheDocument();
+    expect(within(breakdown).getAllByText("73.0%").length).toBeGreaterThan(0);
+
+    // The probability bar exposes its value to screen readers via role="img".
+    const topBar = within(breakdown).getByRole("img", {
+      name: `${NON_BINARY_OUTCOMES[1]}: 確率 73.0%、80%予測区間: 63.0%〜83.0%`,
+    });
+    expect(topBar).toBeInTheDocument();
+
+    // The most-likely outcome carries the 最有力 lead tag.
+    expect(within(breakdown).getByText("最有力")).toBeInTheDocument();
+
+    // ProbabilityPanel renders outcomes only: the scenario UUID must not leak.
+    expect(screen.queryByText(scenarioTargetId)).toBeNull();
+    expect(within(breakdown).queryByRole("img", { name: new RegExp(scenarioTargetId) })).toBeNull();
+  });
+
+  it("omits the forecast summary when no top outcome estimate exists", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const scenarioTargetId = "11111111-2222-3333-4444-555555555555";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(forecastDetail({ status: "draft_ready" }));
+        }
+        if (
+          path === "/forecasts/forecast-1/estimate-set" &&
+          (!init || init.method === "GET")
+        ) {
+          // Only scenario estimates, no outcomes -> ForecastReport returns null.
+          return jsonResponse(
+            estimateSet({
+              estimates: [
+                {
+                  estimate_id: "estimate-scenario",
+                  target_kind: "scenario",
+                  target_id: scenarioTargetId,
+                  prior: 0.4,
+                  evidence_update: 0,
+                  cross_impact_adjustment: 0,
+                  simulation_adjustment: 0,
+                  calibration_adjustment: 0,
+                  human_adjustment: 0,
+                  final_probability: 0.4,
+                  uncertainty_range: { lo80: 0.3, hi80: 0.5 },
+                  components: { derived_from_outcome_id: "outcome-no" },
+                },
+              ],
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    // The estimate set still loads (engine info shows in the breakdown panel).
+    expect(await screen.findByText("snapshot-hash-1")).toBeInTheDocument();
+    // But with no top outcome the summary section and its lead tag are absent.
+    expect(
+      screen.queryByRole("region", { name: "予測サマリ" }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("heading", { name: "予測サマリ" }),
+    ).toBeNull();
+    expect(screen.queryByText("最有力アウトカム")).toBeNull();
+    expect(screen.queryByText("最有力")).toBeNull();
+  });
+
+  it("cancels the active pack rerun when the confirmation is declined", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const activePack = phaseBResearchPack("current_state", {
+      pack_id: "pack-current-active",
+      research_run_id: "run-current-active",
+      attempt_no: 2,
+      effective_status: "failed",
+      pack_status: "failed",
+      research_run_status: "failed",
+      last_error: "source timeout",
+    });
+    const inactivePack = phaseBResearchPack("current_state", {
+      pack_id: "pack-current-old",
+      research_run_id: "run-current-old",
+      attempt_no: 1,
+      is_active: false,
+      effective_status: "completed",
+      pack_status: "completed",
+    });
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            forecastDetail({
+              status: "pack_running",
+              approved_framing_version: 1,
+              current_research_pack: activePack,
+              current_research_pack_status: "failed",
+              research_packs: [inactivePack, activePack],
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/research-packs/pack-current-active/rerun" &&
+          init?.method === "POST"
+        ) {
+          return jsonResponse({
+            pack_id: "pack-current-new",
+            forecast_id: "forecast-1",
+            research_run_id: "run-current-new",
+            pack_role: "current_state",
+            tool_profile: "public",
+            status: "running",
+            policy_decision_id: "policy-1",
+            attempt_no: 3,
+            is_active: true,
+            data_classification: "public",
+          });
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    // Declining the confirmation must short-circuit before any rerun request.
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    expect(await screen.findByText(/attempt 2/)).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Current State を再実行" }),
+    );
+
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) =>
+          String(url).endsWith(
+            "/forecasts/forecast-1/research-packs/pack-current-active/rerun",
+          ) && init?.method === "POST",
+      ),
+    ).toBe(false);
+    // No navigation occurred away from the detail route.
+    expect(window.location.hash).toBe("#/forecasts/forecast-1");
   });
 
   it("enables commit only after PhaseA approval", async () => {
