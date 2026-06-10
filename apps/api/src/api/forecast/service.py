@@ -434,8 +434,8 @@ class ForecastOrchestrator:
             )
         if estimate_set["engine_version"] != "phase_a_v1":
             raise ForecastConflict(
-                "reviewer_required",
-                "Phase B estimate sets require approve_probability_publication with reviewer.",
+                "approval_required",
+                "Phase B estimate sets require approve_probability_publication.",
                 {"estimate_set_id": str(estimate_set_id)},
             )
         self.repository.approve_estimate_set(

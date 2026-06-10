@@ -455,12 +455,6 @@ body {
   box-shadow: var(--focus-ring);
 }
 
-.field-help {
-  font-size: var(--text-caption);
-  color: var(--ink-faint);
-  line-height: var(--leading-normal);
-}
-
 .button-row,
 .result-list {
   display: flex;

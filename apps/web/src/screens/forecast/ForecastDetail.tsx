@@ -628,7 +628,7 @@ function deriveCurrentStep({
         ? "確率公開の承認待ちです"
         : "推定結果の承認待ちです",
       description: isPhaseBEstimate
-        ? "下の推定結果を確認し、承認者を入力して公開承認できます。"
+        ? "下の推定結果を確認し、問題なければ公開承認できます。"
         : "下の推定結果を確認し、問題なければこのまま承認できます。",
       stateLabel: "承認待ち",
       tone: "ready",
@@ -860,7 +860,6 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   const [estimate, setEstimate] = useState<EstimateSetResponse | null>(null);
   const [claimTargetsApproved, setClaimTargetsApproved] = useState(false);
   const [approvedEstimateSetId, setApprovedEstimateSetId] = useState<string | null>(null);
-  const [approvalReviewer, setApprovalReviewer] = useState("");
   const [resolution, setResolution] = useState<ResolveForecastResponse | null>(null);
   const [selectedOutcomeId, setSelectedOutcomeId] = useState("");
   const [resolutionNotes, setResolutionNotes] = useState("");
@@ -902,7 +901,6 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     setEstimate(null);
     setClaimTargetsApproved(false);
     setApprovedEstimateSetId(null);
-    setApprovalReviewer("");
     setResolution(null);
     setSelectedOutcomeId("");
     setResolutionNotes("");
@@ -1071,7 +1069,6 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       if (step === "claimTargets") setClaimTargetsApproved(true);
       if (step === "approve" && estimate) {
         setApprovedEstimateSetId(estimate.estimate_set_id);
-        setApprovalReviewer("");
       }
       if (step === "compute") setEstimate(result as EstimateSetResponse);
       if (step === "resolve") setResolution(result as ResolveForecastResponse);
@@ -1135,9 +1132,6 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
         ) {
           return Promise.resolve();
         }
-        if (estimate.engine_version === "phase_b_v1" && !approvalReviewer.trim()) {
-          return Promise.resolve();
-        }
         return runStep("approve", () =>
           reviewForecast(
             forecastId,
@@ -1145,7 +1139,6 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
               ? {
                   action: "approve_probability_publication",
                   estimate_set_id: estimate.estimate_set_id,
-                  reviewer: approvalReviewer.trim(),
                 }
               : {
                   action: "approve_phase_a_version",
@@ -1321,8 +1314,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     Boolean(estimate?.estimate_set_id) &&
     hasKnownEstimateEngine &&
     !estimateApproved;
-  const canSubmitEstimateApproval =
-    canApproveEstimate && (!isPhaseBEstimate || approvalReviewer.trim().length > 0);
+  const canSubmitEstimateApproval = canApproveEstimate;
   const canCommit = status === "draft_ready" && Boolean(estimate) && estimateApproved;
   const canResolve = status === "committed" && Boolean(selectedOutcomeId);
   const flowNodes = forecastExecutionNodes({
@@ -1538,23 +1530,6 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
               </button>
             )}
           </div>
-        )}
-        {canApproveEstimate && isPhaseBEstimate && (
-          <label className="field">
-            <span>承認者</span>
-            <input
-              type="text"
-              value={approvalReviewer}
-              required
-              aria-required="true"
-              maxLength={500}
-              aria-describedby="forecast-approval-reviewer-help"
-              onChange={(event) => setApprovalReviewer(event.target.value)}
-            />
-            <span id="forecast-approval-reviewer-help" className="field-help">
-              承認者は確率公開の監査記録に保存されます。
-            </span>
-          </label>
         )}
         {canRecoverManualPack && (
           <div className="forecast-current-step__action">

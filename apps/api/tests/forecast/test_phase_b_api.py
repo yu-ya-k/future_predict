@@ -462,7 +462,6 @@ async def test_phase_b_lifecycle_e2e_with_default_packs(
             json={
                 "action": "approve_probability_publication",
                 "estimate_set_id": estimate_json["estimate_set_id"],
-                "reviewer": "analyst-1",
                 "review_reason": "Phase B draft is ready.",
             },
         )
@@ -637,7 +636,7 @@ async def test_private_pack_rejects_trusted_source_tool_mismatch_before_run(
 
 
 @pytest.mark.anyio
-async def test_phase_b_review_actions_require_reviewer(tmp_path: Path) -> None:
+async def test_private_data_review_action_requires_reviewer(tmp_path: Path) -> None:
     fake = IntegrationFakeAzure()
     forecast, research = _make_orchestrators(tmp_path, fake)
     app = create_app()
@@ -994,7 +993,7 @@ def test_phase_b_commit_requires_probability_publication_review(
             estimate_set_id=estimate_set_id,
             comment=None,
         )
-    assert phase_a_error.value.code == "reviewer_required"
+    assert phase_a_error.value.code == "approval_required"
 
     with pytest.raises(ForecastConflict) as commit_error:
         forecast.commit_version(
@@ -1008,7 +1007,7 @@ def test_phase_b_commit_requires_probability_publication_review(
         forecast_id,
         action="approve_probability_publication",
         comment=None,
-        reviewer="reviewer-1",
+        reviewer=None,
         reviewer_auth_subject=None,
         policy_decision_id=None,
         review_reason="Ready for publication.",

@@ -124,7 +124,6 @@ def ensure_trusted_sources_allowed(
 def ensure_reviewer_for_action(action: str, reviewer: str | None) -> None:
     if action in {
         "approve_private_data_use",
-        "approve_probability_publication",
         "override_probability_with_reason",
         "approve_external_report",
         "approve_trusted_source",

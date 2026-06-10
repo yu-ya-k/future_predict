@@ -3838,7 +3838,7 @@ describe("Forecast UI", () => {
     );
   });
 
-  it("requires a reviewer and uses probability publication approval for PhaseB estimates", async () => {
+  it("uses probability publication approval for PhaseB estimates without a reviewer", async () => {
     window.location.hash = "#/forecasts/forecast-1";
     let phaseBApproved = false;
     let status: ForecastDetail["status"] = "draft_ready";
@@ -3931,28 +3931,11 @@ describe("Forecast UI", () => {
     const approveButton = screen.getByRole("button", {
       name: "確率公開を承認",
     });
-    expect(approveButton).toBeDisabled();
+    expect(approveButton).toBeEnabled();
+    expect(screen.queryByRole("textbox", { name: /承認者/ })).toBeNull();
     expect(screen.queryByRole("button", { name: "予測版を確定" })).toBeNull();
 
     await userEvent.click(approveButton);
-    expect(
-      fetchMock.mock.calls.some(
-        ([url, init]) =>
-          String(url).endsWith("/forecasts/forecast-1/review") &&
-          init?.method === "POST",
-      ),
-    ).toBe(false);
-
-    const reviewerInput = screen.getByRole("textbox", { name: /承認者/ });
-    await userEvent.type(reviewerInput, "   ");
-    expect(
-      screen.getByRole("button", { name: "確率公開を承認" }),
-    ).toBeDisabled();
-    await userEvent.clear(reviewerInput);
-    await userEvent.type(reviewerInput, "  reviewer@example.com  ");
-    await userEvent.click(
-      screen.getByRole("button", { name: "確率公開を承認" }),
-    );
 
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "予測版を確定" })).toBeEnabled(),
@@ -3967,7 +3950,6 @@ describe("Forecast UI", () => {
     expect(JSON.parse(String(reviewCalls[0]?.[1]?.body))).toEqual({
       action: "approve_probability_publication",
       estimate_set_id: "estimate-set-1",
-      reviewer: "reviewer@example.com",
     });
     expect(JSON.parse(String(reviewCalls[0]?.[1]?.body))).not.toMatchObject({
       action: "approve_phase_a_version",
