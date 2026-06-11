@@ -7,6 +7,8 @@ import math
 from typing import Any, cast
 from uuid import NAMESPACE_URL, uuid5
 
+from api.forecast.errors import ForecastInvalidInput
+
 ENGINE_VERSION = "phase_c_v1"
 RANDOM_SEED = 0
 CONSTANTS_VERSION = "phase_c_v1_constants"
@@ -16,6 +18,61 @@ K_EVIDENCE = 0.9
 K_COUNTER = 0.45
 K_SIGNAL = 0.35
 RESIDUAL_PENALTY = 1.0
+
+
+def _parse_finite_float(
+    value: Any,
+    *,
+    field: str,
+    lo: float | None = None,
+    hi: float | None = None,
+) -> float:
+    """Parse *value* as float, reject non-finite results, and optionally validate range."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ForecastInvalidInput(
+            "invalid_numeric_field",
+            f"Field '{field}' could not be parsed as a number: {value!r}",
+            {"field": field, "value": repr(value)},
+        ) from exc
+    if not math.isfinite(result):
+        raise ForecastInvalidInput(
+            "non_finite_numeric_field",
+            f"Field '{field}' must be a finite number, got {result!r}",
+            {"field": field, "value": repr(value)},
+        )
+    if lo is not None and result < lo:
+        raise ForecastInvalidInput(
+            "numeric_field_out_of_range",
+            f"Field '{field}' must be >= {lo}, got {result!r}",
+            {"field": field, "value": repr(value), "lo": lo},
+        )
+    if hi is not None and result > hi:
+        raise ForecastInvalidInput(
+            "numeric_field_out_of_range",
+            f"Field '{field}' must be <= {hi}, got {result!r}",
+            {"field": field, "value": repr(value), "hi": hi},
+        )
+    return result
+
+
+def _parse_int(value: Any, *, field: str) -> int:
+    """Parse *value* as an int, raising ForecastInvalidInput on non-integer input."""
+    if isinstance(value, bool):
+        raise ForecastInvalidInput(
+            "invalid_numeric_field",
+            f"Field '{field}' could not be parsed as an integer: {value!r}",
+            {"field": field, "value": repr(value)},
+        )
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ForecastInvalidInput(
+            "invalid_numeric_field",
+            f"Field '{field}' could not be parsed as an integer: {value!r}",
+            {"field": field, "value": repr(value)},
+        ) from exc
 
 
 def canonical_json_bytes(payload: dict[str, Any]) -> bytes:
@@ -52,14 +109,22 @@ def compute_phase_c_projection(*, snapshot: dict[str, Any]) -> dict[str, list[di
 def _scenario_probabilities(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     claims = snapshot.get("claims", [])
     support = math.fsum(
-        float(claim.get("evidence_strength", 0.0))
-        * float(claim.get("reliability_score", 0.0))
+        _parse_finite_float(
+            claim.get("evidence_strength", 0.0), field="evidence_strength", lo=0.0, hi=1.0
+        )
+        * _parse_finite_float(
+            claim.get("reliability_score", 0.0), field="reliability_score", lo=0.0, hi=1.0
+        )
         for claim in claims
         if int(claim.get("polarity", 1)) >= 0
     )
     counter = math.fsum(
-        float(claim.get("evidence_strength", 0.0))
-        * float(claim.get("reliability_score", 0.0))
+        _parse_finite_float(
+            claim.get("evidence_strength", 0.0), field="evidence_strength", lo=0.0, hi=1.0
+        )
+        * _parse_finite_float(
+            claim.get("reliability_score", 0.0), field="reliability_score", lo=0.0, hi=1.0
+        )
         for claim in claims
         if int(claim.get("polarity", 1)) < 0
     )
@@ -159,11 +224,15 @@ def _metric_points(
     forecast_id = str(snapshot["forecast"]["forecast_id"])
     rows: list[dict[str, Any]] = []
     for dimension in snapshot.get("dimensions", []):
-        baseline = float(dimension["baseline_value"])
-        baseline_year = int(dimension["baseline_year"])
-        horizons = sorted(int(year) for year in dimension["horizons"])
+        baseline = _parse_finite_float(
+            dimension["baseline_value"], field="baseline_value", lo=0.0
+        )
+        baseline_year = _parse_int(dimension["baseline_year"], field="baseline_year")
+        horizons = sorted(_parse_int(year, field="horizon_year") for year in dimension["horizons"])
         for scenario in scenarios:
-            growth = float(scenario["driver_vector"]["growth"])
+            growth = _parse_finite_float(
+                scenario["driver_vector"]["growth"], field="growth"
+            )
             for horizon in horizons:
                 years = max(1, horizon - baseline_year)
                 factor = max(0.0, 1.0 + growth * years / 20.0)
@@ -333,6 +402,12 @@ def input_signature(snapshot: dict[str, Any]) -> str:
 
 
 def _softmax(logits: list[float]) -> list[float]:
+    if not logits:
+        raise ForecastInvalidInput(
+            "softmax_empty_logits",
+            "Cannot compute softmax over an empty logit list.",
+            {},
+        )
     max_logit = max(logits)
     exps = [math.exp(logit - max_logit) for logit in logits]
     total = math.fsum(exps)

@@ -10,7 +10,12 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Uploa
 from fastapi.encoders import jsonable_encoder
 
 from api.forecast.dependencies import get_forecast_orchestrator
-from api.forecast.errors import ForecastConflict, forecast_http_error
+from api.forecast.errors import (
+    ForecastConflict,
+    ForecastInvalidInput,
+    forecast_http_error,
+    forecast_invalid_input_http_error,
+)
 from api.forecast.repository import IDEMPOTENCY_IN_PROGRESS
 from api.forecast.schemas import (
     CommitVersionRequest,
@@ -476,6 +481,8 @@ def compute_probabilities(
             payload=body.model_dump(mode="json"),
             action=lambda: orchestrator.compute_probabilities(forecast_id, body),
         )
+    except ForecastInvalidInput as error:
+        raise forecast_invalid_input_http_error(error) from error
     except ForecastConflict as error:
         raise forecast_http_error(error) from error
     except KeyError as error:
@@ -512,6 +519,8 @@ def compute_projection(
             payload=body.model_dump(mode="json"),
             action=lambda: orchestrator.compute_projection(forecast_id, body),
         )
+    except ForecastInvalidInput as error:
+        raise forecast_invalid_input_http_error(error) from error
     except ForecastConflict as error:
         raise forecast_http_error(error) from error
     except KeyError as error:

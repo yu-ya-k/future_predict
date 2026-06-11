@@ -17,6 +17,10 @@ class Settings(BaseSettings):
         "http://localhost:5175",
         "http://127.0.0.1:5175",
     ]
+    # Explicit allowed CORS origins for non-development environments.
+    # When set, CORSMiddleware uses this list and enables credentials.
+    # When empty, falls back to cors_origins (development default).
+    cors_allowed_origins: list[str] = Field(default_factory=list)
     research_db_path: Path = Path(".data/research.sqlite3")
     research_artifact_dir: Path = Path(".data/research-runs")
     forecast_enabled: bool = True

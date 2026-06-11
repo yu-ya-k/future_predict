@@ -8,6 +8,8 @@ import random
 from collections import defaultdict
 from typing import Any, cast
 
+from api.forecast.errors import ForecastInvalidInput
+
 ENGINE_VERSION = "phase_b_v1"
 SCORER_VERSION = "phase_b_scorer_v1"
 RANDOM_SEED = 0
@@ -16,6 +18,43 @@ DEFAULT_KAPPA_EVIDENCE = 1.0
 DEFAULT_KAPPA_CROSS_IMPACT = 1.0
 DEFAULT_CLAMP = 3.0
 DEFAULT_PERTURBATION_RUNS = 200
+
+
+def _parse_finite_float(
+    value: Any,
+    *,
+    field: str,
+    lo: float | None = None,
+    hi: float | None = None,
+) -> float:
+    """Parse *value* as float, reject non-finite results, and optionally validate range."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ForecastInvalidInput(
+            "invalid_numeric_field",
+            f"Field '{field}' could not be parsed as a number: {value!r}",
+            {"field": field, "value": repr(value)},
+        ) from exc
+    if not math.isfinite(result):
+        raise ForecastInvalidInput(
+            "non_finite_numeric_field",
+            f"Field '{field}' must be a finite number, got {result!r}",
+            {"field": field, "value": repr(value)},
+        )
+    if lo is not None and result < lo:
+        raise ForecastInvalidInput(
+            "numeric_field_out_of_range",
+            f"Field '{field}' must be >= {lo}, got {result!r}",
+            {"field": field, "value": repr(value), "lo": lo},
+        )
+    if hi is not None and result > hi:
+        raise ForecastInvalidInput(
+            "numeric_field_out_of_range",
+            f"Field '{field}' must be <= {hi}, got {result!r}",
+            {"field": field, "value": repr(value), "hi": hi},
+        )
+    return result
 
 
 def canonical_json_bytes(payload: dict[str, Any]) -> bytes:
@@ -46,21 +85,35 @@ def compute_phase_b_estimates(
     perturbation_runs: int | None = None,
 ) -> list[dict[str, Any]]:
     epsilon_floor = (
-        float(snapshot.get("epsilon_floor", DEFAULT_EPSILON_FLOOR))
+        _parse_finite_float(
+            snapshot.get("epsilon_floor", DEFAULT_EPSILON_FLOOR),
+            field="epsilon_floor",
+            lo=0.0,
+        )
         if epsilon_floor is None
         else epsilon_floor
     )
     kappa_evidence = (
-        float(snapshot.get("kappa_evidence", DEFAULT_KAPPA_EVIDENCE))
+        _parse_finite_float(
+            snapshot.get("kappa_evidence", DEFAULT_KAPPA_EVIDENCE),
+            field="kappa_evidence",
+        )
         if kappa_evidence is None
         else kappa_evidence
     )
     kappa_cross_impact = (
-        float(snapshot.get("kappa_cross_impact", DEFAULT_KAPPA_CROSS_IMPACT))
+        _parse_finite_float(
+            snapshot.get("kappa_cross_impact", DEFAULT_KAPPA_CROSS_IMPACT),
+            field="kappa_cross_impact",
+        )
         if kappa_cross_impact is None
         else kappa_cross_impact
     )
-    clamp = float(snapshot.get("clamp", DEFAULT_CLAMP)) if clamp is None else clamp
+    clamp = (
+        _parse_finite_float(snapshot.get("clamp", DEFAULT_CLAMP), field="clamp")
+        if clamp is None
+        else clamp
+    )
     random_seed = (
         int(snapshot.get("random_seed", RANDOM_SEED))
         if random_seed is None
@@ -235,7 +288,10 @@ def _analog_weights(snapshot: dict[str, Any]) -> dict[str, float]:
     weights: dict[str, float] = defaultdict(float)
     for event in snapshot.get("analog_events", []):
         if event.get("active", True):
-            weights[str(event["matched_outcome_id"])] += max(0.0, float(event["weight"]))
+            weights[str(event["matched_outcome_id"])] += max(
+                0.0,
+                _parse_finite_float(event["weight"], field="analog_event.weight"),
+            )
     return dict(weights)
 
 
@@ -250,9 +306,13 @@ def _evidence_delta(snapshot: dict[str, Any]) -> dict[str, float]:
             continue
         effective_direction = int(claim.get("polarity", 1)) * int(link["direction"])
         contribution = (
-            float(link["relevance_weight"])
-            * float(claim["evidence_strength"])
-            * float(claim["reliability_score"])
+            _parse_finite_float(link["relevance_weight"], field="relevance_weight", lo=0.0)
+            * _parse_finite_float(
+                claim["evidence_strength"], field="evidence_strength", lo=0.0, hi=1.0
+            )
+            * _parse_finite_float(
+                claim["reliability_score"], field="reliability_score", lo=0.0, hi=1.0
+            )
         )
         grouped[
             (
@@ -286,7 +346,7 @@ def _cross_impact_delta(
             else 1.0
         )
         delta[str(impact["target_outcome_id"])] += (
-            source_probability * float(impact["delta"])
+            source_probability * _parse_finite_float(impact["delta"], field="cross_impact.delta")
         )
     return dict(delta)
 
@@ -307,13 +367,21 @@ def _scenario_estimates(
     estimates: list[dict[str, Any]] = []
     for outcome_id, scenarios in scenarios_by_outcome.items():
         total_weight = math.fsum(
-            max(0.0, float(item.get("normalized_weight", 0.0)))
+            _parse_finite_float(
+                item.get("normalized_weight", 0.0),
+                field="normalized_weight",
+                lo=0.0,
+            )
             for item in scenarios
         )
         if total_weight <= 0:
             continue
         for scenario in scenarios:
-            weight = max(0.0, float(scenario.get("normalized_weight", 0.0)))
+            weight = _parse_finite_float(
+                scenario.get("normalized_weight", 0.0),
+                field="normalized_weight",
+                lo=0.0,
+            )
             probability = outcome_probabilities.get(outcome_id, 0.0) * weight / total_weight
             weight_share = weight / total_weight
             outcome_samples = outcome_probability_samples.get(outcome_id, [])
@@ -385,7 +453,11 @@ def _epsilon_softmax(logits: list[float], epsilon_floor: float) -> list[float]:
     if not logits:
         return []
     if len(logits) * epsilon_floor >= 1:
-        raise ValueError("K*epsilon_floor must be < 1.")
+        raise ForecastInvalidInput(
+            "epsilon_floor_too_large",
+            f"K*epsilon_floor must be < 1, got K={len(logits)} epsilon_floor={epsilon_floor}",
+            {"k": len(logits), "epsilon_floor": epsilon_floor},
+        )
     max_logit = max(logits)
     exps = [math.exp(value - max_logit) for value in logits]
     total = math.fsum(exps)

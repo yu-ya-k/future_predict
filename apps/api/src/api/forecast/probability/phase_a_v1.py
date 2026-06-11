@@ -7,12 +7,51 @@ import math
 from collections import defaultdict
 from typing import Any, cast
 
+from api.forecast.errors import ForecastInvalidInput
+
 ENGINE_VERSION = "phase_a_v1"
 SCORER_VERSION = "phase_a_scorer_v1"
 RANDOM_SEED = 0
 DEFAULT_EPSILON_FLOOR = 1e-9
 DEFAULT_KAPPA = 1.0
 DEFAULT_CLAMP = 3.0
+
+
+def _parse_finite_float(
+    value: Any,
+    *,
+    field: str,
+    lo: float | None = None,
+    hi: float | None = None,
+) -> float:
+    """Parse *value* as float, reject non-finite results, and optionally validate range."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ForecastInvalidInput(
+            "invalid_numeric_field",
+            f"Field '{field}' could not be parsed as a number: {value!r}",
+            {"field": field, "value": repr(value)},
+        ) from exc
+    if not math.isfinite(result):
+        raise ForecastInvalidInput(
+            "non_finite_numeric_field",
+            f"Field '{field}' must be a finite number, got {result!r}",
+            {"field": field, "value": repr(value)},
+        )
+    if lo is not None and result < lo:
+        raise ForecastInvalidInput(
+            "numeric_field_out_of_range",
+            f"Field '{field}' must be >= {lo}, got {result!r}",
+            {"field": field, "value": repr(value), "lo": lo},
+        )
+    if hi is not None and result > hi:
+        raise ForecastInvalidInput(
+            "numeric_field_out_of_range",
+            f"Field '{field}' must be <= {hi}, got {result!r}",
+            {"field": field, "value": repr(value), "hi": hi},
+        )
+    return result
 
 
 def canonical_json_bytes(payload: dict[str, Any]) -> bytes:
@@ -40,15 +79,23 @@ def compute_phase_a_estimates(
     clamp: float | None = None,
 ) -> list[dict[str, Any]]:
     epsilon_floor = (
-        float(snapshot.get("epsilon_floor", DEFAULT_EPSILON_FLOOR))
+        _parse_finite_float(
+            snapshot.get("epsilon_floor", DEFAULT_EPSILON_FLOOR),
+            field="epsilon_floor",
+            lo=0.0,
+        )
         if epsilon_floor is None
         else epsilon_floor
     )
     kappa = (
-        float(snapshot.get("kappa", DEFAULT_KAPPA)) if kappa is None else kappa
+        _parse_finite_float(snapshot.get("kappa", DEFAULT_KAPPA), field="kappa")
+        if kappa is None
+        else kappa
     )
     clamp = (
-        float(snapshot.get("clamp", DEFAULT_CLAMP)) if clamp is None else clamp
+        _parse_finite_float(snapshot.get("clamp", DEFAULT_CLAMP), field="clamp")
+        if clamp is None
+        else clamp
     )
 
     outcomes = snapshot["outcomes"]
@@ -64,9 +111,13 @@ def compute_phase_a_estimates(
         if claim is None:
             continue
         contribution = (
-            float(link["relevance_weight"])
-            * float(claim["evidence_strength"])
-            * float(claim["reliability_score"])
+            _parse_finite_float(link["relevance_weight"], field="relevance_weight", lo=0.0)
+            * _parse_finite_float(
+                claim["evidence_strength"], field="evidence_strength", lo=0.0, hi=1.0
+            )
+            * _parse_finite_float(
+                claim["reliability_score"], field="reliability_score", lo=0.0, hi=1.0
+            )
         )
         key = (
             str(claim["cluster_id"]),
@@ -174,7 +225,11 @@ def _epsilon_softmax(logits: list[float], epsilon_floor: float) -> list[float]:
     if not logits:
         return []
     if len(logits) * epsilon_floor >= 1:
-        raise ValueError("K*epsilon_floor must be < 1.")
+        raise ForecastInvalidInput(
+            "epsilon_floor_too_large",
+            f"K*epsilon_floor must be < 1, got K={len(logits)} epsilon_floor={epsilon_floor}",
+            {"k": len(logits), "epsilon_floor": epsilon_floor},
+        )
     max_logit = max(logits)
     exps = [math.exp(value - max_logit) for value in logits]
     total = math.fsum(exps)

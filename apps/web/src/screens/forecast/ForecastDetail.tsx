@@ -396,6 +396,12 @@ function packFlowMeta({
   }
 }
 
+/** Format a numeric value to fixed decimal places with a NaN / non-finite guard. */
+function formatNumber(value: number | undefined | null, decimals: number): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "-";
+  return value.toFixed(decimals);
+}
+
 function formatStartedAt(value: string | null | undefined): string | null {
   if (!value) return null;
   const date = new Date(value);
@@ -995,6 +1001,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   const manualPromptRequestId = useRef(0);
   const loadRequestId = useRef(0);
   const currentForecastIdRef = useRef(forecastId);
+  const lifecycleAbortRef = useRef<AbortController>(new AbortController());
   const manualReportFileInputRef = useRef<HTMLInputElement | null>(null);
   const manualPromptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   currentForecastIdRef.current = forecastId;
@@ -1010,8 +1017,20 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     resolve: stableKey(forecastId, "resolve"),
   });
 
+  // Refs that always hold the latest loaded estimate / projectionSet so the
+  // approve command can read the freshest value even from a stale closure.
+  const latestEstimateRef = useRef<EstimateSetResponse | null>(null);
+  const latestProjectionSetRef = useRef<ProjectionSetResponse | null>(null);
+
   useEffect(() => {
+    // Abort any in-flight requests from the previous forecastId and create a
+    // fresh controller for this one.  The cleanup also fires on unmount.
+    lifecycleAbortRef.current.abort();
+    lifecycleAbortRef.current = new AbortController();
+
     manualPromptRequestId.current += 1;
+    latestEstimateRef.current = null;
+    latestProjectionSetRef.current = null;
     setForecast(null);
     setEstimate(null);
     setProjectionSet(null);
@@ -1044,18 +1063,22 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       commit: stableKey(forecastId, "commit"),
       resolve: stableKey(forecastId, "resolve"),
     };
+    return () => {
+      lifecycleAbortRef.current.abort();
+    };
   }, [forecastId]);
 
   const load = useCallback(async () => {
     const requestId = loadRequestId.current + 1;
     loadRequestId.current = requestId;
     const requestForecastId = forecastId;
+    const signal = lifecycleAbortRef.current.signal;
     const isCurrentRequest = () =>
       loadRequestId.current === requestId &&
       currentForecastIdRef.current === requestForecastId;
 
     try {
-      const nextForecast = await getForecast(requestForecastId);
+      const nextForecast = await getForecast(requestForecastId, signal);
       if (!isCurrentRequest()) return;
 
       setForecast(nextForecast);
@@ -1063,8 +1086,9 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
         nextForecast.forecast_mode === "discrete_outcome" &&
         hasEstimateSet(nextForecast.status)
       ) {
-        const nextEstimate = await getForecastEstimateSet(requestForecastId);
+        const nextEstimate = await getForecastEstimateSet(requestForecastId, signal);
         if (!isCurrentRequest()) return;
+        latestEstimateRef.current = nextEstimate;
         setEstimate(nextEstimate);
         setProjectionSet(null);
       } else if (
@@ -1073,17 +1097,24 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       ) {
         const nextProjection =
           nextForecast.current_projection_set ??
-          (await getCurrentProjection(requestForecastId));
+          (await getCurrentProjection(requestForecastId, signal));
         if (!isCurrentRequest()) return;
+        latestProjectionSetRef.current = nextProjection;
         setProjectionSet(nextProjection);
         setEstimate(null);
       } else {
+        latestEstimateRef.current = null;
+        latestProjectionSetRef.current = null;
         setEstimate(null);
         setProjectionSet(null);
       }
 
       setError(null);
     } catch (err) {
+      // Aborted requests (forecastId change / unmount) re-throw the raw
+      // AbortError DOMException, which would otherwise surface as a spurious
+      // user-facing error.  Swallow it here so only genuine errors propagate.
+      if (err instanceof DOMException && err.name === "AbortError") return;
       if (isCurrentRequest()) throw err;
     }
   }, [forecastId]);
@@ -1191,22 +1222,44 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     }
   }, [forecast?.status]);
 
-  async function runStep(step: Command, fn: () => Promise<unknown>): Promise<boolean> {
+  async function runStep(
+    step: Command,
+    fn: (signal: AbortSignal) => Promise<unknown>,
+  ): Promise<boolean> {
+    const commandForecastId = currentForecastIdRef.current;
+    const signal = lifecycleAbortRef.current.signal;
     setBusyStartedAt(new Date(Date.now()));
     setBusy(step);
     setError(null);
     try {
-      const result = await fn();
+      const result = await fn(signal);
+      // Discard stale responses if the user navigated to a different forecast
+      // while the command was in flight.
+      if (signal.aborted || currentForecastIdRef.current !== commandForecastId) {
+        return false;
+      }
       if (step === "claimTargets") setClaimTargetsApproved(true);
-      if (step === "approve" && estimate) {
-        setApprovedEstimateSetId(estimate.estimate_set_id);
+      if (step === "approve") {
+        // Optimistic update: mark the estimate/projectionSet that was just
+        // approved so the UI doesn't wait for load() to reflect approval.
+        const approvedEstimate = latestEstimateRef.current;
+        const approvedProjection = latestProjectionSetRef.current;
+        if (approvedEstimate) {
+          setApprovedEstimateSetId(approvedEstimate.estimate_set_id);
+        } else if (approvedProjection) {
+          setApprovedEstimateSetId(approvedProjection.projection_set_id);
+        }
       }
       if (step === "compute") {
         if (forecast?.forecast_mode === "scenario_projection") {
-          setProjectionSet(result as ProjectionSetResponse);
+          const nextProjection = result as ProjectionSetResponse;
+          latestProjectionSetRef.current = nextProjection;
+          setProjectionSet(nextProjection);
           setEstimate(null);
         } else {
-          setEstimate(result as EstimateSetResponse);
+          const nextEstimate = result as EstimateSetResponse;
+          latestEstimateRef.current = nextEstimate;
+          setEstimate(nextEstimate);
           setProjectionSet(null);
         }
       }
@@ -1214,31 +1267,38 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       await load();
       return true;
     } catch (err) {
-      setError(formatForecastError(err));
+      if (!signal.aborted && currentForecastIdRef.current === commandForecastId) {
+        setError(formatForecastError(err));
+      }
       return false;
     } finally {
-      setBusy(null);
-      setBusyStartedAt(null);
+      if (currentForecastIdRef.current === commandForecastId) {
+        setBusy(null);
+        setBusyStartedAt(null);
+      }
     }
   }
 
   function runCommand(command: Command) {
     switch (command) {
       case "pack":
-        return runStep("pack", () =>
+        return runStep("pack", (signal) =>
           forecast?.forecast_mode === "scenario_projection"
             ? dispatchCurrentStatePack(forecastId, {
+                signal,
                 idempotencyKey: idempotencyKeys.current.pack,
               })
             : dispatchDefaultResearchPacks(forecastId, {
+                signal,
                 idempotencyKey: idempotencyKeys.current.pack,
               }),
         );
       case "manualPack":
         return Promise.resolve();
       case "evidence":
-        return runStep("evidence", () =>
+        return runStep("evidence", (signal) =>
           extractEvidence(forecastId, {
+            signal,
             idempotencyKey: idempotencyKeys.current.evidence,
           }),
         );
@@ -1246,8 +1306,9 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
         if (forecast?.forecast_mode === "scenario_projection") {
           return runCommand("compute");
         }
-        return runStep("scenarios", () =>
+        return runStep("scenarios", (signal) =>
           generateScenarios(forecastId, {
+            signal,
             idempotencyKey: idempotencyKeys.current.scenarios,
           }),
         );
@@ -1255,98 +1316,107 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
         if (forecast?.forecast_mode === "scenario_projection") {
           return runCommand("compute");
         }
-        return runStep("claimTargets", () =>
+        return runStep("claimTargets", (signal) =>
           reviewForecast(
             forecastId,
             { action: "approve_claim_target_links" },
-            { idempotencyKey: idempotencyKeys.current.claimTargets },
+            { signal, idempotencyKey: idempotencyKeys.current.claimTargets },
           ),
         );
       case "compute":
         if (forecast?.forecast_mode === "scenario_projection") {
-          return runStep("compute", () =>
+          return runStep("compute", (signal) =>
             computeProjection(forecastId, {
+              signal,
               idempotencyKey: idempotencyKeys.current.compute,
             }),
           );
         }
-        return runStep("compute", () =>
+        return runStep("compute", (signal) =>
           computeProbabilities(
             forecastId,
             { engine_version: probabilityEngine },
             {
+              signal,
               idempotencyKey: idempotencyKeys.current.compute,
             },
           ),
         );
       case "approve":
         if (forecast?.forecast_mode === "scenario_projection") {
-          if (!projectionSet) return Promise.resolve();
-          return runStep("approve", () =>
+          // Read from the ref so we always use the freshest loaded projection,
+          // not a stale closure-captured value.
+          const currentProjection = latestProjectionSetRef.current;
+          if (!currentProjection) return Promise.resolve();
+          return runStep("approve", (signal) =>
             approveProjection(
               forecastId,
-              projectionSet.projection_set_id,
-              { idempotencyKey: idempotencyKeys.current.approve },
+              currentProjection.projection_set_id,
+              { signal, idempotencyKey: idempotencyKeys.current.approve },
             ),
           );
         }
-        if (!estimate) return Promise.resolve();
-        if (!estimate.estimate_set_id) return Promise.resolve();
-        if (
-          estimate.engine_version !== "phase_a_v1" &&
-          estimate.engine_version !== "phase_b_v1"
-        ) {
-          return Promise.resolve();
+        {
+          // Read from the ref for the same reason — avoids stale closure.
+          const currentEstimate = latestEstimateRef.current;
+          if (!currentEstimate) return Promise.resolve();
+          if (!currentEstimate.estimate_set_id) return Promise.resolve();
+          if (
+            currentEstimate.engine_version !== "phase_a_v1" &&
+            currentEstimate.engine_version !== "phase_b_v1"
+          ) {
+            return Promise.resolve();
+          }
+          return runStep("approve", (signal) =>
+            reviewForecast(
+              forecastId,
+              currentEstimate.engine_version === "phase_b_v1"
+                ? {
+                    action: "approve_probability_publication",
+                    estimate_set_id: currentEstimate.estimate_set_id,
+                  }
+                : {
+                    action: "approve_phase_a_version",
+                    estimate_set_id: currentEstimate.estimate_set_id,
+                  },
+              { signal, idempotencyKey: idempotencyKeys.current.approve },
+            ),
+          );
         }
-        return runStep("approve", () =>
-          reviewForecast(
-            forecastId,
-            estimate.engine_version === "phase_b_v1"
-              ? {
-                  action: "approve_probability_publication",
-                  estimate_set_id: estimate.estimate_set_id,
-                }
-              : {
-                  action: "approve_phase_a_version",
-                  estimate_set_id: estimate.estimate_set_id,
-                },
-            { idempotencyKey: idempotencyKeys.current.approve },
-          ),
-        );
       case "commit":
         if (forecast?.forecast_mode === "scenario_projection") {
           if (!projectionSet) return Promise.resolve();
-          return runStep("commit", () =>
+          return runStep("commit", (signal) =>
             commitForecastVersion(
               forecastId,
               {
                 projection_set_id: projectionSet.projection_set_id,
                 expected_input_snapshot_hash: projectionSet.input_snapshot_hash,
               },
-              { idempotencyKey: idempotencyKeys.current.commit },
+              { signal, idempotencyKey: idempotencyKeys.current.commit },
             ),
           );
         }
         if (!estimate) return Promise.resolve();
-        return runStep("commit", () =>
+        return runStep("commit", (signal) =>
           commitForecastVersion(
             forecastId,
             {
               estimate_set_id: estimate.estimate_set_id,
               expected_input_snapshot_hash: estimate.input_snapshot_hash,
             },
-            { idempotencyKey: idempotencyKeys.current.commit },
+            { signal, idempotencyKey: idempotencyKeys.current.commit },
           ),
         );
       case "resolve":
-        return runStep("resolve", () =>
+        return runStep("resolve", (signal) =>
           resolveForecast(
             forecastId,
             {
               outcome_id: selectedOutcomeId,
               resolution_notes: resolutionNotes.trim() || null,
             },
-            { idempotencyKey: idempotencyKeys.current.resolve },
+            { signal, idempotencyKey: idempotencyKeys.current.resolve },
           ),
         );
     }
@@ -1444,7 +1514,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
               />
               <MetricCard
                 label="Snapshot"
-                value={projectionSet.input_snapshot_hash.slice(0, 12)}
+                value={(projectionSet.input_snapshot_hash ?? "").slice(0, 12) || "-"}
                 unit="input hash"
               />
             </div>
@@ -1464,9 +1534,9 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
                     <tr key={item.composite_id}>
                       <th>{item.metric_id}</th>
                       <td>{item.horizon_year}</td>
-                      <td>{item.p10.toFixed(2)}</td>
-                      <td>{item.p50.toFixed(2)}</td>
-                      <td>{item.p90.toFixed(2)}</td>
+                      <td>{formatNumber(item.p10, 2)}</td>
+                      <td>{formatNumber(item.p50, 2)}</td>
+                      <td>{formatNumber(item.p90, 2)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -1478,7 +1548,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
                   <p className="run-card-title">{scenario.label}</p>
                   <p>{scenario.narrative}</p>
                   <p className="run-card-meta">
-                    {(scenario.probability * 100).toFixed(1)}% /{" "}
+                    {formatNumber(scenario.probability * 100, 1)}% /{" "}
                     {scenario.coverage_role}
                   </p>
                 </article>
@@ -1490,8 +1560,8 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
                   <article className="run-card" key={item.sensitivity_id}>
                     <p className="run-card-title">{item.sensitivity_kind}</p>
                     <p className="run-card-meta">
-                      delta P50 {item.delta_p50.toFixed(2)} / delta probability{" "}
-                      {item.delta_probability.toFixed(3)}
+                      delta P50 {formatNumber(item.delta_p50, 2)} / delta probability{" "}
+                      {formatNumber(item.delta_probability, 3)}
                     </p>
                   </article>
                 ))}
@@ -1523,14 +1593,15 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       manualReportFile !== null
         ? { source: "file" as const, file: manualReportFile }
         : { source: "text" as const, text };
-    const imported = await runStep("manualPack", () =>
+    const capturedPrompt = manualPrompt;
+    const imported = await runStep("manualPack", (signal) =>
       importManualResearchPack(
         forecastId,
         {
-          promptSha256: manualPrompt.prompt_sha256,
+          promptSha256: capturedPrompt.prompt_sha256,
           report,
         },
-        { idempotencyKey: idempotencyKeys.current.manualPack },
+        { signal, idempotencyKey: idempotencyKeys.current.manualPack },
       ),
     );
     if (imported) {
@@ -1550,12 +1621,12 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     ) {
       return;
     }
-    void runStep("pack", () =>
+    void runStep("pack", (signal) =>
       rerunForecastResearchPack(
         forecastId,
         pack.pack_id,
         { expected_active_pack_id: pack.pack_id },
-        { idempotencyKey: stableKey(forecastId, "pack") },
+        { signal, idempotencyKey: stableKey(forecastId, "pack") },
       ),
     );
   }
@@ -1588,7 +1659,11 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       estimate &&
         (estimate.approved || approvedEstimateSetId === estimate.estimate_set_id),
     ) ||
-    Boolean(projectionSet?.approved);
+    Boolean(
+      projectionSet &&
+        (projectionSet.approved ||
+          approvedEstimateSetId === projectionSet.projection_set_id),
+    );
   const canApproveClaimTargets =
     !isProjectionForecast && status === "scenarios_ready" && !effectiveClaimTargetsApproved;
   const canCompute = isProjectionForecast

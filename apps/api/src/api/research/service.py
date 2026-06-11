@@ -2470,6 +2470,8 @@ class ResearchOrchestrator:
         _review_claim_token: str,
     ) -> ResearchRunRecord:
         run = self.repository.get_run(run_id)
+        if run.status != RunStatus.REVIEWING:
+            return run
         latest_review = self._latest_review(run.id)
         target_items = _target_item_ids_for_action(
             latest_review,
@@ -2560,6 +2562,32 @@ class ResearchOrchestrator:
                 done_reason="verification_failed",
                 allowed_statuses={RunStatus.REVIEWING},
             )
+
+        latest_run = self.repository.get_run(run.id)
+        if latest_run.status != RunStatus.REVIEWING or latest_run.needs_human_review:
+            if raw_response:
+                self.artifacts.save_json(
+                    run.id,
+                    f"raw-responses/verification_resp_ignored_{run_no:03d}.json",
+                    raw_response,
+                )
+                self._record_review_response_cost(
+                    run_id=latest_run.id,
+                    response_id=response_id,
+                    raw_response=raw_response,
+                    step="verification_ignored",
+                )
+            self.repository.append_history_event(
+                latest_run.id,
+                {
+                    "step": "verification_ignored_status_changed",
+                    "status": latest_run.status.value,
+                    "needs_human_review": latest_run.needs_human_review,
+                    "response_id": response_id,
+                },
+            )
+            return latest_run
+        run = latest_run
 
         verification_tool_calls = extract_tool_calls(raw_response)
         verification_citations = extract_citations(raw_response)
