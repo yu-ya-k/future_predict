@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from secrets import compare_digest
 from typing import Annotated
@@ -11,6 +12,8 @@ from api.research.artifacts import ArtifactStore
 from api.research.azure_responses import AzureResponsesClient
 from api.research.repository import ResearchRepository
 from api.research.service import ResearchOrchestrator
+
+log = logging.getLogger(__name__)
 
 ApiKeyHeader = Annotated[str | None, Header(alias="X-API-Key")]
 AuthorizationHeader = Annotated[str | None, Header()]
@@ -47,8 +50,21 @@ def require_research_api_key(
     x_api_key: ApiKeyHeader = None,
     authorization: AuthorizationHeader = None,
 ) -> None:
-    expected_key = get_settings().research_api_key.strip()
+    settings = get_settings()
+    expected_key = settings.research_api_key.strip()
     if not expected_key:
+        if settings.app_env.strip().lower() != "development":
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "API authentication is not configured. "
+                    "Set RESEARCH_API_KEY to a non-empty value."
+                ),
+            )
+        log.warning(
+            "RESEARCH_API_KEY is not set — authentication is disabled. "
+            "This is only acceptable in development."
+        )
         return
     expected_key_bytes = expected_key.encode("utf-8")
 

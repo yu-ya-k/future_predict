@@ -19,6 +19,7 @@ import type {
   ForecastFramingDraft,
   ForecastFramingDraftClarifyingQuestion,
   ForecastFramingDraftResponse,
+  ProjectionSetResponse,
 } from "../../types";
 
 Object.defineProperty(window, "scrollTo", { value: vi.fn(), writable: true });
@@ -60,6 +61,7 @@ function forecastDetail(
 ): ForecastDetail {
   return {
     forecast_id: "forecast-1",
+    forecast_mode: "discrete_outcome",
     question: "Will the product launch by Q4?",
     status: "framing_pending",
     resolution_date: null,
@@ -79,6 +81,8 @@ function forecastDetail(
     current_research_pack: null,
     current_research_pack_status: null,
     approved_claim_target_link_count: 0,
+    projection_dimensions: [],
+    current_projection_set: null,
     outcomes: [
       {
         outcome_id: "outcome-yes",
@@ -140,6 +144,99 @@ function estimateSet(
     ],
     ...overrides,
   };
+}
+
+function projectionSet(
+  overrides: Partial<ProjectionSetResponse> = {},
+): ProjectionSetResponse {
+  return {
+    projection_set_id: "projection-set-1",
+    forecast_id: "forecast-1",
+    status: "draft",
+    approved: false,
+    engine_version: "phase_c_v1",
+    input_snapshot_hash: "projection-snapshot-hash-1",
+    engine_code_hash: "projection-engine-hash-1",
+    random_seed: 0,
+    snapshot_artifact_path: null,
+    scenarios: [
+      {
+        projection_scenario_id: "projection-scenario-1",
+        projection_set_id: "projection-set-1",
+        label: "Base case",
+        description: "Reference scenario.",
+        coverage_role: "base",
+        residual_flag: false,
+        probability: 0.62,
+        probability_logit: 0,
+        driver_vector: {},
+        narrative: "Reference projection narrative.",
+        validity_status: "valid",
+      },
+    ],
+    metric_points: [
+      {
+        metric_point_id: "metric-point-1",
+        projection_set_id: "projection-set-1",
+        projection_scenario_id: "projection-scenario-1",
+        dimension_id: "dimension-1",
+        metric_id: "market_share",
+        horizon_year: 2035,
+        p10: 12,
+        p50: 24,
+        p90: 36,
+        mean: 24,
+        distribution_family: "triangular",
+        distribution_params: {},
+        baseline_transform: "absolute",
+      },
+    ],
+    composites: [
+      {
+        composite_id: "composite-1",
+        projection_set_id: "projection-set-1",
+        dimension_id: "dimension-1",
+        metric_id: "market_share",
+        horizon_year: 2035,
+        p10: 12,
+        p50: 24,
+        p90: 36,
+        mean: 24,
+        mixture_components: [],
+      },
+    ],
+    sensitivities: [],
+    ...overrides,
+  };
+}
+
+function projectionForecastDetail(
+  overrides: Partial<ForecastDetail> = {},
+): ForecastDetail {
+  return forecastDetail({
+    forecast_mode: "scenario_projection",
+    outcomes: [],
+    approved_claim_target_link_count: 0,
+    projection_dimensions: [
+      {
+        dimension_id: "dimension-1",
+        forecast_id: "forecast-1",
+        framing_version: 1,
+        metric_id: "market_share",
+        label: "Market share",
+        unit: "%",
+        value_type: "percentage",
+        baseline_year: 2026,
+        baseline_value: 10,
+        baseline_source_ids: [],
+        horizons: [2035],
+        sort_order: 0,
+        frozen: true,
+      },
+    ],
+    current_projection_set: null,
+    ...overrides,
+  });
 }
 
 function currentResearchPack(
@@ -384,6 +481,91 @@ describe("Forecast UI", () => {
         name: "Forecastメタデータの不足確認",
       }),
     ).not.toBeInTheDocument();
+  });
+
+  it("requires manually entered projection dimensions before creating a PhaseC forecast", async () => {
+    window.location.hash = "#/forecasts/new";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (path === "/forecasts/framing-drafts" && init?.method === "POST") {
+          return jsonResponse(framingDraft({ ready_to_create: true }));
+        }
+        if (path === "/forecasts" && init?.method === "POST") {
+          const body = JSON.parse(String(init.body));
+          expect(body).toMatchObject({
+            forecast_mode: "scenario_projection",
+            outcomes: [],
+            projection_dimensions: [
+              {
+                metric_id: "market_share",
+                label: "Market share",
+                unit: "%",
+                value_type: "number",
+                baseline_year: 2026,
+                baseline_value: 10,
+                horizons: [2030, 2035],
+              },
+            ],
+          });
+          return jsonResponse({
+            forecast_id: "forecast-1",
+            status: "framing_pending",
+            forecast_mode: "scenario_projection",
+            framing_version: 1,
+            created_at: "2026-06-08T00:00:00Z",
+          });
+        }
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            projectionForecastDetail({
+              status: "framing_pending",
+              question: "Will the product launch by Q4?",
+            }),
+          );
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.type(
+      screen.getByRole("textbox", { name: /予測したいこと/ }),
+      "Project market share through 2035.",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "AIでForecast案を作成" }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "保存前のフレーミング確認" }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "PhaseC" }));
+    const createButton = screen.getByRole("button", { name: "Forecastを作成" });
+    expect(screen.getByLabelText("Metric ID")).toHaveValue("");
+    expect(createButton).toBeDisabled();
+    expect(
+      screen.getByText(/Projection dimension の metric、baseline、horizon/),
+    ).toBeInTheDocument();
+
+    await userEvent.type(screen.getByLabelText("Metric ID"), "market_share");
+    await userEvent.type(screen.getByLabelText("Label"), "Market share");
+    await userEvent.type(screen.getByLabelText("Unit"), "%");
+    await userEvent.type(screen.getByLabelText("Baseline year"), "2026");
+    await userEvent.type(screen.getByLabelText("Baseline value"), "10");
+    await userEvent.type(screen.getByLabelText("Horizons"), "2030\n2035");
+    expect(createButton).toBeEnabled();
+
+    await userEvent.click(createButton);
+
+    expect(
+      await screen.findByRole("heading", { name: "保存済みプレビュー" }),
+    ).toBeInTheDocument();
   });
 
   it("describes same-label clarifying answer fields with their prompt and rationale", async () => {
@@ -1519,6 +1701,68 @@ describe("Forecast UI", () => {
           init?.method === "POST",
       ),
     ).toBe(false);
+  });
+
+  it("submits only the current_state pack for scenario projection forecasts", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            projectionForecastDetail({
+              status: "framing_approved",
+              approved_framing_version: 1,
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/research-packs" &&
+          init?.method === "POST"
+        ) {
+          expect(JSON.parse(String(init.body))).toEqual({
+            pack_role: "current_state",
+            tool_profile: "public",
+          });
+          return jsonResponse({
+            pack_id: "pack-current",
+            forecast_id: "forecast-1",
+            research_run_id: "run-current",
+            pack_role: "current_state",
+            tool_profile: "public",
+            status: "running",
+            policy_decision_id: "policy-1",
+          });
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "current_state Packを開始" }),
+    );
+
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) =>
+          String(url).endsWith("/forecasts/forecast-1/research-packs") &&
+          init?.method === "POST",
+      ),
+    ).toBe(true);
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) =>
+          String(url).endsWith("/forecasts/forecast-1/research-packs/defaults") &&
+          init?.method === "POST",
+      ),
+    ).toBe(false);
+    expect(screen.queryByRole("button", { name: "5 Packを開始" })).toBeNull();
   });
 
   it("does not unlock evidence extraction until all active PhaseB default packs complete", async () => {
@@ -3748,6 +3992,181 @@ describe("Forecast UI", () => {
     ).toBe(false);
     // No navigation occurred away from the detail route.
     expect(window.location.hash).toBe("#/forecasts/forecast-1");
+  });
+
+  it("uses projection endpoints and payloads for scenario projection draft approval and commit", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    let status: ForecastDetail["status"] = "evidence_ready";
+    let currentProjection: ProjectionSetResponse | null = null;
+    let projectionApproved = false;
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            projectionForecastDetail({
+              status,
+              approved_framing_version: 1,
+              current_research_pack: phaseBResearchPack("current_state"),
+              current_research_pack_status: "completed",
+              current_projection_set: currentProjection
+                ? projectionSet({
+                    ...currentProjection,
+                    approved: projectionApproved,
+                  })
+                : null,
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/projections/compute" &&
+          init?.method === "POST"
+        ) {
+          expect(JSON.parse(String(init.body))).toEqual({});
+          status = "draft_ready";
+          currentProjection = projectionSet();
+          return jsonResponse(currentProjection);
+        }
+        if (
+          path === "/forecasts/forecast-1/projections/projection-set-1/approve" &&
+          init?.method === "POST"
+        ) {
+          projectionApproved = true;
+          return jsonResponse({
+            forecast_id: "forecast-1",
+            action: "approve_projection_publication",
+            status: "draft_ready",
+            projection_set_id: "projection-set-1",
+          });
+        }
+        if (
+          path === "/forecasts/forecast-1/versions/commit" &&
+          init?.method === "POST"
+        ) {
+          expect(projectionApproved).toBe(true);
+          expect(JSON.parse(String(init.body))).toEqual({
+            projection_set_id: "projection-set-1",
+            expected_input_snapshot_hash: "projection-snapshot-hash-1",
+          });
+          status = "committed";
+          return jsonResponse({
+            version_id: "version-1",
+            forecast_id: "forecast-1",
+            version_kind: "projection",
+            projection_set_id: "projection-set-1",
+            estimate_set_id: null,
+            input_snapshot_hash: "projection-snapshot-hash-1",
+            snapshot_artifact_path: ".data/forecast-runs/version-1.json",
+            committed_at: "2026-06-08T01:00:00Z",
+          });
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    const computeButton = await screen.findByRole("button", {
+      name: "Projectionを作成",
+    });
+    expect(computeButton).toBeEnabled();
+    await userEvent.click(computeButton);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Projection公開の承認待ちです",
+      }),
+    ).toBeInTheDocument();
+    const projectionTable = screen.getByRole("table");
+    expect(projectionTable.parentElement).toHaveClass("forecast-impact-scroll");
+    expect(
+      screen.getByRole("button", { name: "Projection公開を承認" }),
+    ).toBeEnabled();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Projection公開を承認" }),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "予測版を確定" })).toBeEnabled(),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "予測版を確定" }));
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([url, init]) =>
+            String(url).endsWith("/forecasts/forecast-1/versions/commit") &&
+            init?.method === "POST",
+        ),
+      ).toBe(true),
+    );
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) =>
+          String(url).endsWith("/forecasts/forecast-1/probabilities/compute") &&
+          init?.method === "POST",
+      ),
+    ).toBe(false);
+    expect(
+      fetchMock.mock.calls.some(
+        ([url]) => String(url).endsWith("/forecasts/forecast-1/estimate-set"),
+      ),
+    ).toBe(false);
+    expect(
+      fetchMock.mock.calls.some(
+        ([url]) => String(url).endsWith("/forecasts/forecast-1/projections/current"),
+      ),
+    ).toBe(false);
+  });
+
+  it("loads a scenario projection draft from the current projection endpoint when it is not embedded", async () => {
+    window.location.hash = "#/forecasts/forecast-1";
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const path = String(url).replace("http://localhost:8000", "");
+        if (
+          path === "/forecasts/forecast-1" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(
+            projectionForecastDetail({
+              status: "draft_ready",
+              approved_framing_version: 1,
+              current_projection_set: null,
+            }),
+          );
+        }
+        if (
+          path === "/forecasts/forecast-1/projections/current" &&
+          (!init || init.method === "GET")
+        ) {
+          return jsonResponse(projectionSet({ approved: true }));
+        }
+        return jsonResponse({ detail: "unexpected request" }, 500);
+      },
+    );
+    globalThis.fetch = fetchMock;
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "予測版を確定できます" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("projection-s")).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(
+        ([url]) => String(url).endsWith("/forecasts/forecast-1/projections/current"),
+      ),
+    ).toBe(true);
+    expect(
+      fetchMock.mock.calls.some(
+        ([url]) => String(url).endsWith("/forecasts/forecast-1/estimate-set"),
+      ),
+    ).toBe(false);
   });
 
   it("enables commit only after PhaseA approval", async () => {

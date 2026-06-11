@@ -4,11 +4,15 @@ import "./forecast.css";
 import {
   commitForecastVersion,
   computeProbabilities,
+  computeProjection,
+  dispatchCurrentStatePack,
   dispatchDefaultResearchPacks,
   extractEvidence,
   generateScenarios,
+  approveProjection,
   getForecast,
   getForecastEstimateSet,
+  getCurrentProjection,
   getManualResearchPackPrompt,
   importManualResearchPack,
   rerunForecastResearchPack,
@@ -25,6 +29,7 @@ import type {
   ForecastDetail as ForecastDetailType,
   ForecastPackRole,
   ManualResearchPackPromptResponse,
+  ProjectionSetResponse,
   ForecastStatus,
   ResolveForecastResponse,
 } from "../../types";
@@ -257,15 +262,18 @@ interface ForecastProgressModel {
 function deriveForecastProgress(
   forecast: ForecastDetailType | null,
 ): ForecastProgressModel {
+  const isProjectionForecast = forecast?.forecast_mode === "scenario_projection";
   const packs = uniqueForecastPacks(forecast);
   const activePacks = packs.filter((pack) => pack.is_active !== false);
   const activeDefaultPacksByRole = activeDefaultPackByRole(activePacks);
-  const phaseBStarted = DEFAULT_PACK_ROLES.some(
-    (role) => role !== "current_state" && activeDefaultPacksByRole.has(role),
-  );
-  const phaseBDefaultSetPresent = DEFAULT_PACK_ROLES.every((role) =>
-    activeDefaultPacksByRole.has(role),
-  );
+  const phaseBStarted =
+    !isProjectionForecast &&
+    DEFAULT_PACK_ROLES.some(
+      (role) => role !== "current_state" && activeDefaultPacksByRole.has(role),
+    );
+  const phaseBDefaultSetPresent =
+    !isProjectionForecast &&
+    DEFAULT_PACK_ROLES.every((role) => activeDefaultPacksByRole.has(role));
   const missingDefaultRoles = phaseBStarted
     ? DEFAULT_PACK_ROLES.filter((role) => !activeDefaultPacksByRole.has(role))
     : [];
@@ -340,7 +348,7 @@ function deriveForecastProgress(
     researchPackSubmitWaiting: anyWaiting,
     researchPackSubmitStalled,
     shouldPoll: anyRunning || anySubmitting || anyWaiting,
-    shouldUsePhaseBEngine: phaseBDefaultSetPresent,
+    shouldUsePhaseBEngine: !isProjectionForecast && phaseBDefaultSetPresent,
   };
 }
 
@@ -388,6 +396,12 @@ function packFlowMeta({
   }
 }
 
+/** Format a numeric value to fixed decimal places with a NaN / non-finite guard. */
+function formatNumber(value: number | undefined | null, decimals: number): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "-";
+  return value.toFixed(decimals);
+}
+
 function formatStartedAt(value: string | null | undefined): string | null {
   if (!value) return null;
   const date = new Date(value);
@@ -424,6 +438,7 @@ function deriveCurrentStep({
   estimatePresent,
   probabilityEngine,
   isPhaseBEstimate,
+  isProjectionForecast,
 }: {
   status: ForecastStatus | undefined;
   currentResearchPackStatus: string | null | undefined;
@@ -450,6 +465,7 @@ function deriveCurrentStep({
   estimatePresent: boolean;
   probabilityEngine: "phase_a_v1" | "phase_b_v1";
   isPhaseBEstimate: boolean;
+  isProjectionForecast: boolean;
 }): CurrentStepModel {
   if (!status) {
     return {
@@ -611,30 +627,52 @@ function deriveCurrentStep({
 
   if (canCompute || canRestoreDraft) {
     return {
-      title: canRestoreDraft ? "推定値を復元できます" : "確率計算の準備ができました",
+      title: canRestoreDraft
+        ? isProjectionForecast
+          ? "Projection下書きを復元できます"
+          : "推定値を復元できます"
+        : isProjectionForecast
+          ? "Projection作成の準備ができました"
+          : "確率計算の準備ができました",
       description: canRestoreDraft
-        ? "保存済みの下書き推定値を読み込みます。"
-        : `承認済みの対応関係をもとに、${probabilityEngine}で確率を計算します。`,
+        ? isProjectionForecast
+          ? "保存済みのProjection下書きを読み込みます。"
+          : "保存済みの下書き推定値を読み込みます。"
+        : isProjectionForecast
+          ? "抽出済みの公開情報から、シナリオ別の指標レンジを作成します。"
+          : `承認済みの対応関係をもとに、${probabilityEngine}で確率を計算します。`,
       stateLabel: canRestoreDraft ? "復元可能" : "計算可能",
       tone: "ready",
       action: "compute",
-      actionLabel: canRestoreDraft ? "推定値を復元" : "確率を計算",
+      actionLabel: canRestoreDraft
+        ? isProjectionForecast
+          ? "Projectionを復元"
+          : "推定値を復元"
+        : isProjectionForecast
+          ? "Projectionを作成"
+          : "確率を計算",
     };
   }
 
   if (canApproveEstimate) {
     return {
-      title: isPhaseBEstimate
+      title: isProjectionForecast
+        ? "Projection公開の承認待ちです"
+        : isPhaseBEstimate
         ? "確率公開の承認待ちです"
         : "推定結果の承認待ちです",
-      description: isPhaseBEstimate
+      description: isProjectionForecast
+        ? "シナリオと指標レンジを確認し、問題なければ公開承認できます。"
+        : isPhaseBEstimate
         ? "下の推定結果を確認し、問題なければ公開承認できます。"
         : "下の推定結果を確認し、問題なければこのまま承認できます。",
       stateLabel: "承認待ち",
       tone: "ready",
       action: estimatePresent ? "approve" : null,
       actionLabel: estimatePresent
-        ? isPhaseBEstimate
+        ? isProjectionForecast
+          ? "Projection公開を承認"
+          : isPhaseBEstimate
           ? "確率公開を承認"
           : "推定結果を承認"
         : undefined,
@@ -644,7 +682,9 @@ function deriveCurrentStep({
   if (canCommit) {
     return {
       title: "予測版を確定できます",
-      description: "承認済みの推定結果を、Forecastの確定版として保存します。",
+      description: isProjectionForecast
+        ? "承認済みのProjectionを、Forecastの確定版として保存します。"
+        : "承認済みの推定結果を、Forecastの確定版として保存します。",
       stateLabel: "確定待ち",
       tone: "ready",
       action: estimatePresent ? "commit" : null,
@@ -712,6 +752,7 @@ function forecastExecutionNodes({
   busy,
   probabilityEngine,
   isPhaseBEstimate,
+  isProjectionForecast,
 }: {
   status: ForecastStatus | undefined;
   approvedFraming: boolean;
@@ -731,9 +772,88 @@ function forecastExecutionNodes({
   busy: Command | null;
   probabilityEngine: "phase_a_v1" | "phase_b_v1";
   isPhaseBEstimate: boolean;
+  isProjectionForecast: boolean;
 }): ForecastFlowNode[] {
   const isResolved = status === "resolved";
   const estimateReady = hasEstimate || statusAtLeast(status, "draft_ready");
+  if (isProjectionForecast) {
+    return [
+      {
+        id: "framing",
+        title: "フレーミング承認",
+        meta: approvedFraming ? "保存済み前提を承認済み" : "保存済み前提の承認待ち",
+        status: flowStatus({
+          done: approvedFraming || statusAtLeast(status, "framing_approved"),
+          active: status === "framing_pending",
+        }),
+        tone: "brief",
+      },
+      {
+        id: "pack",
+        title: "公開情報の収集",
+        meta: researchPackCompleted
+          ? "current_state Pack完了"
+          : researchPackRunning
+            ? "current_state Packを収集中"
+            : "current_state Pack",
+        status: flowStatus({
+          done: researchPackCompleted || statusAtLeast(status, "evidence_ready"),
+          active: researchPackRunning,
+          submitting: researchPackSubmitting || researchPackSubmitWaiting || packSubmissionPending,
+          blocked: researchPackBlocked,
+          available: status === "framing_approved",
+        }),
+        statusLabel: researchPackSubmitWaiting ? "Deep Research送信待ち" : undefined,
+        tone: "research",
+      },
+      {
+        id: "evidence",
+        title: "証拠を抽出",
+        meta: "公開情報からProjection入力を抽出",
+        status: flowStatus({
+          done: statusAtLeast(status, "evidence_ready"),
+          active: busy === "evidence",
+          available: status === "pack_running" && researchPackCompleted,
+        }),
+        tone: "review",
+      },
+      {
+        id: "compute",
+        title: "Projectionを作成",
+        meta: estimateReady ? "下書きProjectionあり" : "phase_c_v1で作成",
+        status: flowStatus({
+          done: estimateReady,
+          active: busy === "compute",
+          available: status === "evidence_ready",
+        }),
+        tone: "verify",
+      },
+      {
+        id: "approve-estimate",
+        title: "Projection公開を承認",
+        meta: estimateApproved ? "Projection承認済み" : "シナリオと指標レンジの確認待ち",
+        status: flowStatus({
+          done: estimateApproved || statusAtLeast(status, "committed"),
+          active: busy === "approve",
+          available: status === "draft_ready" && estimateReady && !estimateApproved,
+        }),
+        tone: "review",
+      },
+      {
+        id: "commit",
+        title: "予測版を確定",
+        meta: statusAtLeast(status, "committed")
+          ? "バージョン固定済み"
+          : "承認済みProjectionをバージョン化",
+        status: flowStatus({
+          done: statusAtLeast(status, "committed"),
+          active: busy === "commit",
+          available: status === "draft_ready" && estimateApproved,
+        }),
+        tone: "finalize",
+      },
+    ];
+  }
   return [
     {
       id: "framing",
@@ -858,6 +978,7 @@ function forecastExecutionNodes({
 export function ForecastDetail({ forecastId }: { forecastId: string }) {
   const [forecast, setForecast] = useState<ForecastDetailType | null>(null);
   const [estimate, setEstimate] = useState<EstimateSetResponse | null>(null);
+  const [projectionSet, setProjectionSet] = useState<ProjectionSetResponse | null>(null);
   const [claimTargetsApproved, setClaimTargetsApproved] = useState(false);
   const [approvedEstimateSetId, setApprovedEstimateSetId] = useState<string | null>(null);
   const [resolution, setResolution] = useState<ResolveForecastResponse | null>(null);
@@ -880,6 +1001,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
   const manualPromptRequestId = useRef(0);
   const loadRequestId = useRef(0);
   const currentForecastIdRef = useRef(forecastId);
+  const lifecycleAbortRef = useRef<AbortController>(new AbortController());
   const manualReportFileInputRef = useRef<HTMLInputElement | null>(null);
   const manualPromptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   currentForecastIdRef.current = forecastId;
@@ -895,10 +1017,23 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     resolve: stableKey(forecastId, "resolve"),
   });
 
+  // Refs that always hold the latest loaded estimate / projectionSet so the
+  // approve command can read the freshest value even from a stale closure.
+  const latestEstimateRef = useRef<EstimateSetResponse | null>(null);
+  const latestProjectionSetRef = useRef<ProjectionSetResponse | null>(null);
+
   useEffect(() => {
+    // Abort any in-flight requests from the previous forecastId and create a
+    // fresh controller for this one.  The cleanup also fires on unmount.
+    lifecycleAbortRef.current.abort();
+    lifecycleAbortRef.current = new AbortController();
+
     manualPromptRequestId.current += 1;
+    latestEstimateRef.current = null;
+    latestProjectionSetRef.current = null;
     setForecast(null);
     setEstimate(null);
+    setProjectionSet(null);
     setClaimTargetsApproved(false);
     setApprovedEstimateSetId(null);
     setResolution(null);
@@ -928,31 +1063,58 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       commit: stableKey(forecastId, "commit"),
       resolve: stableKey(forecastId, "resolve"),
     };
+    return () => {
+      lifecycleAbortRef.current.abort();
+    };
   }, [forecastId]);
 
   const load = useCallback(async () => {
     const requestId = loadRequestId.current + 1;
     loadRequestId.current = requestId;
     const requestForecastId = forecastId;
+    const signal = lifecycleAbortRef.current.signal;
     const isCurrentRequest = () =>
       loadRequestId.current === requestId &&
       currentForecastIdRef.current === requestForecastId;
 
     try {
-      const nextForecast = await getForecast(requestForecastId);
+      const nextForecast = await getForecast(requestForecastId, signal);
       if (!isCurrentRequest()) return;
 
       setForecast(nextForecast);
-      if (hasEstimateSet(nextForecast.status)) {
-        const nextEstimate = await getForecastEstimateSet(requestForecastId);
+      if (
+        nextForecast.forecast_mode === "discrete_outcome" &&
+        hasEstimateSet(nextForecast.status)
+      ) {
+        const nextEstimate = await getForecastEstimateSet(requestForecastId, signal);
         if (!isCurrentRequest()) return;
+        latestEstimateRef.current = nextEstimate;
         setEstimate(nextEstimate);
-      } else {
+        setProjectionSet(null);
+      } else if (
+        nextForecast.forecast_mode === "scenario_projection" &&
+        hasEstimateSet(nextForecast.status)
+      ) {
+        const nextProjection =
+          nextForecast.current_projection_set ??
+          (await getCurrentProjection(requestForecastId, signal));
+        if (!isCurrentRequest()) return;
+        latestProjectionSetRef.current = nextProjection;
+        setProjectionSet(nextProjection);
         setEstimate(null);
+      } else {
+        latestEstimateRef.current = null;
+        latestProjectionSetRef.current = null;
+        setEstimate(null);
+        setProjectionSet(null);
       }
 
       setError(null);
     } catch (err) {
+      // Aborted requests (forecastId change / unmount) re-throw the raw
+      // AbortError DOMException, which would otherwise surface as a spurious
+      // user-facing error.  Swallow it here so only genuine errors propagate.
+      if (err instanceof DOMException && err.name === "AbortError") return;
       if (isCurrentRequest()) throw err;
     }
   }, [forecastId]);
@@ -1060,114 +1222,201 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     }
   }, [forecast?.status]);
 
-  async function runStep(step: Command, fn: () => Promise<unknown>): Promise<boolean> {
+  async function runStep(
+    step: Command,
+    fn: (signal: AbortSignal) => Promise<unknown>,
+  ): Promise<boolean> {
+    const commandForecastId = currentForecastIdRef.current;
+    const signal = lifecycleAbortRef.current.signal;
     setBusyStartedAt(new Date(Date.now()));
     setBusy(step);
     setError(null);
     try {
-      const result = await fn();
-      if (step === "claimTargets") setClaimTargetsApproved(true);
-      if (step === "approve" && estimate) {
-        setApprovedEstimateSetId(estimate.estimate_set_id);
+      const result = await fn(signal);
+      // Discard stale responses if the user navigated to a different forecast
+      // while the command was in flight.
+      if (signal.aborted || currentForecastIdRef.current !== commandForecastId) {
+        return false;
       }
-      if (step === "compute") setEstimate(result as EstimateSetResponse);
+      if (step === "claimTargets") setClaimTargetsApproved(true);
+      if (step === "approve") {
+        // Optimistic update: mark the estimate/projectionSet that was just
+        // approved so the UI doesn't wait for load() to reflect approval.
+        const approvedEstimate = latestEstimateRef.current;
+        const approvedProjection = latestProjectionSetRef.current;
+        if (approvedEstimate) {
+          setApprovedEstimateSetId(approvedEstimate.estimate_set_id);
+        } else if (approvedProjection) {
+          setApprovedEstimateSetId(approvedProjection.projection_set_id);
+        }
+      }
+      if (step === "compute") {
+        if (forecast?.forecast_mode === "scenario_projection") {
+          const nextProjection = result as ProjectionSetResponse;
+          latestProjectionSetRef.current = nextProjection;
+          setProjectionSet(nextProjection);
+          setEstimate(null);
+        } else {
+          const nextEstimate = result as EstimateSetResponse;
+          latestEstimateRef.current = nextEstimate;
+          setEstimate(nextEstimate);
+          setProjectionSet(null);
+        }
+      }
       if (step === "resolve") setResolution(result as ResolveForecastResponse);
       await load();
       return true;
     } catch (err) {
-      setError(formatForecastError(err));
+      if (!signal.aborted && currentForecastIdRef.current === commandForecastId) {
+        setError(formatForecastError(err));
+      }
       return false;
     } finally {
-      setBusy(null);
-      setBusyStartedAt(null);
+      if (currentForecastIdRef.current === commandForecastId) {
+        setBusy(null);
+        setBusyStartedAt(null);
+      }
     }
   }
 
   function runCommand(command: Command) {
     switch (command) {
       case "pack":
-        return runStep("pack", () =>
-          dispatchDefaultResearchPacks(forecastId, {
-            idempotencyKey: idempotencyKeys.current.pack,
-          }),
+        return runStep("pack", (signal) =>
+          forecast?.forecast_mode === "scenario_projection"
+            ? dispatchCurrentStatePack(forecastId, {
+                signal,
+                idempotencyKey: idempotencyKeys.current.pack,
+              })
+            : dispatchDefaultResearchPacks(forecastId, {
+                signal,
+                idempotencyKey: idempotencyKeys.current.pack,
+              }),
         );
       case "manualPack":
         return Promise.resolve();
       case "evidence":
-        return runStep("evidence", () =>
+        return runStep("evidence", (signal) =>
           extractEvidence(forecastId, {
+            signal,
             idempotencyKey: idempotencyKeys.current.evidence,
           }),
         );
       case "scenarios":
-        return runStep("scenarios", () =>
+        if (forecast?.forecast_mode === "scenario_projection") {
+          return runCommand("compute");
+        }
+        return runStep("scenarios", (signal) =>
           generateScenarios(forecastId, {
+            signal,
             idempotencyKey: idempotencyKeys.current.scenarios,
           }),
         );
       case "claimTargets":
-        return runStep("claimTargets", () =>
+        if (forecast?.forecast_mode === "scenario_projection") {
+          return runCommand("compute");
+        }
+        return runStep("claimTargets", (signal) =>
           reviewForecast(
             forecastId,
             { action: "approve_claim_target_links" },
-            { idempotencyKey: idempotencyKeys.current.claimTargets },
+            { signal, idempotencyKey: idempotencyKeys.current.claimTargets },
           ),
         );
       case "compute":
-        return runStep("compute", () =>
+        if (forecast?.forecast_mode === "scenario_projection") {
+          return runStep("compute", (signal) =>
+            computeProjection(forecastId, {
+              signal,
+              idempotencyKey: idempotencyKeys.current.compute,
+            }),
+          );
+        }
+        return runStep("compute", (signal) =>
           computeProbabilities(
             forecastId,
             { engine_version: probabilityEngine },
             {
+              signal,
               idempotencyKey: idempotencyKeys.current.compute,
             },
           ),
         );
       case "approve":
-        if (!estimate) return Promise.resolve();
-        if (!estimate.estimate_set_id) return Promise.resolve();
-        if (
-          estimate.engine_version !== "phase_a_v1" &&
-          estimate.engine_version !== "phase_b_v1"
-        ) {
-          return Promise.resolve();
+        if (forecast?.forecast_mode === "scenario_projection") {
+          // Read from the ref so we always use the freshest loaded projection,
+          // not a stale closure-captured value.
+          const currentProjection = latestProjectionSetRef.current;
+          if (!currentProjection) return Promise.resolve();
+          return runStep("approve", (signal) =>
+            approveProjection(
+              forecastId,
+              currentProjection.projection_set_id,
+              { signal, idempotencyKey: idempotencyKeys.current.approve },
+            ),
+          );
         }
-        return runStep("approve", () =>
-          reviewForecast(
-            forecastId,
-            estimate.engine_version === "phase_b_v1"
-              ? {
-                  action: "approve_probability_publication",
-                  estimate_set_id: estimate.estimate_set_id,
-                }
-              : {
-                  action: "approve_phase_a_version",
-                  estimate_set_id: estimate.estimate_set_id,
-                },
-            { idempotencyKey: idempotencyKeys.current.approve },
-          ),
-        );
+        {
+          // Read from the ref for the same reason — avoids stale closure.
+          const currentEstimate = latestEstimateRef.current;
+          if (!currentEstimate) return Promise.resolve();
+          if (!currentEstimate.estimate_set_id) return Promise.resolve();
+          if (
+            currentEstimate.engine_version !== "phase_a_v1" &&
+            currentEstimate.engine_version !== "phase_b_v1"
+          ) {
+            return Promise.resolve();
+          }
+          return runStep("approve", (signal) =>
+            reviewForecast(
+              forecastId,
+              currentEstimate.engine_version === "phase_b_v1"
+                ? {
+                    action: "approve_probability_publication",
+                    estimate_set_id: currentEstimate.estimate_set_id,
+                  }
+                : {
+                    action: "approve_phase_a_version",
+                    estimate_set_id: currentEstimate.estimate_set_id,
+                  },
+              { signal, idempotencyKey: idempotencyKeys.current.approve },
+            ),
+          );
+        }
       case "commit":
+        if (forecast?.forecast_mode === "scenario_projection") {
+          if (!projectionSet) return Promise.resolve();
+          return runStep("commit", (signal) =>
+            commitForecastVersion(
+              forecastId,
+              {
+                projection_set_id: projectionSet.projection_set_id,
+                expected_input_snapshot_hash: projectionSet.input_snapshot_hash,
+              },
+              { signal, idempotencyKey: idempotencyKeys.current.commit },
+            ),
+          );
+        }
         if (!estimate) return Promise.resolve();
-        return runStep("commit", () =>
+        return runStep("commit", (signal) =>
           commitForecastVersion(
             forecastId,
             {
               estimate_set_id: estimate.estimate_set_id,
               expected_input_snapshot_hash: estimate.input_snapshot_hash,
             },
-            { idempotencyKey: idempotencyKeys.current.commit },
+            { signal, idempotencyKey: idempotencyKeys.current.commit },
           ),
         );
       case "resolve":
-        return runStep("resolve", () =>
+        return runStep("resolve", (signal) =>
           resolveForecast(
             forecastId,
             {
               outcome_id: selectedOutcomeId,
               resolution_notes: resolutionNotes.trim() || null,
             },
-            { idempotencyKey: idempotencyKeys.current.resolve },
+            { signal, idempotencyKey: idempotencyKeys.current.resolve },
           ),
         );
     }
@@ -1234,6 +1483,109 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     URL.revokeObjectURL(url);
   }
 
+  function ProjectionSummary({
+    forecast,
+    projectionSet,
+  }: {
+    forecast: ForecastDetailType;
+    projectionSet: ProjectionSetResponse | null;
+  }) {
+    const dimensions = forecast.projection_dimensions;
+    const scenarios = projectionSet?.scenarios ?? [];
+    const composites = projectionSet?.composites ?? [];
+    const sensitivities = projectionSet?.sensitivities ?? [];
+    return (
+      <section className="form-panel">
+        <div className="forecast-panel-heading">
+          <h2>2035年状態予測</h2>
+        </div>
+        {projectionSet ? (
+          <>
+            <div className="metric-grid">
+              <MetricCard
+                label="Projection set"
+                value={projectionSet.status}
+                unit={projectionSet.engine_version}
+              />
+              <MetricCard
+                label="Scenarios"
+                value={String(scenarios.length)}
+                unit={projectionSet.approved ? "approved" : "draft"}
+              />
+              <MetricCard
+                label="Snapshot"
+                value={(projectionSet.input_snapshot_hash ?? "").slice(0, 12) || "-"}
+                unit="input hash"
+              />
+            </div>
+            <div className="forecast-impact-scroll">
+              <table className="forecast-impact-table">
+                <thead>
+                  <tr>
+                    <th>Metric</th>
+                    <th>Horizon</th>
+                    <th>P10</th>
+                    <th>P50</th>
+                    <th>P90</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {composites.map((item) => (
+                    <tr key={item.composite_id}>
+                      <th>{item.metric_id}</th>
+                      <td>{item.horizon_year}</td>
+                      <td>{formatNumber(item.p10, 2)}</td>
+                      <td>{formatNumber(item.p50, 2)}</td>
+                      <td>{formatNumber(item.p90, 2)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="result-list">
+              {scenarios.map((scenario) => (
+                <article className="run-card" key={scenario.projection_scenario_id}>
+                  <p className="run-card-title">{scenario.label}</p>
+                  <p>{scenario.narrative}</p>
+                  <p className="run-card-meta">
+                    {formatNumber(scenario.probability * 100, 1)}% /{" "}
+                    {scenario.coverage_role}
+                  </p>
+                </article>
+              ))}
+            </div>
+            {sensitivities.length > 0 && (
+              <div className="result-list">
+                {sensitivities.slice(0, 4).map((item) => (
+                  <article className="run-card" key={item.sensitivity_id}>
+                    <p className="run-card-title">{item.sensitivity_kind}</p>
+                    <p className="run-card-meta">
+                      delta P50 {formatNumber(item.delta_p50, 2)} / delta probability{" "}
+                      {formatNumber(item.delta_probability, 3)}
+                    </p>
+                  </article>
+                ))}
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="result-list">
+            {dimensions.map((dimension) => (
+              <article className="run-card" key={dimension.dimension_id}>
+                <p className="run-card-title">{dimension.label}</p>
+                <p>
+                  {dimension.baseline_value} {dimension.unit} in{" "}
+                  {dimension.baseline_year}
+                </p>
+                <p className="run-card-meta">{dimension.horizons.join(", ")}</p>
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
+    );
+  }
+
   async function importManualPack() {
     if (!manualPrompt) return;
     const text = manualReportText.trim();
@@ -1241,14 +1593,15 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
       manualReportFile !== null
         ? { source: "file" as const, file: manualReportFile }
         : { source: "text" as const, text };
-    const imported = await runStep("manualPack", () =>
+    const capturedPrompt = manualPrompt;
+    const imported = await runStep("manualPack", (signal) =>
       importManualResearchPack(
         forecastId,
         {
-          promptSha256: manualPrompt.prompt_sha256,
+          promptSha256: capturedPrompt.prompt_sha256,
           report,
         },
-        { idempotencyKey: idempotencyKeys.current.manualPack },
+        { signal, idempotencyKey: idempotencyKeys.current.manualPack },
       ),
     );
     if (imported) {
@@ -1268,16 +1621,17 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     ) {
       return;
     }
-    void runStep("pack", () =>
+    void runStep("pack", (signal) =>
       rerunForecastResearchPack(
         forecastId,
         pack.pack_id,
         { expected_active_pack_id: pack.pack_id },
-        { idempotencyKey: stableKey(forecastId, "pack") },
+        { signal, idempotencyKey: stableKey(forecastId, "pack") },
       ),
     );
   }
 
+  const isProjectionForecast = forecast?.forecast_mode === "scenario_projection";
   const canDispatch = approvedFraming && status === "framing_approved";
   const canRecoverManualPack =
     !forecastProgress.phaseBStarted &&
@@ -1290,7 +1644,7 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     (canRecoverManualPack && manualRecoveryOpen);
   const manualReportReady = manualReportFile !== null || manualReportText.trim().length > 0;
   const canExtract = status === "pack_running" && researchPackCompleted;
-  const canGenerate = status === "evidence_ready";
+  const canGenerate = !isProjectionForecast && status === "evidence_ready";
   const effectiveClaimTargetsApproved =
     claimTargetsApproved ||
     (forecast?.approved_claim_target_link_count ?? 0) > 0 ||
@@ -1304,19 +1658,31 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     Boolean(
       estimate &&
         (estimate.approved || approvedEstimateSetId === estimate.estimate_set_id),
+    ) ||
+    Boolean(
+      projectionSet &&
+        (projectionSet.approved ||
+          approvedEstimateSetId === projectionSet.projection_set_id),
     );
   const canApproveClaimTargets =
-    status === "scenarios_ready" && !effectiveClaimTargetsApproved;
-  const canCompute = status === "scenarios_ready" && effectiveClaimTargetsApproved;
-  const canRestoreDraft = status === "draft_ready" && !estimate;
+    !isProjectionForecast && status === "scenarios_ready" && !effectiveClaimTargetsApproved;
+  const canCompute = isProjectionForecast
+    ? status === "evidence_ready"
+    : status === "scenarios_ready" && effectiveClaimTargetsApproved;
+  const canRestoreDraft = status === "draft_ready" && !estimate && !projectionSet;
   const canApproveEstimate =
     status === "draft_ready" &&
-    Boolean(estimate?.estimate_set_id) &&
-    hasKnownEstimateEngine &&
-    !estimateApproved;
+    !estimateApproved &&
+    (isProjectionForecast
+      ? Boolean(projectionSet?.projection_set_id)
+      : Boolean(estimate?.estimate_set_id) && hasKnownEstimateEngine);
   const canSubmitEstimateApproval = canApproveEstimate;
-  const canCommit = status === "draft_ready" && Boolean(estimate) && estimateApproved;
-  const canResolve = status === "committed" && Boolean(selectedOutcomeId);
+  const canCommit =
+    status === "draft_ready" &&
+    (isProjectionForecast ? Boolean(projectionSet) : Boolean(estimate)) &&
+    estimateApproved;
+  const canResolve =
+    !isProjectionForecast && status === "committed" && Boolean(selectedOutcomeId);
   const flowNodes = forecastExecutionNodes({
     status,
     approvedFraming,
@@ -1330,12 +1696,13 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     completedDefaultPackCount: forecastProgress.completedDefaultPackCount,
     missingDefaultPacks: forecastProgress.missingDefaultRoles.length,
     claimTargetsApproved: effectiveClaimTargetsApproved,
-    hasEstimate: Boolean(estimate),
+    hasEstimate: isProjectionForecast ? Boolean(projectionSet) : Boolean(estimate),
     estimateApproved,
     packSubmissionPending,
     busy,
     probabilityEngine,
     isPhaseBEstimate,
+    isProjectionForecast,
   });
   const currentStep = deriveCurrentStep({
     status,
@@ -1361,9 +1728,10 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     canApproveEstimate,
     canCommit,
     canResolve,
-    estimatePresent: Boolean(estimate),
+    estimatePresent: isProjectionForecast ? Boolean(projectionSet) : Boolean(estimate),
     probabilityEngine,
     isPhaseBEstimate,
+    isProjectionForecast,
   });
   const researchPackUpdatedLabel = formatStartedAt(
     currentResearchPack?.research_run_updated_at ??
@@ -1375,6 +1743,10 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
     ? "Deep Research送信待ち"
     : packSubmissionPending
       ? "サーバーに登録中"
+      : isProjectionForecast
+        ? researchPackCompleted
+          ? "current_state Pack完了"
+          : localizePackStatus(currentResearchPackStatus)
       : forecastProgress.phaseBStarted
         ? forecastProgress.missingDefaultRoles.length > 0
           ? `必要Pack不足 (${forecastProgress.completedDefaultPackCount}/5完了)`
@@ -1487,7 +1859,14 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
           value={forecast?.approved_framing_version ? "承認済み" : "承認待ち"}
         />
         <MetricCard label="公開情報パック" value={currentResearchPackDisplayStatus} />
-        <MetricCard label="確率エンジン" value={estimate?.engine_version ?? "未計算"} />
+        <MetricCard
+          label={isProjectionForecast ? "Projectionエンジン" : "確率エンジン"}
+          value={
+            isProjectionForecast
+              ? projectionSet?.engine_version ?? "未作成"
+              : estimate?.engine_version ?? "未計算"
+          }
+        />
       </div>
 
       <section
@@ -1572,7 +1951,9 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
             {collectionMode === "auto" ? (
               <div className="forecast-collection-choice__action">
                 <p>
-                  Deep Research APIで既定5 Packを収集し、完了後に証拠抽出へ進めます。
+                  {isProjectionForecast
+                    ? "Deep Research APIでcurrent_state Packを収集し、完了後に証拠抽出へ進めます。"
+                    : "Deep Research APIで既定5 Packを収集し、完了後に証拠抽出へ進めます。"}
                 </p>
                 <button
                   type="button"
@@ -1580,7 +1961,9 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
                   disabled={!!busy}
                   onClick={() => void runCommand("pack")}
                 >
-                  公開情報の収集を開始
+                  {isProjectionForecast
+                    ? "current_state Packを開始"
+                    : "公開情報の収集を開始"}
                 </button>
               </div>
             ) : null}
@@ -1727,7 +2110,11 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
         </dl>
       </section>
 
-      <ForecastReport forecast={forecast} estimate={estimate} />
+      {isProjectionForecast ? (
+        <ProjectionSummary forecast={forecast} projectionSet={projectionSet} />
+      ) : (
+        <ForecastReport forecast={forecast} estimate={estimate} />
+      )}
 
       <ForecastFlowProgress
         heading="全体フロー"
@@ -1743,18 +2130,22 @@ export function ForecastDetail({ forecastId }: { forecastId: string }) {
         busy={Boolean(busy)}
         onRerunPack={rerunPack}
         onDispatchDefaults={
-          canDispatch
+          canDispatch && !isProjectionForecast
             ? () => void runCommand("pack")
             : undefined
         }
       />
 
       <EvidenceBoard forecast={forecast} />
-      <ScenarioMap forecast={forecast} estimate={estimate} />
+      {!isProjectionForecast && (
+        <>
+          <ScenarioMap forecast={forecast} estimate={estimate} />
+          <ProbabilityPanel forecast={forecast} estimate={estimate} />
+        </>
+      )}
 
-      <ProbabilityPanel forecast={forecast} estimate={estimate} />
-
-      {(forecast?.status === "committed" || forecast?.status === "resolved") && (
+      {!isProjectionForecast &&
+        (forecast?.status === "committed" || forecast?.status === "resolved") && (
         <div className="form-panel" id="forecast-resolve-panel">
           <h2>実績結果で解決</h2>
           {forecast.status === "resolved" ? (

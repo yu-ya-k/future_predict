@@ -594,6 +594,8 @@ export type ForecastToolProfile = "public" | "private" | "synthesis";
 
 export type ForecastConfidentialityClass = "public" | "internal" | "restricted";
 
+export type ForecastMode = "discrete_outcome" | "scenario_projection";
+
 export interface ForecastOutcome {
   outcome_id: string;
   label: string;
@@ -605,6 +607,7 @@ export interface ForecastOutcome {
 
 export interface ForecastSummary {
   forecast_id: string;
+  forecast_mode: ForecastMode;
   question: string;
   status: ForecastStatus;
   resolution_date?: string | null;
@@ -657,6 +660,8 @@ export interface ForecastDetail extends ForecastSummary {
   decision_context?: string | null;
   confidentiality_class: string;
   outcomes: ForecastOutcome[];
+  projection_dimensions: ProjectionDimension[];
+  current_projection_set?: ProjectionSetResponse | null;
   current_research_pack?: ForecastCurrentResearchPack | null;
   current_research_pack_status?: string | null;
   research_packs?: ForecastCurrentResearchPack[];
@@ -673,12 +678,15 @@ export interface ForecastCreateRequest {
   resolution_sources?: string[];
   decision_context?: string | null;
   confidentiality_class?: ForecastConfidentialityClass;
+  forecast_mode?: ForecastMode;
   outcomes?: string[];
+  projection_dimensions?: ProjectionDimensionInput[];
 }
 
 export interface ForecastCreateResponse {
   forecast_id: string;
   status: ForecastStatus;
+  forecast_mode: ForecastMode;
   framing_version: number;
   created_at: string;
 }
@@ -734,11 +742,13 @@ export interface ForecastReviewRequest {
     | "approve_claim_target_links"
     | "approve_private_data_use"
     | "approve_probability_publication"
+    | "approve_projection_publication"
     | "override_probability_with_reason"
     | "approve_external_report"
     | "approve_trusted_source";
   comment?: string | null;
   estimate_set_id?: string | null;
+  projection_set_id?: string | null;
   version_id?: string | null;
   reviewer?: string | null;
   reviewer_auth_subject?: string | null;
@@ -752,6 +762,7 @@ export interface ForecastReviewResponse {
   status: ForecastStatus;
   approved_framing_version?: number | null;
   estimate_set_id?: string | null;
+  projection_set_id?: string | null;
 }
 
 export interface ResearchPackResponse {
@@ -877,6 +888,105 @@ export interface ComputeProbabilitiesRequest {
   engine_version?: "phase_a_v1" | "phase_b_v1" | null;
 }
 
+export interface ProjectionDimensionInput {
+  metric_id: string;
+  label: string;
+  unit: string;
+  value_type?: "number" | "currency" | "percentage" | "index";
+  currency?: string | null;
+  nominal_or_real?: "nominal" | "real" | null;
+  baseline_year: number;
+  baseline_value: number;
+  baseline_source_ids?: string[];
+  horizons: number[];
+}
+
+export interface ProjectionDimension extends ProjectionDimensionInput {
+  dimension_id: string;
+  forecast_id: string;
+  framing_version: number;
+  value_type: "number" | "currency" | "percentage" | "index";
+  baseline_source_ids: string[];
+  sort_order: number;
+  frozen: boolean;
+}
+
+export interface ProjectionScenario {
+  projection_scenario_id: string;
+  projection_set_id: string;
+  label: string;
+  description: string;
+  coverage_role: string;
+  residual_flag: boolean;
+  probability: number;
+  probability_logit: number;
+  driver_vector: Record<string, unknown>;
+  narrative: string;
+  validity_status: string;
+}
+
+export interface ProjectionMetricPoint {
+  metric_point_id: string;
+  projection_set_id: string;
+  projection_scenario_id: string;
+  dimension_id: string;
+  metric_id: string;
+  horizon_year: number;
+  p10: number;
+  p50: number;
+  p90: number;
+  mean: number;
+  distribution_family: string;
+  distribution_params: Record<string, unknown>;
+  baseline_transform: string;
+}
+
+export interface ProjectionComposite {
+  composite_id: string;
+  projection_set_id: string;
+  dimension_id: string;
+  metric_id: string;
+  horizon_year: number;
+  p10: number;
+  p50: number;
+  p90: number;
+  mean: number;
+  mixture_components: Record<string, unknown>[];
+}
+
+export interface ProjectionSensitivity {
+  sensitivity_id: string;
+  projection_set_id: string;
+  sensitivity_kind: "driver_one_way" | "scenario_probability" | string;
+  target_ref: string;
+  baseline_snapshot_hash: string;
+  perturbed_input: Record<string, unknown>;
+  delta_p50: number;
+  delta_p90: number;
+  delta_probability: number;
+  rank: number;
+}
+
+export interface ProjectionSetResponse {
+  projection_set_id: string;
+  forecast_id: string;
+  status: string;
+  approved: boolean;
+  engine_version: string;
+  input_snapshot_hash: string;
+  engine_code_hash: string;
+  random_seed: number;
+  snapshot_artifact_path?: string | null;
+  scenarios: ProjectionScenario[];
+  metric_points: ProjectionMetricPoint[];
+  composites: ProjectionComposite[];
+  sensitivities: ProjectionSensitivity[];
+}
+
+export interface ComputeProjectionRequest {
+  engine_version?: "phase_c_v1" | null;
+}
+
 export interface ForecastTrustedSource {
   trusted_source_id: string;
   identifier: string;
@@ -893,7 +1003,9 @@ export interface ForecastTrustedSource {
 export interface CommitVersionResponse {
   version_id: string;
   forecast_id: string;
-  estimate_set_id: string;
+  version_kind: "estimate" | "projection";
+  estimate_set_id?: string | null;
+  projection_set_id?: string | null;
   input_snapshot_hash: string;
   snapshot_artifact_path: string;
   committed_at: string;

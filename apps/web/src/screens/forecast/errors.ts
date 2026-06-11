@@ -70,6 +70,10 @@ export function formatForecastError(error: unknown): string {
     // policy_requires_revision) carry a code and often structured details the
     // operator needs to act on, so surface them. Errors with no code fall back
     // to a friendly sentence rather than dumping an opaque payload.
+    if (error.code === "approval_required") {
+      return "入力データが変更されています。最新状態を確認して再度実行してください。";
+    }
+
     const serverMessage = error.message.trim();
     if (error.code) {
       const lines = [
@@ -78,7 +82,11 @@ export function formatForecastError(error: unknown): string {
           : error.code,
       ];
       if (error.details && Object.keys(error.details).length > 0) {
-        lines.push(`詳細: ${JSON.stringify(error.details, null, 2)}`);
+        // Trim details to safe human-readable key=value pairs; avoid dumping raw JSON.
+        const summary = Object.entries(error.details)
+          .map(([k, v]) => `${k}: ${typeof v === "string" || typeof v === "number" ? v : JSON.stringify(v)}`)
+          .join(", ");
+        lines.push(`詳細: ${summary}`);
       }
       return lines.join("\n");
     }

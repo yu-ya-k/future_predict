@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -101,11 +103,16 @@ class ResearchRepository:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
-    def connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def connect(self) -> Generator[sqlite3.Connection, None, None]:
         connection = sqlite3.connect(self.db_path)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def initialize(self) -> None:
         with self.connect() as connection:
@@ -986,6 +993,24 @@ class ResearchRepository:
 
     def delete_run(self, run_id: UUID) -> bool:
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            table = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'forecast_research_packs'
+                """
+            ).fetchone()
+            if table is not None:
+                linked = connection.execute(
+                    """
+                    SELECT 1 FROM forecast_research_packs
+                    WHERE research_run_id = ?
+                    LIMIT 1
+                    """,
+                    (str(run_id),),
+                ).fetchone()
+                if linked is not None:
+                    raise RuntimeError("forecast_linked_research_run")
             cursor = connection.execute(
                 "DELETE FROM research_runs WHERE id = ?",
                 (str(run_id),),

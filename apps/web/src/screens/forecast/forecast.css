@@ -213,3 +213,33 @@
   color: var(--ink-soft);
   word-break: break-all;
 }
+
+.forecast-impact-scroll {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.forecast-impact-table {
+  min-width: 620px;
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-body-sm);
+}
+
+.forecast-impact-table th,
+.forecast-impact-table td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: var(--border-subtle);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.forecast-impact-table th:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  max-width: 220px;
+  text-align: left;
+  background: var(--surface);
+  white-space: normal;
+}

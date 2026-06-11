@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from api.forecast.schemas import ForecastStatus, ToolProfile
+from api.forecast.schemas import ForecastMode, ForecastStatus, ToolProfile
 from api.research.schemas import utc_now
 
 
@@ -68,6 +68,26 @@ def _is_phase_a_research_pack_unique_error(error: sqlite3.IntegrityError) -> boo
     ) in message
 
 
+def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _column_notnull(
+    connection: sqlite3.Connection,
+    *,
+    table_name: str,
+    column_name: str,
+) -> int | None:
+    for row in connection.execute(f"PRAGMA table_info({table_name})"):
+        if row["name"] == column_name:
+            return int(row["notnull"])
+    return None
+
+
 class ForecastRepository:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
@@ -96,6 +116,8 @@ class ForecastRepository:
                     resolution_sources_json TEXT NOT NULL DEFAULT '[]',
                     decision_context TEXT,
                     confidentiality_class TEXT NOT NULL DEFAULT 'public',
+                    forecast_mode TEXT NOT NULL DEFAULT 'discrete_outcome'
+                        CHECK (forecast_mode IN ('discrete_outcome','scenario_projection')),
                     status TEXT NOT NULL,
                     current_framing_version INTEGER NOT NULL DEFAULT 1,
                     approved_framing_version INTEGER,
@@ -336,6 +358,145 @@ class ForecastRepository:
                 ON forecast_estimate_sets(forecast_id)
                 WHERE status = 'draft';
 
+                CREATE TABLE IF NOT EXISTS forecast_projection_dimensions (
+                    dimension_id TEXT PRIMARY KEY,
+                    forecast_id TEXT NOT NULL REFERENCES forecast_forecasts(id) ON DELETE CASCADE,
+                    framing_version INTEGER NOT NULL,
+                    metric_id TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    unit TEXT NOT NULL,
+                    value_type TEXT NOT NULL CHECK (value_type IN ('number','currency','percentage','index')),
+                    currency TEXT,
+                    nominal_or_real TEXT CHECK (nominal_or_real IS NULL OR nominal_or_real IN ('nominal','real')),
+                    baseline_year INTEGER NOT NULL,
+                    baseline_value REAL NOT NULL CHECK (baseline_value >= 0),
+                    baseline_source_ids_json TEXT NOT NULL DEFAULT '[]',
+                    horizons_json TEXT NOT NULL DEFAULT '[]',
+                    sort_order INTEGER NOT NULL,
+                    frozen INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (forecast_id, framing_version, metric_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS forecast_projection_sets (
+                    projection_set_id TEXT PRIMARY KEY,
+                    forecast_id TEXT NOT NULL REFERENCES forecast_forecasts(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL CHECK (status IN ('draft','frozen')),
+                    engine_version TEXT NOT NULL,
+                    input_snapshot_hash TEXT NOT NULL,
+                    engine_code_hash TEXT NOT NULL,
+                    random_seed INTEGER NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    snapshot_artifact_path TEXT,
+                    created_at TEXT NOT NULL,
+                    frozen_at TEXT
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS forecast_projection_sets_one_draft
+                ON forecast_projection_sets(forecast_id)
+                WHERE status = 'draft';
+
+                CREATE TABLE IF NOT EXISTS forecast_projection_scenarios (
+                    projection_scenario_id TEXT PRIMARY KEY,
+                    projection_set_id TEXT NOT NULL REFERENCES forecast_projection_sets(projection_set_id) ON DELETE CASCADE,
+                    forecast_id TEXT NOT NULL REFERENCES forecast_forecasts(id) ON DELETE CASCADE,
+                    label TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    coverage_role TEXT NOT NULL,
+                    residual_flag INTEGER NOT NULL DEFAULT 0 CHECK (residual_flag IN (0,1)),
+                    probability REAL NOT NULL CHECK (probability >= 0 AND probability <= 1),
+                    probability_logit REAL NOT NULL,
+                    driver_vector_json TEXT NOT NULL DEFAULT '{}',
+                    narrative TEXT NOT NULL DEFAULT '',
+                    validity_status TEXT NOT NULL DEFAULT 'valid',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS forecast_projection_metric_points (
+                    metric_point_id TEXT PRIMARY KEY,
+                    projection_set_id TEXT NOT NULL REFERENCES forecast_projection_sets(projection_set_id) ON DELETE CASCADE,
+                    projection_scenario_id TEXT NOT NULL REFERENCES forecast_projection_scenarios(projection_scenario_id) ON DELETE CASCADE,
+                    dimension_id TEXT NOT NULL REFERENCES forecast_projection_dimensions(dimension_id),
+                    forecast_id TEXT NOT NULL REFERENCES forecast_forecasts(id) ON DELETE CASCADE,
+                    metric_id TEXT NOT NULL,
+                    horizon_year INTEGER NOT NULL,
+                    p10 REAL NOT NULL,
+                    p50 REAL NOT NULL,
+                    p90 REAL NOT NULL,
+                    mean REAL NOT NULL,
+                    distribution_family TEXT NOT NULL,
+                    distribution_params_json TEXT NOT NULL DEFAULT '{}',
+                    baseline_transform TEXT NOT NULL DEFAULT 'level',
+                    created_at TEXT NOT NULL,
+                    CHECK (p10 <= p50 AND p50 <= p90),
+                    CHECK (p10 >= 0 AND p50 >= 0 AND p90 >= 0 AND mean >= 0)
+                );
+
+                CREATE TABLE IF NOT EXISTS forecast_projection_composites (
+                    composite_id TEXT PRIMARY KEY,
+                    projection_set_id TEXT NOT NULL REFERENCES forecast_projection_sets(projection_set_id) ON DELETE CASCADE,
+                    dimension_id TEXT NOT NULL REFERENCES forecast_projection_dimensions(dimension_id),
+                    forecast_id TEXT NOT NULL REFERENCES forecast_forecasts(id) ON DELETE CASCADE,
+                    metric_id TEXT NOT NULL,
+                    horizon_year INTEGER NOT NULL,
+                    p10 REAL NOT NULL,
+                    p50 REAL NOT NULL,
+                    p90 REAL NOT NULL,
+                    mean REAL NOT NULL,
+                    mixture_components_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    CHECK (p10 <= p50 AND p50 <= p90),
+                    CHECK (p10 >= 0 AND p50 >= 0 AND p90 >= 0 AND mean >= 0)
+                );
+
+                CREATE TABLE IF NOT EXISTS forecast_projection_sensitivities (
+                    sensitivity_id TEXT PRIMARY KEY,
+                    projection_set_id TEXT NOT NULL REFERENCES forecast_projection_sets(projection_set_id) ON DELETE CASCADE,
+                    forecast_id TEXT NOT NULL REFERENCES forecast_forecasts(id) ON DELETE CASCADE,
+                    sensitivity_kind TEXT NOT NULL CHECK (sensitivity_kind IN ('driver_one_way','scenario_probability')),
+                    target_ref TEXT NOT NULL,
+                    baseline_snapshot_hash TEXT NOT NULL,
+                    perturbed_input_json TEXT NOT NULL DEFAULT '{}',
+                    delta_p50 REAL NOT NULL DEFAULT 0,
+                    delta_p90 REAL NOT NULL DEFAULT 0,
+                    delta_probability REAL NOT NULL DEFAULT 0,
+                    rank INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS forecast_projection_evidence_links (
+                    link_id TEXT PRIMARY KEY,
+                    forecast_id TEXT NOT NULL REFERENCES forecast_forecasts(id) ON DELETE CASCADE,
+                    projection_set_id TEXT REFERENCES forecast_projection_sets(projection_set_id) ON DELETE CASCADE,
+                    dimension_id TEXT REFERENCES forecast_projection_dimensions(dimension_id) ON DELETE CASCADE,
+                    projection_scenario_id TEXT REFERENCES forecast_projection_scenarios(projection_scenario_id) ON DELETE CASCADE,
+                    claim_id TEXT NOT NULL REFERENCES forecast_claims(claim_id) ON DELETE CASCADE,
+                    relevance_weight REAL NOT NULL CHECK (relevance_weight >= 0 AND relevance_weight <= 1),
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS forecast_projection_resolutions (
+                    projection_resolution_id TEXT PRIMARY KEY,
+                    forecast_id TEXT NOT NULL REFERENCES forecast_forecasts(id) ON DELETE CASCADE,
+                    version_id TEXT NOT NULL REFERENCES forecast_versions(version_id),
+                    status TEXT NOT NULL CHECK (status IN ('partially_resolved','resolved')),
+                    notes TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS forecast_projection_resolution_actuals (
+                    actual_id TEXT PRIMARY KEY,
+                    projection_resolution_id TEXT NOT NULL REFERENCES forecast_projection_resolutions(projection_resolution_id) ON DELETE CASCADE,
+                    dimension_id TEXT NOT NULL REFERENCES forecast_projection_dimensions(dimension_id),
+                    metric_id TEXT NOT NULL,
+                    horizon_year INTEGER NOT NULL,
+                    actual_value REAL NOT NULL CHECK (actual_value >= 0),
+                    source TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (projection_resolution_id, dimension_id, horizon_year)
+                );
+
                 CREATE TABLE IF NOT EXISTS forecast_probability_estimates (
                     estimate_id TEXT PRIMARY KEY,
                     estimate_set_id TEXT NOT NULL REFERENCES forecast_estimate_sets(estimate_set_id) ON DELETE CASCADE,
@@ -360,17 +521,34 @@ class ForecastRepository:
                 CREATE TABLE IF NOT EXISTS forecast_versions (
                     version_id TEXT PRIMARY KEY,
                     forecast_id TEXT NOT NULL REFERENCES forecast_forecasts(id) ON DELETE CASCADE,
-                    estimate_set_id TEXT NOT NULL UNIQUE REFERENCES forecast_estimate_sets(estimate_set_id),
+                    version_kind TEXT NOT NULL DEFAULT 'estimate'
+                        CHECK (version_kind IN ('estimate','projection')),
+                    estimate_set_id TEXT REFERENCES forecast_estimate_sets(estimate_set_id),
+                    projection_set_id TEXT REFERENCES forecast_projection_sets(projection_set_id),
                     input_snapshot_hash TEXT NOT NULL,
                     snapshot_artifact_path TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    CHECK (
+                        (version_kind = 'estimate' AND estimate_set_id IS NOT NULL AND projection_set_id IS NULL)
+                        OR
+                        (version_kind = 'projection' AND projection_set_id IS NOT NULL AND estimate_set_id IS NULL)
+                    )
                 );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS forecast_versions_estimate_unique
+                ON forecast_versions(estimate_set_id)
+                WHERE estimate_set_id IS NOT NULL;
+
+                CREATE UNIQUE INDEX IF NOT EXISTS forecast_versions_projection_unique
+                ON forecast_versions(projection_set_id)
+                WHERE projection_set_id IS NOT NULL;
 
                 CREATE TABLE IF NOT EXISTS forecast_reviews (
                     review_id TEXT PRIMARY KEY,
                     forecast_id TEXT NOT NULL REFERENCES forecast_forecasts(id) ON DELETE CASCADE,
                     framing_version INTEGER,
                     estimate_set_id TEXT,
+                    projection_set_id TEXT,
                     version_id TEXT,
                     action TEXT NOT NULL,
                     comment TEXT,
@@ -494,7 +672,364 @@ class ForecastRepository:
                 BEGIN
                     SELECT RAISE(ABORT, 'frozen forecast_probability_estimates are immutable');
                 END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_sets_no_frozen_update
+                BEFORE UPDATE ON forecast_projection_sets
+                WHEN OLD.status = 'frozen'
+                BEGIN
+                    SELECT RAISE(ABORT, 'frozen forecast_projection_sets are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_sets_no_frozen_delete
+                BEFORE DELETE ON forecast_projection_sets
+                WHEN OLD.status = 'frozen'
+                BEGIN
+                    SELECT RAISE(ABORT, 'frozen forecast_projection_sets are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_dimensions_no_frozen_update
+                BEFORE UPDATE ON forecast_projection_dimensions
+                WHEN OLD.frozen = 1
+                BEGIN
+                    SELECT RAISE(ABORT, 'frozen forecast_projection_dimensions are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_dimensions_no_frozen_delete
+                BEFORE DELETE ON forecast_projection_dimensions
+                WHEN OLD.frozen = 1
+                BEGIN
+                    SELECT RAISE(ABORT, 'frozen forecast_projection_dimensions are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_scenarios_forecast_owner_insert
+                BEFORE INSERT ON forecast_projection_scenarios
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = NEW.projection_set_id
+                      AND forecast_id = NEW.forecast_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'forecast_projection_scenarios forecast ownership mismatch');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_scenarios_forecast_owner_update
+                BEFORE UPDATE ON forecast_projection_scenarios
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = NEW.projection_set_id
+                      AND forecast_id = NEW.forecast_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'forecast_projection_scenarios forecast ownership mismatch');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_metric_points_forecast_owner_insert
+                BEFORE INSERT ON forecast_projection_metric_points
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = NEW.projection_set_id
+                      AND forecast_id = NEW.forecast_id
+                )
+                OR NOT EXISTS (
+                    SELECT 1 FROM forecast_projection_scenarios
+                    WHERE projection_scenario_id = NEW.projection_scenario_id
+                      AND forecast_id = NEW.forecast_id
+                )
+                OR NOT EXISTS (
+                    SELECT 1 FROM forecast_projection_dimensions
+                    WHERE dimension_id = NEW.dimension_id
+                      AND forecast_id = NEW.forecast_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'forecast_projection_metric_points forecast ownership mismatch');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_metric_points_forecast_owner_update
+                BEFORE UPDATE ON forecast_projection_metric_points
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = NEW.projection_set_id
+                      AND forecast_id = NEW.forecast_id
+                )
+                OR NOT EXISTS (
+                    SELECT 1 FROM forecast_projection_scenarios
+                    WHERE projection_scenario_id = NEW.projection_scenario_id
+                      AND forecast_id = NEW.forecast_id
+                )
+                OR NOT EXISTS (
+                    SELECT 1 FROM forecast_projection_dimensions
+                    WHERE dimension_id = NEW.dimension_id
+                      AND forecast_id = NEW.forecast_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'forecast_projection_metric_points forecast ownership mismatch');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_composites_forecast_owner_insert
+                BEFORE INSERT ON forecast_projection_composites
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = NEW.projection_set_id
+                      AND forecast_id = NEW.forecast_id
+                )
+                OR NOT EXISTS (
+                    SELECT 1 FROM forecast_projection_dimensions
+                    WHERE dimension_id = NEW.dimension_id
+                      AND forecast_id = NEW.forecast_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'forecast_projection_composites forecast ownership mismatch');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_composites_forecast_owner_update
+                BEFORE UPDATE ON forecast_projection_composites
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = NEW.projection_set_id
+                      AND forecast_id = NEW.forecast_id
+                )
+                OR NOT EXISTS (
+                    SELECT 1 FROM forecast_projection_dimensions
+                    WHERE dimension_id = NEW.dimension_id
+                      AND forecast_id = NEW.forecast_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'forecast_projection_composites forecast ownership mismatch');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_sensitivities_forecast_owner_insert
+                BEFORE INSERT ON forecast_projection_sensitivities
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = NEW.projection_set_id
+                      AND forecast_id = NEW.forecast_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'forecast_projection_sensitivities forecast ownership mismatch');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_sensitivities_forecast_owner_update
+                BEFORE UPDATE ON forecast_projection_sensitivities
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = NEW.projection_set_id
+                      AND forecast_id = NEW.forecast_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'forecast_projection_sensitivities forecast ownership mismatch');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_evidence_links_forecast_owner_insert
+                BEFORE INSERT ON forecast_projection_evidence_links
+                WHEN (
+                    NEW.projection_set_id IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM forecast_projection_sets
+                        WHERE projection_set_id = NEW.projection_set_id
+                          AND forecast_id = NEW.forecast_id
+                    )
+                )
+                OR (
+                    NEW.dimension_id IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM forecast_projection_dimensions
+                        WHERE dimension_id = NEW.dimension_id
+                          AND forecast_id = NEW.forecast_id
+                    )
+                )
+                OR (
+                    NEW.projection_scenario_id IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM forecast_projection_scenarios
+                        WHERE projection_scenario_id = NEW.projection_scenario_id
+                          AND forecast_id = NEW.forecast_id
+                    )
+                )
+                OR NOT EXISTS (
+                    SELECT 1 FROM forecast_claims
+                    WHERE claim_id = NEW.claim_id
+                      AND forecast_id = NEW.forecast_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'forecast_projection_evidence_links forecast ownership mismatch');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_evidence_links_forecast_owner_update
+                BEFORE UPDATE ON forecast_projection_evidence_links
+                WHEN (
+                    NEW.projection_set_id IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM forecast_projection_sets
+                        WHERE projection_set_id = NEW.projection_set_id
+                          AND forecast_id = NEW.forecast_id
+                    )
+                )
+                OR (
+                    NEW.dimension_id IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM forecast_projection_dimensions
+                        WHERE dimension_id = NEW.dimension_id
+                          AND forecast_id = NEW.forecast_id
+                    )
+                )
+                OR (
+                    NEW.projection_scenario_id IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM forecast_projection_scenarios
+                        WHERE projection_scenario_id = NEW.projection_scenario_id
+                          AND forecast_id = NEW.forecast_id
+                    )
+                )
+                OR NOT EXISTS (
+                    SELECT 1 FROM forecast_claims
+                    WHERE claim_id = NEW.claim_id
+                      AND forecast_id = NEW.forecast_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'forecast_projection_evidence_links forecast ownership mismatch');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_scenarios_no_frozen_insert
+                BEFORE INSERT ON forecast_projection_scenarios
+                WHEN EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = NEW.projection_set_id
+                      AND status = 'frozen'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'frozen forecast_projection_scenarios are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_scenarios_no_frozen_update
+                BEFORE UPDATE ON forecast_projection_scenarios
+                WHEN EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = OLD.projection_set_id
+                      AND status = 'frozen'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'frozen forecast_projection_scenarios are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_scenarios_no_frozen_delete
+                BEFORE DELETE ON forecast_projection_scenarios
+                WHEN EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = OLD.projection_set_id
+                      AND status = 'frozen'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'frozen forecast_projection_scenarios are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_metric_points_no_frozen_insert
+                BEFORE INSERT ON forecast_projection_metric_points
+                WHEN EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = NEW.projection_set_id
+                      AND status = 'frozen'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'frozen forecast_projection_metric_points are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_metric_points_no_frozen_update
+                BEFORE UPDATE ON forecast_projection_metric_points
+                WHEN EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = OLD.projection_set_id
+                      AND status = 'frozen'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'frozen forecast_projection_metric_points are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_metric_points_no_frozen_delete
+                BEFORE DELETE ON forecast_projection_metric_points
+                WHEN EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = OLD.projection_set_id
+                      AND status = 'frozen'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'frozen forecast_projection_metric_points are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_composites_no_frozen_insert
+                BEFORE INSERT ON forecast_projection_composites
+                WHEN EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = NEW.projection_set_id
+                      AND status = 'frozen'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'frozen forecast_projection_composites are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_composites_no_frozen_update
+                BEFORE UPDATE ON forecast_projection_composites
+                WHEN EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = OLD.projection_set_id
+                      AND status = 'frozen'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'frozen forecast_projection_composites are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_composites_no_frozen_delete
+                BEFORE DELETE ON forecast_projection_composites
+                WHEN EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = OLD.projection_set_id
+                      AND status = 'frozen'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'frozen forecast_projection_composites are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_sensitivities_no_frozen_insert
+                BEFORE INSERT ON forecast_projection_sensitivities
+                WHEN EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = NEW.projection_set_id
+                      AND status = 'frozen'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'frozen forecast_projection_sensitivities are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_sensitivities_no_frozen_update
+                BEFORE UPDATE ON forecast_projection_sensitivities
+                WHEN EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = OLD.projection_set_id
+                      AND status = 'frozen'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'frozen forecast_projection_sensitivities are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS forecast_projection_sensitivities_no_frozen_delete
+                BEFORE DELETE ON forecast_projection_sensitivities
+                WHEN EXISTS (
+                    SELECT 1 FROM forecast_projection_sets
+                    WHERE projection_set_id = OLD.projection_set_id
+                      AND status = 'frozen'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'frozen forecast_projection_sensitivities are immutable');
+                END;
                 """
+            )
+            _ensure_column(
+                connection,
+                table_name="forecast_forecasts",
+                column_name="forecast_mode",
+                ddl=(
+                    "forecast_mode TEXT NOT NULL DEFAULT 'discrete_outcome' "
+                    "CHECK (forecast_mode IN ('discrete_outcome','scenario_projection'))"
+                ),
             )
             _ensure_column(
                 connection,
@@ -606,6 +1141,13 @@ class ForecastRepository:
                     column_name=column_name,
                     ddl=ddl,
                 )
+            _ensure_column(
+                connection,
+                table_name="forecast_reviews",
+                column_name="projection_set_id",
+                ddl="projection_set_id TEXT",
+            )
+            self._migrate_forecast_versions_projection_columns(connection)
             for column_name, ddl in {
                 "allowed_vector_store_ids_json": "allowed_vector_store_ids_json TEXT NOT NULL DEFAULT '[]'",
                 "allowed_mcp_server_ids_json": "allowed_mcp_server_ids_json TEXT NOT NULL DEFAULT '[]'",
@@ -633,6 +1175,99 @@ class ForecastRepository:
                   AND data_classification = 'public'
                 """
             )
+            violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError(f"forecast_repository_foreign_key_check_failed: {violations}")
+
+    def _migrate_forecast_versions_projection_columns(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        if not _table_exists(connection, "forecast_versions"):
+            return
+        columns = _table_columns(connection, "forecast_versions")
+        estimate_notnull = _column_notnull(
+            connection,
+            table_name="forecast_versions",
+            column_name="estimate_set_id",
+        )
+        if (
+            {"version_kind", "projection_set_id"}.issubset(columns)
+            and estimate_notnull == 0
+        ):
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS forecast_versions_estimate_unique
+                ON forecast_versions(estimate_set_id)
+                WHERE estimate_set_id IS NOT NULL
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS forecast_versions_projection_unique
+                ON forecast_versions(projection_set_id)
+                WHERE projection_set_id IS NOT NULL
+                """
+            )
+            return
+
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("PRAGMA legacy_alter_table = ON")
+        try:
+            connection.executescript(
+                """
+                DROP TRIGGER IF EXISTS forecast_versions_no_update;
+                DROP TRIGGER IF EXISTS forecast_versions_no_delete;
+                DROP INDEX IF EXISTS forecast_versions_estimate_unique;
+                DROP INDEX IF EXISTS forecast_versions_projection_unique;
+                ALTER TABLE forecast_versions RENAME TO forecast_versions_old;
+                CREATE TABLE forecast_versions (
+                    version_id TEXT PRIMARY KEY,
+                    forecast_id TEXT NOT NULL REFERENCES forecast_forecasts(id) ON DELETE CASCADE,
+                    version_kind TEXT NOT NULL DEFAULT 'estimate'
+                        CHECK (version_kind IN ('estimate','projection')),
+                    estimate_set_id TEXT REFERENCES forecast_estimate_sets(estimate_set_id),
+                    projection_set_id TEXT REFERENCES forecast_projection_sets(projection_set_id),
+                    input_snapshot_hash TEXT NOT NULL,
+                    snapshot_artifact_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    CHECK (
+                        (version_kind = 'estimate' AND estimate_set_id IS NOT NULL AND projection_set_id IS NULL)
+                        OR
+                        (version_kind = 'projection' AND projection_set_id IS NOT NULL AND estimate_set_id IS NULL)
+                    )
+                );
+                INSERT INTO forecast_versions (
+                    version_id, forecast_id, version_kind, estimate_set_id,
+                    projection_set_id, input_snapshot_hash, snapshot_artifact_path,
+                    created_at
+                )
+                SELECT
+                    version_id, forecast_id, 'estimate', estimate_set_id,
+                    NULL, input_snapshot_hash, snapshot_artifact_path, created_at
+                FROM forecast_versions_old;
+                DROP TABLE forecast_versions_old;
+                CREATE UNIQUE INDEX forecast_versions_estimate_unique
+                ON forecast_versions(estimate_set_id)
+                WHERE estimate_set_id IS NOT NULL;
+                CREATE UNIQUE INDEX forecast_versions_projection_unique
+                ON forecast_versions(projection_set_id)
+                WHERE projection_set_id IS NOT NULL;
+                CREATE TRIGGER forecast_versions_no_update
+                BEFORE UPDATE ON forecast_versions
+                BEGIN
+                    SELECT RAISE(ABORT, 'forecast_versions are append-only');
+                END;
+                CREATE TRIGGER forecast_versions_no_delete
+                BEFORE DELETE ON forecast_versions
+                BEGIN
+                    SELECT RAISE(ABORT, 'forecast_versions are append-only');
+                END;
+                """
+            )
+        finally:
+            connection.execute("PRAGMA legacy_alter_table = OFF")
+            connection.execute("PRAGMA foreign_keys = ON")
             connection.execute(
                 """
                 UPDATE forecast_claims
@@ -784,7 +1419,9 @@ class ForecastRepository:
         resolution_sources: list[str],
         decision_context: str | None,
         confidentiality_class: str,
+        forecast_mode: str,
         outcome_labels: list[str],
+        projection_dimensions: list[dict[str, Any]] | None = None,
         idempotency_key: str | None,
     ) -> sqlite3.Row:
         if idempotency_key:
@@ -795,10 +1432,13 @@ class ForecastRepository:
         now = utc_now().isoformat()
         forecast_id = uuid4()
         normalization_group_id = f"ng-{forecast_id}"
-        labels = [label.strip() for label in outcome_labels if label.strip()] or [
-            "Yes",
-            "No",
-        ]
+        if forecast_mode == ForecastMode.SCENARIO_PROJECTION.value:
+            labels: list[str] = []
+        else:
+            labels = [label.strip() for label in outcome_labels if label.strip()] or [
+                "Yes",
+                "No",
+            ]
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
@@ -807,10 +1447,10 @@ class ForecastRepository:
                     id, question, original_execution_prompt, resolution_date,
                     target_population, unit_of_analysis,
                     resolution_criteria, resolution_sources_json, decision_context,
-                    confidentiality_class, status, current_framing_version,
+                    confidentiality_class, forecast_mode, status, current_framing_version,
                     idempotency_key, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                 """,
                 (
                     str(forecast_id),
@@ -823,6 +1463,7 @@ class ForecastRepository:
                     _dump(resolution_sources),
                     decision_context,
                     confidentiality_class,
+                    forecast_mode,
                     ForecastStatus.FRAMING_PENDING.value,
                     idempotency_key,
                     now,
@@ -851,11 +1492,45 @@ class ForecastRepository:
                         now,
                     ),
                 )
+            for index, dimension in enumerate(projection_dimensions or []):
+                connection.execute(
+                    """
+                    INSERT INTO forecast_projection_dimensions (
+                        dimension_id, forecast_id, framing_version, metric_id, label,
+                        unit, value_type, currency, nominal_or_real, baseline_year,
+                        baseline_value, baseline_source_ids_json, horizons_json,
+                        sort_order, created_at, updated_at
+                    )
+                    VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid4()),
+                        str(forecast_id),
+                        dimension["metric_id"],
+                        dimension["label"],
+                        dimension["unit"],
+                        dimension["value_type"],
+                        dimension.get("currency"),
+                        dimension.get("nominal_or_real"),
+                        dimension["baseline_year"],
+                        dimension["baseline_value"],
+                        _dump([str(item) for item in dimension.get("baseline_source_ids", [])]),
+                        _dump(dimension["horizons"]),
+                        index,
+                        now,
+                        now,
+                    ),
+                )
             self.append_audit(
                 connection,
                 forecast_id,
                 "forecast_created",
-                {"framing_version": 1, "outcome_count": len(labels)},
+                {
+                    "framing_version": 1,
+                    "forecast_mode": forecast_mode,
+                    "outcome_count": len(labels),
+                    "projection_dimension_count": len(projection_dimensions or []),
+                },
             )
             row = connection.execute(
                 "SELECT * FROM forecast_forecasts WHERE id = ?",
@@ -915,6 +1590,31 @@ class ForecastRepository:
                 ).fetchall()
         return rows
 
+    def get_projection_dimensions(
+        self,
+        forecast_id: UUID,
+        *,
+        framing_version: int | None = None,
+    ) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            if framing_version is None:
+                return connection.execute(
+                    """
+                    SELECT * FROM forecast_projection_dimensions
+                    WHERE forecast_id = ?
+                    ORDER BY sort_order, metric_id
+                    """,
+                    (str(forecast_id),),
+                ).fetchall()
+            return connection.execute(
+                """
+                SELECT * FROM forecast_projection_dimensions
+                WHERE forecast_id = ? AND framing_version = ?
+                ORDER BY sort_order, metric_id
+                """,
+                (str(forecast_id), framing_version),
+            ).fetchall()
+
     def approve_framing(self, forecast_id: UUID, *, comment: str | None) -> sqlite3.Row:
         now = utc_now().isoformat()
         with self.connect() as connection:
@@ -933,6 +1633,14 @@ class ForecastRepository:
                 WHERE forecast_id = ? AND framing_version = ?
                 """,
                 (str(forecast_id), version),
+            )
+            connection.execute(
+                """
+                UPDATE forecast_projection_dimensions
+                SET frozen = 1, updated_at = ?
+                WHERE forecast_id = ? AND framing_version = ?
+                """,
+                (now, str(forecast_id), version),
             )
             connection.execute(
                 """
@@ -2376,6 +3084,299 @@ class ForecastRepository:
             for row in self.get_estimates(estimate_set_id)
         ]
 
+    def create_draft_projection_set(
+        self,
+        *,
+        forecast_id: UUID,
+        engine_version: str,
+        input_snapshot_hash: str,
+        engine_code_hash: str,
+        random_seed: int,
+        snapshot: dict[str, Any],
+        scenarios: list[dict[str, Any]],
+        metric_points: list[dict[str, Any]],
+        composites: list[dict[str, Any]],
+        sensitivities: list[dict[str, Any]],
+    ) -> sqlite3.Row:
+        if abs(sum(float(item["probability"]) for item in scenarios) - 1.0) > 1e-9:
+            raise ValueError("projection_probability_sum_invalid")
+        projection_set_id = uuid4()
+        now = utc_now().isoformat()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT * FROM forecast_projection_sets
+                WHERE forecast_id = ? AND status = 'draft'
+                """,
+                (str(forecast_id),),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["engine_version"] == engine_version
+                    and existing["input_snapshot_hash"] == input_snapshot_hash
+                    and existing["engine_code_hash"] == engine_code_hash
+                ):
+                    return existing
+                raise ValueError("draft_projection_set_exists")
+            dimension_forecasts = {
+                row["dimension_id"]: row["forecast_id"]
+                for row in connection.execute(
+                    """
+                    SELECT dimension_id, forecast_id
+                    FROM forecast_projection_dimensions
+                    WHERE forecast_id = ?
+                    """,
+                    (str(forecast_id),),
+                ).fetchall()
+            }
+            connection.execute(
+                """
+                INSERT INTO forecast_projection_sets (
+                    projection_set_id, forecast_id, status, engine_version,
+                    input_snapshot_hash, engine_code_hash, random_seed,
+                    snapshot_json, created_at
+                )
+                VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(projection_set_id),
+                    str(forecast_id),
+                    engine_version,
+                    input_snapshot_hash,
+                    engine_code_hash,
+                    random_seed,
+                    _dump(snapshot),
+                    now,
+                ),
+            )
+            scenario_ids: set[str] = set()
+            for scenario in scenarios:
+                scenario_id = str(scenario.get("projection_scenario_id") or uuid4())
+                scenario_ids.add(scenario_id)
+                connection.execute(
+                    """
+                    INSERT INTO forecast_projection_scenarios (
+                        projection_scenario_id, projection_set_id, forecast_id,
+                        label, description, coverage_role, residual_flag,
+                        probability, probability_logit, driver_vector_json,
+                        narrative, validity_status, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        scenario_id,
+                        str(projection_set_id),
+                        str(forecast_id),
+                        scenario["label"],
+                        scenario["description"],
+                        scenario["coverage_role"],
+                        1 if scenario.get("residual_flag") else 0,
+                        scenario["probability"],
+                        scenario["probability_logit"],
+                        _dump(scenario.get("driver_vector", {})),
+                        scenario.get("narrative", ""),
+                        scenario.get("validity_status", "valid"),
+                        now,
+                    ),
+                )
+            for point in metric_points:
+                dimension_id = str(point["dimension_id"])
+                scenario_id = str(point["projection_scenario_id"])
+                if dimension_forecasts.get(dimension_id) != str(forecast_id):
+                    raise ValueError("projection_dimension_forecast_mismatch")
+                if scenario_id not in scenario_ids:
+                    raise ValueError("projection_scenario_set_mismatch")
+                connection.execute(
+                    """
+                    INSERT INTO forecast_projection_metric_points (
+                        metric_point_id, projection_set_id, projection_scenario_id,
+                        dimension_id, forecast_id, metric_id, horizon_year,
+                        p10, p50, p90, mean, distribution_family,
+                        distribution_params_json, baseline_transform, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(point.get("metric_point_id") or uuid4()),
+                        str(projection_set_id),
+                        scenario_id,
+                        dimension_id,
+                        str(forecast_id),
+                        point["metric_id"],
+                        point["horizon_year"],
+                        point["p10"],
+                        point["p50"],
+                        point["p90"],
+                        point["mean"],
+                        point["distribution_family"],
+                        _dump(point.get("distribution_params", {})),
+                        point.get("baseline_transform", "level"),
+                        now,
+                    ),
+                )
+            for composite in composites:
+                dimension_id = str(composite["dimension_id"])
+                if dimension_forecasts.get(dimension_id) != str(forecast_id):
+                    raise ValueError("projection_dimension_forecast_mismatch")
+                connection.execute(
+                    """
+                    INSERT INTO forecast_projection_composites (
+                        composite_id, projection_set_id, dimension_id, forecast_id,
+                        metric_id, horizon_year, p10, p50, p90, mean,
+                        mixture_components_json, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(composite.get("composite_id") or uuid4()),
+                        str(projection_set_id),
+                        dimension_id,
+                        str(forecast_id),
+                        composite["metric_id"],
+                        composite["horizon_year"],
+                        composite["p10"],
+                        composite["p50"],
+                        composite["p90"],
+                        composite["mean"],
+                        _dump(composite.get("mixture_components", [])),
+                        now,
+                    ),
+                )
+            for sensitivity in sensitivities:
+                connection.execute(
+                    """
+                    INSERT INTO forecast_projection_sensitivities (
+                        sensitivity_id, projection_set_id, forecast_id,
+                        sensitivity_kind, target_ref, baseline_snapshot_hash,
+                        perturbed_input_json, delta_p50, delta_p90,
+                        delta_probability, rank, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(sensitivity.get("sensitivity_id") or uuid4()),
+                        str(projection_set_id),
+                        str(forecast_id),
+                        sensitivity["sensitivity_kind"],
+                        sensitivity["target_ref"],
+                        sensitivity["baseline_snapshot_hash"],
+                        _dump(sensitivity.get("perturbed_input", {})),
+                        sensitivity.get("delta_p50", 0.0),
+                        sensitivity.get("delta_p90", 0.0),
+                        sensitivity.get("delta_probability", 0.0),
+                        sensitivity["rank"],
+                        now,
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE forecast_forecasts
+                SET status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (ForecastStatus.DRAFT_READY.value, now, str(forecast_id)),
+            )
+            self.append_audit(
+                connection,
+                forecast_id,
+                "projection_computed",
+                {
+                    "projection_set_id": str(projection_set_id),
+                    "input_snapshot_hash": input_snapshot_hash,
+                    "engine_version": engine_version,
+                },
+            )
+            row = connection.execute(
+                "SELECT * FROM forecast_projection_sets WHERE projection_set_id = ?",
+                (str(projection_set_id),),
+            ).fetchone()
+        if row is None:
+            raise KeyError(str(projection_set_id))
+        return row
+
+    def get_draft_projection_set(self, forecast_id: UUID) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM forecast_projection_sets
+                WHERE forecast_id = ? AND status = 'draft'
+                """,
+                (str(forecast_id),),
+            ).fetchone()
+
+    def get_projection_set(self, projection_set_id: UUID) -> sqlite3.Row:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM forecast_projection_sets
+                WHERE projection_set_id = ?
+                """,
+                (str(projection_set_id),),
+            ).fetchone()
+        if row is None:
+            raise KeyError(str(projection_set_id))
+        return row
+
+    def get_current_projection_set(self, forecast_id: UUID) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM forecast_projection_sets
+                WHERE forecast_id = ?
+                ORDER BY
+                    CASE status WHEN 'draft' THEN 0 ELSE 1 END,
+                    COALESCE(frozen_at, created_at) DESC,
+                    created_at DESC
+                LIMIT 1
+                """,
+                (str(forecast_id),),
+            ).fetchone()
+
+    def get_projection_scenarios(self, projection_set_id: UUID) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM forecast_projection_scenarios
+                WHERE projection_set_id = ?
+                ORDER BY residual_flag, probability DESC, label
+                """,
+                (str(projection_set_id),),
+            ).fetchall()
+
+    def get_projection_metric_points(self, projection_set_id: UUID) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM forecast_projection_metric_points
+                WHERE projection_set_id = ?
+                ORDER BY metric_id, horizon_year, projection_scenario_id
+                """,
+                (str(projection_set_id),),
+            ).fetchall()
+
+    def get_projection_composites(self, projection_set_id: UUID) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM forecast_projection_composites
+                WHERE projection_set_id = ?
+                ORDER BY metric_id, horizon_year
+                """,
+                (str(projection_set_id),),
+            ).fetchall()
+
+    def get_projection_sensitivities(self, projection_set_id: UUID) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM forecast_projection_sensitivities
+                WHERE projection_set_id = ?
+                ORDER BY rank, sensitivity_kind, target_ref
+                """,
+                (str(projection_set_id),),
+            ).fetchall()
+
     def approve_estimate_set(
         self,
         forecast_id: UUID,
@@ -2447,6 +3448,7 @@ class ForecastRepository:
         policy_decision_id: UUID | None = None,
         review_reason: str | None = None,
         estimate_set_id: UUID | None = None,
+        projection_set_id: UUID | None = None,
         version_id: UUID | None = None,
     ) -> None:
         now = utc_now().isoformat()
@@ -2454,16 +3456,17 @@ class ForecastRepository:
             connection.execute(
                 """
                 INSERT INTO forecast_reviews (
-                    review_id, forecast_id, estimate_set_id, version_id, action,
-                    comment, reviewer, reviewer_auth_subject, policy_decision_id,
-                    review_reason, created_at
+                    review_id, forecast_id, estimate_set_id, projection_set_id,
+                    version_id, action, comment, reviewer, reviewer_auth_subject,
+                    policy_decision_id, review_reason, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid4()),
                     str(forecast_id),
                     str(estimate_set_id) if estimate_set_id else None,
+                    str(projection_set_id) if projection_set_id else None,
                     str(version_id) if version_id else None,
                     action,
                     comment,
@@ -2515,6 +3518,57 @@ class ForecastRepository:
             ).fetchone()
         return row is not None
 
+    def projection_set_has_approval(
+        self,
+        forecast_id: UUID,
+        projection_set_id: UUID,
+    ) -> bool:
+        with self.connect() as connection:
+            projection_set = connection.execute(
+                """
+                SELECT 1 FROM forecast_projection_sets
+                WHERE projection_set_id = ? AND forecast_id = ?
+                """,
+                (str(projection_set_id), str(forecast_id)),
+            ).fetchone()
+            if projection_set is None:
+                return False
+            row = connection.execute(
+                """
+                SELECT 1 FROM forecast_reviews
+                WHERE forecast_id = ? AND projection_set_id = ?
+                  AND action = 'approve_projection_publication'
+                LIMIT 1
+                """,
+                (str(forecast_id), str(projection_set_id)),
+            ).fetchone()
+        return row is not None
+
+    def approve_projection_set(
+        self,
+        forecast_id: UUID,
+        *,
+        projection_set_id: UUID,
+        comment: str | None,
+    ) -> None:
+        now = utc_now().isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO forecast_reviews (
+                    review_id, forecast_id, projection_set_id, action, comment, created_at
+                )
+                VALUES (?, ?, ?, 'approve_projection_publication', ?, ?)
+                """,
+                (str(uuid4()), str(forecast_id), str(projection_set_id), comment, now),
+            )
+            self.append_audit(
+                connection,
+                forecast_id,
+                "projection_publication_approved",
+                {"projection_set_id": str(projection_set_id)},
+            )
+
     def commit_estimate_set(
         self,
         *,
@@ -2543,10 +3597,11 @@ class ForecastRepository:
             connection.execute(
                 """
                 INSERT INTO forecast_versions (
-                    version_id, forecast_id, estimate_set_id, input_snapshot_hash,
-                    snapshot_artifact_path, created_at
+                    version_id, forecast_id, version_kind, estimate_set_id,
+                    projection_set_id, input_snapshot_hash, snapshot_artifact_path,
+                    created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, 'estimate', ?, NULL, ?, ?, ?)
                 """,
                 (
                     str(version_id),
@@ -2595,6 +3650,90 @@ class ForecastRepository:
                 {
                     "version_id": str(version_id),
                     "estimate_set_id": str(estimate_set_id),
+                    "input_snapshot_hash": expected_input_snapshot_hash,
+                },
+            )
+            row = connection.execute(
+                "SELECT * FROM forecast_versions WHERE version_id = ?",
+                (str(version_id),),
+            ).fetchone()
+        if row is None:
+            raise KeyError(str(version_id))
+        return row
+
+    def commit_projection_set(
+        self,
+        *,
+        forecast_id: UUID,
+        projection_set_id: UUID,
+        expected_input_snapshot_hash: str,
+        snapshot_artifact_path: str,
+    ) -> sqlite3.Row:
+        version_id = uuid4()
+        now = utc_now().isoformat()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            projection_set = connection.execute(
+                """
+                SELECT * FROM forecast_projection_sets
+                WHERE projection_set_id = ? AND forecast_id = ?
+                """,
+                (str(projection_set_id), str(forecast_id)),
+            ).fetchone()
+            if projection_set is None:
+                raise KeyError(str(projection_set_id))
+            if projection_set["status"] != "draft":
+                raise ValueError("projection_set_already_committed")
+            if projection_set["input_snapshot_hash"] != expected_input_snapshot_hash:
+                raise ValueError("input_snapshot_hash_mismatch")
+            connection.execute(
+                """
+                INSERT INTO forecast_versions (
+                    version_id, forecast_id, version_kind, estimate_set_id,
+                    projection_set_id, input_snapshot_hash, snapshot_artifact_path,
+                    created_at
+                )
+                VALUES (?, ?, 'projection', NULL, ?, ?, ?, ?)
+                """,
+                (
+                    str(version_id),
+                    str(forecast_id),
+                    str(projection_set_id),
+                    expected_input_snapshot_hash,
+                    snapshot_artifact_path,
+                    now,
+                ),
+            )
+            cursor = connection.execute(
+                """
+                UPDATE forecast_projection_sets
+                SET status = 'frozen', snapshot_artifact_path = ?, frozen_at = ?
+                WHERE projection_set_id = ? AND status = 'draft'
+                """,
+                (snapshot_artifact_path, now, str(projection_set_id)),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("projection_set_already_committed")
+            connection.execute(
+                """
+                UPDATE forecast_forecasts
+                SET status = ?, committed_version_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    ForecastStatus.COMMITTED.value,
+                    str(version_id),
+                    now,
+                    str(forecast_id),
+                ),
+            )
+            self.append_audit(
+                connection,
+                forecast_id,
+                "projection_version_committed",
+                {
+                    "version_id": str(version_id),
+                    "projection_set_id": str(projection_set_id),
                     "input_snapshot_hash": expected_input_snapshot_hash,
                 },
             )
@@ -2738,6 +3877,7 @@ class ForecastRepository:
     def forecast_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "forecast_id": UUID(row["id"]),
+            "forecast_mode": ForecastMode(row["forecast_mode"]),
             "question": row["question"],
             "original_execution_prompt": row["original_execution_prompt"],
             "status": ForecastStatus(row["status"]),

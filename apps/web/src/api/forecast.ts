@@ -1,6 +1,7 @@
 import type {
   CommitVersionResponse,
   ComputeProbabilitiesRequest,
+  ComputeProjectionRequest,
   EstimateSetResponse,
   EvidenceExtractResponse,
   ForecastAuditResponse,
@@ -13,6 +14,7 @@ import type {
   ForecastReviewRequest,
   ForecastReviewResponse,
   ForecastSummary,
+  ProjectionSetResponse,
   ResearchPackDefaultsResponse,
   ResearchPackRerunRequest,
   ResearchPackResponse,
@@ -234,9 +236,54 @@ export function getForecastEstimateSet(
   return apiClient.request(`${BASE}/${forecastId}/estimate-set`, { signal });
 }
 
+export function computeProjection(
+  forecastId: string,
+  requestOrInput?: ComputeProjectionRequest | AbortSignal | ForecastCommandOptions,
+  maybeInput?: AbortSignal | ForecastCommandOptions,
+): Promise<ProjectionSetResponse> {
+  const hasRequest =
+    requestOrInput &&
+    !(typeof AbortSignal !== "undefined" && requestOrInput instanceof AbortSignal) &&
+    "engine_version" in requestOrInput;
+  const request = hasRequest ? (requestOrInput as ComputeProjectionRequest) : {};
+  const options = optionsFrom(
+    hasRequest
+      ? maybeInput
+      : (requestOrInput as AbortSignal | ForecastCommandOptions | undefined),
+  );
+  return apiClient.request(`${BASE}/${forecastId}/projections/compute`, {
+    method: "POST",
+    body: request,
+    signal: options.signal,
+    idempotencyKey: commandKey("forecast-projection", options),
+  });
+}
+
+export function getCurrentProjection(
+  forecastId: string,
+  signal?: AbortSignal,
+): Promise<ProjectionSetResponse> {
+  return apiClient.request(`${BASE}/${forecastId}/projections/current`, { signal });
+}
+
+export function approveProjection(
+  forecastId: string,
+  projectionSetId: string,
+  input?: AbortSignal | ForecastCommandOptions,
+): Promise<ForecastReviewResponse> {
+  const options = optionsFrom(input);
+  return apiClient.request(`${BASE}/${forecastId}/projections/${projectionSetId}/approve`, {
+    method: "POST",
+    signal: options.signal,
+    idempotencyKey: commandKey("forecast-projection-approve", options),
+  });
+}
+
 export function commitForecastVersion(
   forecastId: string,
-  request: { estimate_set_id: string; expected_input_snapshot_hash: string },
+  request:
+    | { estimate_set_id: string; projection_set_id?: never; expected_input_snapshot_hash: string }
+    | { projection_set_id: string; estimate_set_id?: never; expected_input_snapshot_hash: string },
   input?: AbortSignal | ForecastCommandOptions,
 ): Promise<CommitVersionResponse> {
   const options = optionsFrom(input);
