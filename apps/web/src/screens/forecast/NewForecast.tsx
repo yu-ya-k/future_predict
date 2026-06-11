@@ -12,6 +12,7 @@ import type {
   ForecastDetail,
   ForecastFramingDraftClarifyingQuestion,
   ForecastFramingDraftResponse,
+  ForecastMode,
 } from "../../types";
 import { FRAMING_ROUGH_QUESTION_MAX_LENGTH } from "./constants";
 import { formatForecastError } from "./errors";
@@ -37,6 +38,16 @@ interface FinalFields {
   targetPopulation: string;
   unitOfAnalysis: string;
   decisionContext: string;
+}
+
+interface ProjectionDimensionFields {
+  metricId: string;
+  label: string;
+  unit: string;
+  valueType: "number" | "currency" | "percentage" | "index";
+  baselineYear: string;
+  baselineValue: string;
+  horizons: string;
 }
 
 interface AnswerHistoryEntry {
@@ -94,10 +105,12 @@ function finalFieldsFromDraft(
 
 function finalPayloadFromFields(
   fields: FinalFields,
+  forecastMode: ForecastMode,
+  projectionDimension: ProjectionDimensionFields,
   basePayload: ForecastCreateRequest | null | undefined,
   originalExecutionPrompt: string,
 ): ForecastCreateRequest {
-  return {
+  const base: ForecastCreateRequest = {
     ...basePayload,
     question: fields.question.trim(),
     original_execution_prompt:
@@ -111,6 +124,30 @@ function finalPayloadFromFields(
     unit_of_analysis: optionalValue(fields.unitOfAnalysis),
     decision_context: optionalValue(fields.decisionContext),
     confidentiality_class: basePayload?.confidentiality_class ?? "public",
+  };
+  if (forecastMode === "scenario_projection") {
+    return {
+      ...base,
+      forecast_mode: "scenario_projection",
+      outcomes: [],
+      projection_dimensions: [
+        {
+          metric_id: projectionDimension.metricId.trim(),
+          label: projectionDimension.label.trim(),
+          unit: projectionDimension.unit.trim(),
+          value_type: projectionDimension.valueType,
+          baseline_year: Number(projectionDimension.baselineYear),
+          baseline_value: Number(projectionDimension.baselineValue),
+          horizons: splitLines(projectionDimension.horizons).map((item) => Number(item)),
+        },
+      ],
+    };
+  }
+  return {
+    ...base,
+    forecast_mode: "discrete_outcome",
+    outcomes: splitLines(fields.outcomes),
+    projection_dimensions: [],
   };
 }
 
@@ -276,6 +313,17 @@ export function NewForecast() {
     unitOfAnalysis: "",
     decisionContext: "",
   });
+  const [forecastMode, setForecastMode] = useState<ForecastMode>("discrete_outcome");
+  const [projectionDimension, setProjectionDimension] =
+    useState<ProjectionDimensionFields>({
+      metricId: "",
+      label: "",
+      unit: "",
+      valueType: "number",
+      baselineYear: "",
+      baselineValue: "",
+      horizons: "",
+    });
   const [forecastId, setForecastId] = useState<string | null>(null);
   const [preview, setPreview] = useState<ForecastDetail | null>(null);
   const [state, setState] = useState<State>("rough_input");
@@ -304,7 +352,25 @@ export function NewForecast() {
   );
   const hasTooManySources = sourceLines.length > 20;
   const hasTooManyOutcomes = outcomeLabels.length > 8;
+  const hasTooManyOutcomesForMode =
+    forecastMode === "discrete_outcome" && hasTooManyOutcomes;
   const hasNoOutcome = outcomeLabels.length === 0;
+  const projectionHorizons = useMemo(
+    () => splitLines(projectionDimension.horizons),
+    [projectionDimension.horizons],
+  );
+  const hasInvalidProjectionDimension =
+    forecastMode === "scenario_projection" &&
+    (!projectionDimension.metricId.trim() ||
+      !projectionDimension.label.trim() ||
+      !projectionDimension.unit.trim() ||
+      !projectionDimension.baselineYear.trim() ||
+      !projectionDimension.baselineValue.trim() ||
+      !Number.isFinite(Number(projectionDimension.baselineYear)) ||
+      !Number.isFinite(Number(projectionDimension.baselineValue)) ||
+      Number(projectionDimension.baselineValue) < 0 ||
+      projectionHorizons.length === 0 ||
+      projectionHorizons.some((item) => !Number.isFinite(Number(item))));
   const hasNoQuestion = finalFields.question.trim().length === 0;
   const hasNoResolutionCriteria =
     finalFields.resolutionCriteria.trim().length === 0;
@@ -313,10 +379,18 @@ export function NewForecast() {
     () =>
       finalPayloadFromFields(
         finalFields,
+        forecastMode,
+        projectionDimension,
         draftResponse?.create_payload,
         originalExecutionPrompt,
       ),
-    [draftResponse?.create_payload, finalFields, originalExecutionPrompt],
+    [
+      draftResponse?.create_payload,
+      finalFields,
+      forecastMode,
+      originalExecutionPrompt,
+      projectionDimension,
+    ],
   );
   const aiChangeSummary = useMemo(
     () =>
@@ -340,9 +414,10 @@ export function NewForecast() {
   const isFinalValid =
     !hasNoQuestion &&
     !hasNoResolutionCriteria &&
-    !hasNoOutcome &&
-    !hasTooManyOutcomes &&
-    !hasTooManySources;
+    (forecastMode === "scenario_projection" || !hasNoOutcome) &&
+    !hasTooManyOutcomesForMode &&
+    !hasTooManySources &&
+    !hasInvalidProjectionDimension;
   const canCreate =
     state === "final_edit" &&
     isFinalValid;
@@ -451,7 +526,20 @@ export function NewForecast() {
           </p>
         </div>
         <div className="forecast-mode-pills" aria-label="Forecast実行条件">
-          <span className="status-pill">PhaseA</span>
+          <button
+            type="button"
+            className={`status-pill${forecastMode === "discrete_outcome" ? " status-pill--info" : ""}`}
+            onClick={() => setForecastMode("discrete_outcome")}
+          >
+            PhaseA/B
+          </button>
+          <button
+            type="button"
+            className={`status-pill${forecastMode === "scenario_projection" ? " status-pill--info" : ""}`}
+            onClick={() => setForecastMode("scenario_projection")}
+          >
+            PhaseC
+          </button>
           <span className="status-pill status-pill--info">public</span>
           <span className="status-pill">current_state pack</span>
         </div>
@@ -910,50 +998,158 @@ export function NewForecast() {
                     </span>
                   </label>
 
-                  <label
-                    className="forecast-field"
-                    htmlFor="forecast-final-outcomes"
-                  >
-                    <span className="forecast-field-header">
-                      <span className="forecast-field-label">
-                        解決時の結果状態
+                  {forecastMode === "discrete_outcome" ? (
+                    <label
+                      className="forecast-field"
+                      htmlFor="forecast-final-outcomes"
+                    >
+                      <span className="forecast-field-header">
+                        <span className="forecast-field-label">
+                          解決時の結果状態
+                        </span>
+                        <span className="forecast-required">1行1候補</span>
                       </span>
-                      <span className="forecast-required">1行1候補</span>
-                    </span>
-                    <span
-                      id="forecast-outcomes-help"
-                      className="forecast-field-help"
-                    >
-                      これは元の調査依頼の答えではなく、後で公開情報に照らして選ぶ解決・結果状態です。Yes/Noに限る必要はありません。
-                    </span>
-                    <textarea
-                      id="forecast-final-outcomes"
-                      className="forecast-textarea forecast-textarea--compact"
-                      value={finalFields.outcomes}
-                      onChange={(event) =>
-                        setFinalFields((current) => ({
-                          ...current,
-                          outcomes: event.target.value,
-                        }))
-                      }
-                      rows={4}
-                      disabled={state !== "final_edit"}
-                      aria-describedby="forecast-outcomes-help forecast-outcome-count"
-                      aria-invalid={hasNoOutcome || hasTooManyOutcomes}
-                    />
-                    <span
-                      id="forecast-outcome-count"
-                      className={`forecast-field-meta${hasTooManyOutcomes || hasNoOutcome ? " forecast-field-meta--error" : ""}`}
-                    >
-                      {outcomeLabels.length}/8 件
-                      {hasNoOutcome
-                        ? "。解決時の結果状態を1件以上入力してください。"
-                        : ""}
-                      {hasTooManyOutcomes
-                        ? "。解決時の結果状態を8件以内にしてください。"
-                        : ""}
-                    </span>
-                  </label>
+                      <span
+                        id="forecast-outcomes-help"
+                        className="forecast-field-help"
+                      >
+                        これは元の調査依頼の答えではなく、後で公開情報に照らして選ぶ解決・結果状態です。Yes/Noに限る必要はありません。
+                      </span>
+                      <textarea
+                        id="forecast-final-outcomes"
+                        className="forecast-textarea forecast-textarea--compact"
+                        value={finalFields.outcomes}
+                        onChange={(event) =>
+                          setFinalFields((current) => ({
+                            ...current,
+                            outcomes: event.target.value,
+                          }))
+                        }
+                        rows={4}
+                        disabled={state !== "final_edit"}
+                        aria-describedby="forecast-outcomes-help forecast-outcome-count"
+                        aria-invalid={hasNoOutcome || hasTooManyOutcomes}
+                      />
+                      <span
+                        id="forecast-outcome-count"
+                        className={`forecast-field-meta${hasTooManyOutcomes || hasNoOutcome ? " forecast-field-meta--error" : ""}`}
+                      >
+                        {outcomeLabels.length}/8 件
+                        {hasNoOutcome
+                          ? "。解決時の結果状態を1件以上入力してください。"
+                          : ""}
+                        {hasTooManyOutcomes
+                          ? "。解決時の結果状態を8件以内にしてください。"
+                          : ""}
+                      </span>
+                    </label>
+                  ) : (
+                    <div className="forecast-field-stack">
+                      <div className="forecast-metadata-heading">
+                        <h3>Projection dimensions</h3>
+                      </div>
+                      <div className="forecast-optional-grid">
+                        <label className="forecast-field" htmlFor="projection-metric-id">
+                          <span className="forecast-field-label">Metric ID</span>
+                          <input
+                            id="projection-metric-id"
+                            className="forecast-input"
+                            value={projectionDimension.metricId}
+                            onChange={(event) =>
+                              setProjectionDimension((current) => ({
+                                ...current,
+                                metricId: event.target.value,
+                              }))
+                            }
+                            disabled={state !== "final_edit"}
+                          />
+                        </label>
+                        <label className="forecast-field" htmlFor="projection-label">
+                          <span className="forecast-field-label">Label</span>
+                          <input
+                            id="projection-label"
+                            className="forecast-input"
+                            value={projectionDimension.label}
+                            onChange={(event) =>
+                              setProjectionDimension((current) => ({
+                                ...current,
+                                label: event.target.value,
+                              }))
+                            }
+                            disabled={state !== "final_edit"}
+                          />
+                        </label>
+                        <label className="forecast-field" htmlFor="projection-unit">
+                          <span className="forecast-field-label">Unit</span>
+                          <input
+                            id="projection-unit"
+                            className="forecast-input"
+                            value={projectionDimension.unit}
+                            onChange={(event) =>
+                              setProjectionDimension((current) => ({
+                                ...current,
+                                unit: event.target.value,
+                              }))
+                            }
+                            disabled={state !== "final_edit"}
+                          />
+                        </label>
+                        <label className="forecast-field" htmlFor="projection-baseline-year">
+                          <span className="forecast-field-label">Baseline year</span>
+                          <input
+                            id="projection-baseline-year"
+                            className="forecast-input"
+                            inputMode="numeric"
+                            value={projectionDimension.baselineYear}
+                            onChange={(event) =>
+                              setProjectionDimension((current) => ({
+                                ...current,
+                                baselineYear: event.target.value,
+                              }))
+                            }
+                            disabled={state !== "final_edit"}
+                          />
+                        </label>
+                        <label className="forecast-field" htmlFor="projection-baseline-value">
+                          <span className="forecast-field-label">Baseline value</span>
+                          <input
+                            id="projection-baseline-value"
+                            className="forecast-input"
+                            inputMode="decimal"
+                            value={projectionDimension.baselineValue}
+                            onChange={(event) =>
+                              setProjectionDimension((current) => ({
+                                ...current,
+                                baselineValue: event.target.value,
+                              }))
+                            }
+                            disabled={state !== "final_edit"}
+                          />
+                        </label>
+                        <label className="forecast-field" htmlFor="projection-horizons">
+                          <span className="forecast-field-label">Horizons</span>
+                          <textarea
+                            id="projection-horizons"
+                            className="forecast-textarea forecast-textarea--compact"
+                            value={projectionDimension.horizons}
+                            onChange={(event) =>
+                              setProjectionDimension((current) => ({
+                                ...current,
+                                horizons: event.target.value,
+                              }))
+                            }
+                            rows={3}
+                            disabled={state !== "final_edit"}
+                          />
+                        </label>
+                      </div>
+                      {hasInvalidProjectionDimension && (
+                        <span className="forecast-field-meta forecast-field-meta--error">
+                          Projection dimension の metric、baseline、horizon を入力してください。
+                        </span>
+                      )}
+                    </div>
+                  )}
 
                   <div className="forecast-optional-grid">
                     <label
@@ -1119,6 +1315,7 @@ export function NewForecast() {
               <div className="run-card-meta">
                 <span>Version {preview.current_framing_version}</span>
                 <span>{preview.confidentiality_class}</span>
+                <span>{preview.forecast_mode}</span>
               </div>
               <div className="forecast-preview-summary">
                 <p className="run-card-title">{preview.question}</p>
@@ -1131,20 +1328,40 @@ export function NewForecast() {
                   </ul>
                 )}
               </div>
-              <div className="result-list forecast-outcome-list">
-                {preview.outcomes.map((outcome) => (
-                  <article
-                    className="run-card forecast-outcome-card"
-                    key={outcome.outcome_id}
-                  >
-                    <p className="run-card-title">{outcome.label}</p>
-                    <p>{outcome.definition}</p>
-                    <p className="run-card-meta">
-                      {outcome.normalization_group_id}
-                    </p>
-                  </article>
-                ))}
-              </div>
+              {preview.forecast_mode === "scenario_projection" ? (
+                <div className="result-list forecast-outcome-list">
+                  {preview.projection_dimensions.map((dimension) => (
+                    <article
+                      className="run-card forecast-outcome-card"
+                      key={dimension.dimension_id}
+                    >
+                      <p className="run-card-title">{dimension.label}</p>
+                      <p>
+                        {dimension.baseline_value} {dimension.unit} in{" "}
+                        {dimension.baseline_year}
+                      </p>
+                      <p className="run-card-meta">
+                        {dimension.metric_id} / {dimension.horizons.join(", ")}
+                      </p>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <div className="result-list forecast-outcome-list">
+                  {preview.outcomes.map((outcome) => (
+                    <article
+                      className="run-card forecast-outcome-card"
+                      key={outcome.outcome_id}
+                    >
+                      <p className="run-card-title">{outcome.label}</p>
+                      <p>{outcome.definition}</p>
+                      <p className="run-card-meta">
+                        {outcome.normalization_group_id}
+                      </p>
+                    </article>
+                  ))}
+                </div>
+              )}
             </section>
           )}
         </div>

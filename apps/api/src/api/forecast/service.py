@@ -10,7 +10,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from pydantic import ValidationError
 
 from api.config import Settings
-from api.forecast import probability
+from api.forecast import probability, projection
 from api.forecast.artifacts import ForecastArtifactStore
 from api.forecast.errors import ForecastConflict
 from api.forecast.pack_orchestration import (
@@ -30,6 +30,7 @@ from api.forecast.schemas import (
     ClaimRecord,
     CommitVersionResponse,
     ComputeProbabilitiesRequest,
+    ComputeProjectionRequest,
     ConfidentialityClass,
     ForecastAuditEvent,
     ForecastAuditResponse,
@@ -40,12 +41,19 @@ from api.forecast.schemas import (
     ForecastFramingDraft,
     ForecastFramingDraftRequest,
     ForecastFramingDraftResponse,
+    ForecastMode,
     ForecastOutcome,
     ForecastStatus,
     ForecastSummary,
     ManualResearchPackPromptResponse,
     PackRole,
     ProbabilityEstimateRecord,
+    ProjectionCompositeRecord,
+    ProjectionDimensionRecord,
+    ProjectionMetricPointRecord,
+    ProjectionScenarioRecord,
+    ProjectionSensitivityRecord,
+    ProjectionSetResponse,
     ResearchPackDefaultsResponse,
     ResearchPackRequest,
     ResearchPackRerunRequest,
@@ -109,10 +117,35 @@ class ForecastOrchestrator:
     @staticmethod
     def _ensure_not_committed(forecast: ForecastDetail) -> None:
         if forecast.committed_version_id is not None or forecast.status == ForecastStatus.COMMITTED:
+            if forecast.forecast_mode == ForecastMode.SCENARIO_PROJECTION:
+                raise ForecastConflict(
+                    "projection_set_already_committed",
+                    "Projection forecast has already been committed.",
+                )
             raise ForecastConflict(
                 "estimate_set_already_committed",
                 "Committed forecasts cannot be modified in PhaseA.",
             )
+
+    @staticmethod
+    def _ensure_discrete_mode(forecast: ForecastDetail, operation: str) -> None:
+        if forecast.forecast_mode == ForecastMode.DISCRETE_OUTCOME:
+            return
+        raise ForecastConflict(
+            "forecast_mode_mismatch",
+            f"{operation} is only available for discrete outcome forecasts.",
+            {"forecast_mode": forecast.forecast_mode.value, "operation": operation},
+        )
+
+    @staticmethod
+    def _ensure_projection_mode(forecast: ForecastDetail, operation: str) -> None:
+        if forecast.forecast_mode == ForecastMode.SCENARIO_PROJECTION:
+            return
+        raise ForecastConflict(
+            "forecast_mode_mismatch",
+            f"{operation} is only available for scenario projection forecasts.",
+            {"forecast_mode": forecast.forecast_mode.value, "operation": operation},
+        )
 
     def _ensure_mutable(
         self,
@@ -142,12 +175,18 @@ class ForecastOrchestrator:
             resolution_sources=request.resolution_sources,
             decision_context=request.decision_context,
             confidentiality_class=request.confidentiality_class,
+            forecast_mode=request.forecast_mode,
             outcome_labels=request.outcomes,
+            projection_dimensions=[
+                dimension.model_dump(mode="python")
+                for dimension in request.projection_dimensions
+            ],
             idempotency_key=idempotency_key,
         )
         return ForecastCreateResponse(
             forecast_id=UUID(row["id"]),
             status=ForecastStatus(row["status"]),
+            forecast_mode=ForecastMode(row["forecast_mode"]),
             framing_version=row["current_framing_version"],
             created_at=ForecastRepository.forecast_row_to_dict(row)["created_at"],
         )
@@ -229,6 +268,21 @@ class ForecastOrchestrator:
                 framing_version=row["current_framing_version"],
             )
         ]
+        projection_dimensions = [
+            _projection_dimension_response(dimension)
+            for dimension in self.repository.get_projection_dimensions(
+                forecast_id,
+                framing_version=row["current_framing_version"],
+            )
+        ]
+        current_projection_set_row = self.repository.get_current_projection_set(forecast_id)
+        current_projection_set = (
+            self.projection_set_response(
+                UUID(current_projection_set_row["projection_set_id"])
+            )
+            if current_projection_set_row is not None
+            else None
+        )
         packs = self.repository.list_packs(forecast_id)
         reconciled_packs = [self._reconcile_research_pack(pack) for pack in packs]
         current_pack_row = reconciled_packs[-1] if reconciled_packs else None
@@ -240,6 +294,8 @@ class ForecastOrchestrator:
         return ForecastDetail(
             **base,
             outcomes=outcomes,
+            projection_dimensions=projection_dimensions,
+            current_projection_set=current_projection_set,
             current_research_pack=current_pack,
             current_research_pack_status=(
                 current_pack.effective_status if current_pack is not None else None
@@ -419,6 +475,7 @@ class ForecastOrchestrator:
         comment: str | None,
     ) -> ForecastDetail:
         forecast = self.get_forecast(forecast_id)
+        self._ensure_discrete_mode(forecast, "approve_estimate_set")
         self._ensure_mutable(forecast)
         if forecast.status != ForecastStatus.DRAFT_READY:
             raise ForecastConflict(
@@ -452,6 +509,7 @@ class ForecastOrchestrator:
         comment: str | None,
     ) -> ForecastDetail:
         forecast = self.get_forecast(forecast_id)
+        self._ensure_discrete_mode(forecast, "approve_claim_target_links")
         self._ensure_mutable(forecast)
         if not self.repository.get_claims(forecast.forecast_id):
             raise ForecastConflict("evidence_not_ready", "Extract evidence first.")
@@ -473,6 +531,11 @@ class ForecastOrchestrator:
     ) -> ForecastDetail:
         forecast = self.get_forecast(forecast_id)
         self._ensure_enabled()
+        if action in {
+            "approve_probability_publication",
+            "override_probability_with_reason",
+        }:
+            self._ensure_discrete_mode(forecast, action)
         ensure_reviewer_for_action(action, reviewer)
         if estimate_set_id is not None:
             estimate_set = self.repository.get_estimate_set(estimate_set_id)
@@ -504,7 +567,7 @@ class ForecastOrchestrator:
     ) -> ResearchPackResponse:
         forecast = self.get_forecast(forecast_id)
         self._ensure_mutable(forecast)
-        _ensure_forecast_has_outcomes(forecast)
+        _ensure_forecast_has_mode_payload(forecast)
         if forecast.approved_framing_version != forecast.current_framing_version:
             raise ForecastConflict(
                 "framing_not_approved",
@@ -734,7 +797,7 @@ class ForecastOrchestrator:
                 reason=error.code,
             )
             raise
-        prompt = build_research_pack_prompt(
+        prompt = _build_research_pack_prompt(
             forecast,
             pack_role=request.pack_role,
             tool_profile=request.tool_profile.value,
@@ -1142,7 +1205,7 @@ class ForecastOrchestrator:
     ) -> tuple[ForecastDetail, str, Any | None, Any | None]:
         forecast = self.get_forecast(forecast_id)
         self._ensure_mutable(forecast)
-        _ensure_forecast_has_outcomes(forecast)
+        _ensure_forecast_has_mode_payload(forecast)
         if forecast.approved_framing_version != forecast.current_framing_version:
             raise ForecastConflict(
                 "framing_not_approved",
@@ -1160,7 +1223,7 @@ class ForecastOrchestrator:
                     "forecast_already_started",
                     "A PhaseA research pack can only be dispatched once.",
                 )
-            return forecast, build_current_state_prompt(forecast), None, None
+            return forecast, _build_current_state_prompt(forecast), None, None
 
         pack = self._reconcile_research_pack(packs[-1])
         run = self.research.repository.get_run(UUID(pack["research_run_id"]))
@@ -1275,7 +1338,7 @@ class ForecastOrchestrator:
     ) -> tuple[ForecastDetail, str]:
         forecast = self.get_forecast(forecast_id)
         self._ensure_mutable(forecast)
-        _ensure_forecast_has_outcomes(forecast)
+        _ensure_forecast_has_mode_payload(forecast)
         if forecast.approved_framing_version != forecast.current_framing_version:
             raise ForecastConflict(
                 "framing_not_approved",
@@ -1303,12 +1366,15 @@ class ForecastOrchestrator:
                 "forecast_already_started",
                 "A PhaseA research pack can only be dispatched once.",
             )
-        return forecast, build_current_state_prompt(forecast)
+        return forecast, _build_current_state_prompt(forecast)
 
     def extract_evidence(self, forecast_id: UUID) -> tuple[list[SourceRecord], list[ClaimRecord]]:
         forecast = self.get_forecast(forecast_id)
         self._ensure_mutable(forecast)
-        _ensure_forecast_has_outcomes(forecast)
+        if forecast.forecast_mode == ForecastMode.DISCRETE_OUTCOME:
+            _ensure_forecast_has_outcomes(forecast)
+        else:
+            self._ensure_projection_mode(forecast, "extract_evidence")
         if forecast.status not in {ForecastStatus.PACK_RUNNING, ForecastStatus.EVIDENCE_READY}:
             raise ForecastConflict(
                 "pack_not_completed",
@@ -1357,7 +1423,6 @@ class ForecastOrchestrator:
             )
             lines = _claim_lines(report)
             for index, line in enumerate(lines[: max(1, min(len(lines), 12))]):
-                outcome = outcomes[index % len(outcomes)]
                 independence_group = _publisher_group(line, index)
                 cluster_id = hashlib.sha256(
                     f"{_fingerprint(line)}:{independence_group}".encode()
@@ -1386,22 +1451,24 @@ class ForecastOrchestrator:
                         "source_ids": [source_id],
                     }
                 )
-                links.append(
-                    {
-                        "link_id": str(
-                            uuid5(
-                                NAMESPACE_URL,
-                                f"forecast-link:{claim_id}:outcome:{outcome.outcome_id}",
-                            )
-                        ),
-                        "claim_id": claim_id,
-                        "target_kind": "outcome",
-                        "target_id": str(outcome.outcome_id),
-                        "direction": 1,
-                        "relevance_weight": 1.0,
-                        "review_status": "pending",
-                    }
-                )
+                if forecast.forecast_mode == ForecastMode.DISCRETE_OUTCOME:
+                    outcome = outcomes[index % len(outcomes)]
+                    links.append(
+                        {
+                            "link_id": str(
+                                uuid5(
+                                    NAMESPACE_URL,
+                                    f"forecast-link:{claim_id}:outcome:{outcome.outcome_id}",
+                                )
+                            ),
+                            "claim_id": claim_id,
+                            "target_kind": "outcome",
+                            "target_id": str(outcome.outcome_id),
+                            "direction": 1,
+                            "relevance_weight": 1.0,
+                            "review_status": "pending",
+                        }
+                    )
         if not claims:
             raise ForecastConflict(
                 "pack_not_completed",
@@ -1424,7 +1491,8 @@ class ForecastOrchestrator:
             claims=claims,
             links=links,
         )
-        self._derive_phase_b_structures_from_reports(forecast, reports)
+        if forecast.forecast_mode == ForecastMode.DISCRETE_OUTCOME:
+            self._derive_phase_b_structures_from_reports(forecast, reports)
         return (
             [_source_response(row) for row in source_rows],
             [_claim_response(self.repository, row) for row in claim_rows],
@@ -1565,6 +1633,7 @@ class ForecastOrchestrator:
 
     def generate_scenarios(self, forecast_id: UUID) -> list[ScenarioRecord]:
         forecast = self.get_forecast(forecast_id)
+        self._ensure_discrete_mode(forecast, "generate_scenarios")
         self._ensure_mutable(forecast)
         _ensure_forecast_has_outcomes(forecast)
         if forecast.status not in {ForecastStatus.EVIDENCE_READY, ForecastStatus.SCENARIOS_READY}:
@@ -1649,6 +1718,7 @@ class ForecastOrchestrator:
         request: ComputeProbabilitiesRequest | None = None,
     ) -> dict[str, Any]:
         forecast = self.get_forecast(forecast_id)
+        self._ensure_discrete_mode(forecast, "compute_probabilities")
         self._ensure_mutable(forecast)
         _ensure_forecast_has_outcomes(forecast)
         if not self.repository.get_active_claims(forecast.forecast_id):
@@ -1765,26 +1835,265 @@ class ForecastOrchestrator:
 
     def current_estimate_set_response(self, forecast_id: UUID) -> dict[str, Any]:
         self._ensure_enabled()
-        self.repository.get_forecast(forecast_id)
+        forecast = self.get_forecast(forecast_id)
+        self._ensure_discrete_mode(forecast, "current_estimate_set")
         estimate_set = self.repository.get_current_estimate_set(forecast_id)
         if estimate_set is None:
             raise KeyError(str(forecast_id))
         return self.estimate_set_response(UUID(estimate_set["estimate_set_id"]))
 
+    def compute_projection(
+        self,
+        forecast_id: UUID,
+        request: ComputeProjectionRequest | None = None,
+    ) -> ProjectionSetResponse:
+        forecast = self.get_forecast(forecast_id)
+        self._ensure_projection_mode(forecast, "compute_projection")
+        self._ensure_mutable(forecast)
+        if not forecast.projection_dimensions:
+            raise ForecastConflict(
+                "projection_dimensions_required",
+                "Scenario projection forecasts require at least one projection dimension.",
+            )
+        if not self.repository.get_active_claims(forecast.forecast_id):
+            raise ForecastConflict("evidence_not_ready", "Extract evidence first.")
+        engine = projection.get_engine(request.engine_version if request else None)
+        snapshot = self._canonical_projection_snapshot(
+            forecast,
+            engine_version=engine.engine_version,
+        )
+        input_hash = engine.snapshot_hash(snapshot)
+        engine_code_hash = engine.engine_code_hash()
+        existing = self.repository.get_draft_projection_set(forecast.forecast_id)
+        if existing is not None:
+            if (
+                existing["input_snapshot_hash"] == input_hash
+                and existing["engine_version"] == engine.engine_version
+                and existing["engine_code_hash"] == engine_code_hash
+            ):
+                return self.projection_set_response(UUID(existing["projection_set_id"]))
+            raise ForecastConflict(
+                "draft_projection_set_exists",
+                "A draft projection set already exists for different inputs.",
+                {
+                    "projection_set_id": existing["projection_set_id"],
+                    "existing_input_snapshot_hash": existing["input_snapshot_hash"],
+                    "new_input_snapshot_hash": input_hash,
+                    "existing_engine_version": existing["engine_version"],
+                    "new_engine_version": engine.engine_version,
+                    "existing_engine_code_hash": existing["engine_code_hash"],
+                    "new_engine_code_hash": engine_code_hash,
+                },
+            )
+        computed = engine.compute(snapshot=snapshot)
+        try:
+            projection_set = self.repository.create_draft_projection_set(
+                forecast_id=forecast.forecast_id,
+                engine_version=engine.engine_version,
+                input_snapshot_hash=input_hash,
+                engine_code_hash=engine_code_hash,
+                random_seed=engine.random_seed,
+                snapshot=snapshot,
+                scenarios=computed["scenarios"],
+                metric_points=computed["metric_points"],
+                composites=computed["composites"],
+                sensitivities=computed["sensitivities"],
+            )
+        except ValueError as error:
+            if str(error) == "draft_projection_set_exists":
+                raise ForecastConflict(
+                    "draft_projection_set_exists",
+                    "A draft projection set already exists for different inputs.",
+                ) from error
+            raise
+        return self.projection_set_response(UUID(projection_set["projection_set_id"]))
+
+    def current_projection_set_response(self, forecast_id: UUID) -> ProjectionSetResponse:
+        forecast = self.get_forecast(forecast_id)
+        self._ensure_projection_mode(forecast, "current_projection_set")
+        projection_set = self.repository.get_current_projection_set(forecast_id)
+        if projection_set is None:
+            raise KeyError(str(forecast_id))
+        return self.projection_set_response(UUID(projection_set["projection_set_id"]))
+
+    def projection_set_response(self, projection_set_id: UUID) -> ProjectionSetResponse:
+        projection_set = self.repository.get_projection_set(projection_set_id)
+        forecast_id = UUID(projection_set["forecast_id"])
+        return ProjectionSetResponse(
+            projection_set_id=UUID(projection_set["projection_set_id"]),
+            forecast_id=forecast_id,
+            status=projection_set["status"],
+            approved=self.repository.projection_set_has_approval(
+                forecast_id,
+                UUID(projection_set["projection_set_id"]),
+            ),
+            engine_version=projection_set["engine_version"],
+            input_snapshot_hash=projection_set["input_snapshot_hash"],
+            engine_code_hash=projection_set["engine_code_hash"],
+            random_seed=projection_set["random_seed"],
+            snapshot_artifact_path=projection_set["snapshot_artifact_path"],
+            scenarios=[
+                _projection_scenario_response(row)
+                for row in self.repository.get_projection_scenarios(projection_set_id)
+            ],
+            metric_points=[
+                _projection_metric_point_response(row)
+                for row in self.repository.get_projection_metric_points(projection_set_id)
+            ],
+            composites=[
+                _projection_composite_response(row)
+                for row in self.repository.get_projection_composites(projection_set_id)
+            ],
+            sensitivities=[
+                _projection_sensitivity_response(row)
+                for row in self.repository.get_projection_sensitivities(projection_set_id)
+            ],
+        )
+
+    def approve_projection_set(
+        self,
+        forecast_id: UUID,
+        *,
+        projection_set_id: UUID,
+        comment: str | None,
+    ) -> ForecastDetail:
+        forecast = self.get_forecast(forecast_id)
+        self._ensure_projection_mode(forecast, "approve_projection_set")
+        self._ensure_mutable(forecast)
+        if forecast.status != ForecastStatus.DRAFT_READY:
+            raise ForecastConflict(
+                "approval_required",
+                "Compute a projection draft before approving it.",
+            )
+        projection_set = self.repository.get_projection_set(projection_set_id)
+        if UUID(projection_set["forecast_id"]) != forecast.forecast_id:
+            raise ForecastConflict(
+                "approval_required",
+                "Projection set does not belong to this forecast.",
+                {"projection_set_id": str(projection_set_id)},
+            )
+        self.repository.approve_projection_set(
+            forecast.forecast_id,
+            projection_set_id=projection_set_id,
+            comment=comment,
+        )
+        return self.get_forecast(forecast_id)
+
     def commit_version(
         self,
         forecast_id: UUID,
         *,
-        estimate_set_id: UUID,
+        estimate_set_id: UUID | None = None,
+        projection_set_id: UUID | None = None,
         expected_input_snapshot_hash: str,
     ) -> CommitVersionResponse:
         forecast = self.get_forecast(forecast_id)
         self._ensure_mutable(forecast)
+        if (estimate_set_id is None) == (projection_set_id is None):
+            raise ForecastConflict(
+                "approval_required",
+                "Provide exactly one of estimate_set_id or projection_set_id.",
+            )
         if forecast.status != ForecastStatus.DRAFT_READY:
             raise ForecastConflict(
                 "approval_required",
                 "Compute and approve a PhaseA draft before committing.",
             )
+        if projection_set_id is not None:
+            self._ensure_projection_mode(forecast, "commit_projection_version")
+            projection_set = self.repository.get_projection_set(projection_set_id)
+            if UUID(projection_set["forecast_id"]) != forecast.forecast_id:
+                raise ForecastConflict(
+                    "approval_required",
+                    "Projection set does not belong to this forecast.",
+                    {"projection_set_id": str(projection_set_id)},
+                )
+            if not self.repository.projection_set_has_approval(
+                forecast_id,
+                projection_set_id,
+            ):
+                raise ForecastConflict(
+                    "approval_required",
+                    "Approve the projection set before committing a version.",
+                )
+            if projection_set["status"] != "draft":
+                raise ForecastConflict(
+                    "projection_set_already_committed",
+                    "Projection set is already committed.",
+                )
+            if projection_set["input_snapshot_hash"] != expected_input_snapshot_hash:
+                raise ForecastConflict(
+                    "approval_required",
+                    "Expected input snapshot hash does not match the draft.",
+                    {
+                        "expected_input_snapshot_hash": expected_input_snapshot_hash,
+                        "actual_input_snapshot_hash": projection_set["input_snapshot_hash"],
+                    },
+                )
+            snapshot = _json_load(projection_set["snapshot_json"])
+            if forecast.confidentiality_class == "public" and _snapshot_has_non_public_evidence(
+                snapshot
+            ):
+                raise ForecastConflict(
+                    "classification_mismatch",
+                    "Public Forecast versions cannot include internal or restricted evidence.",
+                )
+            artifact_profile = (
+                "private"
+                if forecast.confidentiality_class != "public"
+                or _snapshot_has_non_public_evidence(snapshot)
+                else "public"
+            )
+            path, digest, _bytes = self.artifacts.save_bytes(
+                forecast_id,
+                artifact_profile,
+                f"versions/{projection_set_id}.projection-snapshot.json",
+                projection.canonical_json_bytes(
+                    snapshot,
+                    engine_version=projection_set["engine_version"],
+                ),
+            )
+            if digest != projection_set["input_snapshot_hash"]:
+                Path(path).unlink(missing_ok=True)
+                raise ForecastConflict(
+                    "approval_required",
+                    "Snapshot artifact hash does not match the approved draft.",
+                    {
+                        "input_snapshot_hash": projection_set["input_snapshot_hash"],
+                        "artifact_hash": digest,
+                    },
+                )
+            try:
+                version = self.repository.commit_projection_set(
+                    forecast_id=forecast_id,
+                    projection_set_id=projection_set_id,
+                    expected_input_snapshot_hash=expected_input_snapshot_hash,
+                    snapshot_artifact_path=path,
+                )
+            except ValueError as error:
+                Path(path).unlink(missing_ok=True)
+                if str(error) == "projection_set_already_committed":
+                    raise ForecastConflict(
+                        "projection_set_already_committed",
+                        "Projection set is already committed.",
+                    ) from error
+                raise
+            except Exception:
+                Path(path).unlink(missing_ok=True)
+                raise
+            return CommitVersionResponse(
+                version_id=UUID(version["version_id"]),
+                forecast_id=UUID(version["forecast_id"]),
+                version_kind="projection",
+                estimate_set_id=None,
+                projection_set_id=UUID(version["projection_set_id"]),
+                input_snapshot_hash=version["input_snapshot_hash"],
+                snapshot_artifact_path=version["snapshot_artifact_path"],
+                committed_at=_parse_dt_required(version["created_at"]),
+            )
+
+        self._ensure_discrete_mode(forecast, "commit_estimate_version")
+        assert estimate_set_id is not None
         if not self.repository.estimate_set_has_approval(forecast_id, estimate_set_id):
             raise ForecastConflict(
                 "approval_required",
@@ -1859,7 +2168,9 @@ class ForecastOrchestrator:
         return CommitVersionResponse(
             version_id=UUID(version["version_id"]),
             forecast_id=UUID(version["forecast_id"]),
+            version_kind="estimate",
             estimate_set_id=UUID(version["estimate_set_id"]),
+            projection_set_id=None,
             input_snapshot_hash=version["input_snapshot_hash"],
             snapshot_artifact_path=version["snapshot_artifact_path"],
             committed_at=_parse_dt_required(version["created_at"]),
@@ -1874,6 +2185,7 @@ class ForecastOrchestrator:
     ) -> ResolveForecastResponse:
         forecast = self.get_forecast(forecast_id)
         self._ensure_enabled()
+        self._ensure_discrete_mode(forecast, "resolve_forecast")
         if forecast.resolved_at is not None:
             raise ForecastConflict(
                 "forecast_already_resolved",
@@ -2171,6 +2483,146 @@ class ForecastOrchestrator:
             "cross_impact": cross_impact,
         }
 
+    def _canonical_projection_snapshot(
+        self,
+        forecast: ForecastDetail,
+        *,
+        engine_version: str,
+    ) -> dict[str, Any]:
+        engine = projection.get_engine(engine_version)
+        dimensions = [
+            {
+                "dimension_id": str(dimension.dimension_id),
+                "metric_id": dimension.metric_id,
+                "label": dimension.label,
+                "unit": dimension.unit,
+                "value_type": dimension.value_type,
+                "currency": dimension.currency,
+                "nominal_or_real": dimension.nominal_or_real,
+                "baseline_year": dimension.baseline_year,
+                "baseline_value": dimension.baseline_value,
+                "baseline_source_ids": [
+                    str(source_id) for source_id in dimension.baseline_source_ids
+                ],
+                "horizons": dimension.horizons,
+                "sort_order": dimension.sort_order,
+            }
+            for dimension in forecast.projection_dimensions
+        ]
+        dimensions = sorted(dimensions, key=lambda item: (item["sort_order"], item["metric_id"]))
+        claims = [
+            {
+                "claim_id": row["claim_id"],
+                "claim_type": row["claim_type"],
+                "polarity": row["polarity"],
+                "evidence_strength": row["evidence_strength"],
+                "reliability_score": row["reliability_score"],
+                "cluster_id": row["cluster_id"],
+                "independence_group": row["independence_group"],
+                "source_ids": [
+                    str(source_id)
+                    for source_id in self.repository.get_claim_source_ids(UUID(row["claim_id"]))
+                ],
+                "review_status": row["review_status"],
+                "data_classification": row["data_classification"],
+                "origin_tool_profile": row["origin_tool_profile"],
+                "pack_id": row["pack_id"],
+                "extraction_batch_id": row["extraction_batch_id"],
+                "report_artifact_hash": row["report_artifact_hash"],
+            }
+            for row in self.repository.get_active_claims(forecast.forecast_id)
+        ]
+        claims = sorted(claims, key=lambda item: item["claim_id"])
+        sources = [
+            {
+                "source_id": row["source_id"],
+                "title": row["title"],
+                "publisher": row["publisher"],
+                "url": row["url"],
+                "source_type": row["source_type"],
+                "source_classification": row["source_classification"],
+                "data_classification": row["data_classification"],
+                "origin_tool_profile": row["origin_tool_profile"],
+                "reliability_score": row["reliability_score"],
+            }
+            for row in self.repository.get_active_sources(forecast.forecast_id)
+        ]
+        sources = sorted(sources, key=lambda item: item["source_id"])
+        active_source_ids = {str(source["source_id"]) for source in sources}
+        for claim in claims:
+            claim["source_ids"] = [
+                source_id
+                for source_id in claim["source_ids"]
+                if source_id in active_source_ids
+            ]
+        packs = [
+            {
+                "pack_id": row["pack_id"],
+                "research_run_id": row["research_run_id"],
+                "pack_role": row["pack_role"],
+                "tool_profile": row["tool_profile"],
+                "prompt_version": row["prompt_version"],
+                "report_artifact_hash": row["report_artifact_hash"],
+                "attempt_no": row["attempt_no"],
+                "is_active": bool(row["is_active"]),
+                "data_classification": row["data_classification"],
+            }
+            for row in self.repository.list_active_packs(forecast.forecast_id)
+        ]
+        packs = sorted(packs, key=lambda item: item["pack_id"])
+        drivers = [
+            {
+                "driver_id": row["driver_id"],
+                "name": row["name"],
+                "description": row["description"],
+                "sort_order": row["sort_order"],
+            }
+            for row in self.repository.get_drivers(forecast.forecast_id)
+        ]
+        driver_states = [
+            {
+                "state_id": row["state_id"],
+                "driver_id": row["driver_id"],
+                "label": row["label"],
+                "description": row["description"],
+                "sort_order": row["sort_order"],
+            }
+            for row in self.repository.get_driver_states(forecast.forecast_id)
+        ]
+        return {
+            "engine_version": engine.engine_version,
+            "engine_code_hash": engine.engine_code_hash(),
+            "prompt_versions": {
+                "current_state": CURRENT_STATE_PROMPT_VERSION,
+                "extractor": "phase_c_claims_v1",
+                "projection": "phase_c_projection_v1",
+            },
+            "engine_constants": {
+                "constants_version": "phase_c_v1_constants",
+                "epsilon_floor": 1e-9,
+                "residual_floor": 0.05,
+                "k_evidence": 0.9,
+                "k_counter": 0.45,
+                "k_signal": 0.35,
+                "residual_penalty": 1.0,
+            },
+            "random_seed": engine.random_seed,
+            "forecast": {
+                "forecast_id": str(forecast.forecast_id),
+                "forecast_mode": forecast.forecast_mode.value,
+                "question": forecast.question,
+                "resolution_criteria": forecast.resolution_criteria,
+                "approved_framing_version": forecast.approved_framing_version,
+                "confidentiality_class": forecast.confidentiality_class,
+            },
+            "dimensions": dimensions,
+            "claims": claims,
+            "sources": sources,
+            "packs": packs,
+            "drivers": drivers,
+            "driver_states": driver_states,
+        }
+
 
 def _outcome_response(row: Any) -> ForecastOutcome:
     return ForecastOutcome(
@@ -2180,6 +2632,92 @@ def _outcome_response(row: Any) -> ForecastOutcome:
         resolution_rule=row["resolution_rule"],
         normalization_group_id=row["normalization_group_id"],
         sort_order=row["sort_order"],
+    )
+
+
+def _projection_dimension_response(row: Any) -> ProjectionDimensionRecord:
+    return ProjectionDimensionRecord(
+        dimension_id=UUID(row["dimension_id"]),
+        forecast_id=UUID(row["forecast_id"]),
+        framing_version=row["framing_version"],
+        metric_id=row["metric_id"],
+        label=row["label"],
+        unit=row["unit"],
+        value_type=row["value_type"],
+        currency=row["currency"],
+        nominal_or_real=row["nominal_or_real"],
+        baseline_year=row["baseline_year"],
+        baseline_value=row["baseline_value"],
+        baseline_source_ids=[
+            UUID(source_id) for source_id in _json_load(row["baseline_source_ids_json"])
+        ],
+        horizons=[int(year) for year in _json_load(row["horizons_json"])],
+        sort_order=row["sort_order"],
+        frozen=bool(row["frozen"]),
+    )
+
+
+def _projection_scenario_response(row: Any) -> ProjectionScenarioRecord:
+    return ProjectionScenarioRecord(
+        projection_scenario_id=UUID(row["projection_scenario_id"]),
+        projection_set_id=UUID(row["projection_set_id"]),
+        label=row["label"],
+        description=row["description"],
+        coverage_role=row["coverage_role"],
+        residual_flag=bool(row["residual_flag"]),
+        probability=row["probability"],
+        probability_logit=row["probability_logit"],
+        driver_vector=_json_load(row["driver_vector_json"]),
+        narrative=row["narrative"],
+        validity_status=row["validity_status"],
+    )
+
+
+def _projection_metric_point_response(row: Any) -> ProjectionMetricPointRecord:
+    return ProjectionMetricPointRecord(
+        metric_point_id=UUID(row["metric_point_id"]),
+        projection_set_id=UUID(row["projection_set_id"]),
+        projection_scenario_id=UUID(row["projection_scenario_id"]),
+        dimension_id=UUID(row["dimension_id"]),
+        metric_id=row["metric_id"],
+        horizon_year=row["horizon_year"],
+        p10=row["p10"],
+        p50=row["p50"],
+        p90=row["p90"],
+        mean=row["mean"],
+        distribution_family=row["distribution_family"],
+        distribution_params=_json_load(row["distribution_params_json"]),
+        baseline_transform=row["baseline_transform"],
+    )
+
+
+def _projection_composite_response(row: Any) -> ProjectionCompositeRecord:
+    return ProjectionCompositeRecord(
+        composite_id=UUID(row["composite_id"]),
+        projection_set_id=UUID(row["projection_set_id"]),
+        dimension_id=UUID(row["dimension_id"]),
+        metric_id=row["metric_id"],
+        horizon_year=row["horizon_year"],
+        p10=row["p10"],
+        p50=row["p50"],
+        p90=row["p90"],
+        mean=row["mean"],
+        mixture_components=_json_load(row["mixture_components_json"]),
+    )
+
+
+def _projection_sensitivity_response(row: Any) -> ProjectionSensitivityRecord:
+    return ProjectionSensitivityRecord(
+        sensitivity_id=UUID(row["sensitivity_id"]),
+        projection_set_id=UUID(row["projection_set_id"]),
+        sensitivity_kind=row["sensitivity_kind"],
+        target_ref=row["target_ref"],
+        baseline_snapshot_hash=row["baseline_snapshot_hash"],
+        perturbed_input=_json_load(row["perturbed_input_json"]),
+        delta_p50=row["delta_p50"],
+        delta_p90=row["delta_p90"],
+        delta_probability=row["delta_probability"],
+        rank=row["rank"],
     )
 
 
@@ -2524,6 +3062,110 @@ def _ensure_forecast_has_outcomes(forecast: ForecastDetail) -> None:
     raise ForecastConflict(
         "forecast_outcomes_required",
         "Forecast PhaseA requires at least one resolution outcome state.",
+    )
+
+
+def _ensure_forecast_has_mode_payload(forecast: ForecastDetail) -> None:
+    if forecast.forecast_mode == ForecastMode.DISCRETE_OUTCOME:
+        _ensure_forecast_has_outcomes(forecast)
+        return
+    if forecast.projection_dimensions:
+        return
+    raise ForecastConflict(
+        "projection_dimensions_required",
+        "Scenario projection forecasts require at least one projection dimension.",
+    )
+
+
+def _build_current_state_prompt(forecast: ForecastDetail) -> str:
+    if forecast.forecast_mode == ForecastMode.SCENARIO_PROJECTION:
+        return _build_projection_current_state_prompt(forecast)
+    return build_current_state_prompt(forecast)
+
+
+def _build_research_pack_prompt(
+    forecast: ForecastDetail,
+    *,
+    pack_role: PackRole,
+    tool_profile: str,
+) -> str:
+    if pack_role == PackRole.CURRENT_STATE:
+        return _build_current_state_prompt(forecast).replace(
+            "Pack role: current_state",
+            f"Pack role: {pack_role.value}\nTool profile: {tool_profile}",
+        )
+    return build_research_pack_prompt(
+        forecast,
+        pack_role=pack_role,
+        tool_profile=tool_profile,
+    )
+
+
+def _build_projection_current_state_prompt(forecast: ForecastDetail) -> str:
+    dimensions = "\n".join(
+        _projection_dimension_prompt_line(dimension)
+        for dimension in forecast.projection_dimensions
+    )
+    sources = "\n".join(f"- {source}" for source in forecast.resolution_sources)
+    original_prompt = (
+        forecast.original_execution_prompt
+        if forecast.original_execution_prompt
+        and forecast.original_execution_prompt.strip()
+        else None
+    )
+    primary_task = original_prompt or forecast.question
+    fallback_note = (
+        ""
+        if original_prompt
+        else (
+            "\nOriginal execution prompt was not stored for this forecast; "
+            "use the metadata appendix as the task framing.\n"
+        )
+    )
+    return f"""You are collecting public evidence for a scenario projection forecast.
+
+Primary execution prompt:
+{primary_task}
+{fallback_note}
+Treat the primary execution prompt above as the user's source-of-truth task.
+The metadata appendix below is operational framing for Forecast projection and must not
+replace, compress, or override the primary execution prompt.
+
+Forecast metadata appendix:
+- Forecast question: {forecast.question}
+- Target population: {forecast.target_population or "Not specified."}
+- Unit of analysis: {forecast.unit_of_analysis or "Not specified."}
+- Decision context: {forecast.decision_context or "Not specified."}
+
+Resolution criteria:
+{forecast.resolution_criteria or "Use the approved resolution criteria."}
+
+Resolution sources:
+{sources or "- Not specified."}
+
+Projection dimension metadata:
+{dimensions}
+
+Pack role: {PackRole.CURRENT_STATE.value}
+
+Collect public current-state evidence, baseline facts, recent signals, scenario
+drivers, and credible counterpoints for the projection dimensions above.
+Do not provide final scenario probabilities or projected metric values. Cite public
+sources.
+"""
+
+
+def _projection_dimension_prompt_line(dimension: ProjectionDimensionRecord) -> str:
+    horizons = ", ".join(str(year) for year in dimension.horizons)
+    value_type = dimension.value_type
+    currency = f", currency: {dimension.currency}" if dimension.currency else ""
+    nominal_or_real = (
+        f", {dimension.nominal_or_real}" if dimension.nominal_or_real else ""
+    )
+    return (
+        f"- {dimension.label} ({dimension.metric_id}): unit: {dimension.unit}, "
+        f"value type: {value_type}{currency}{nominal_or_real}, baseline: "
+        f"{dimension.baseline_value} in {dimension.baseline_year}, horizons: {horizons}"
     )
 
 

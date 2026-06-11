@@ -16,6 +16,7 @@ from api.forecast.schemas import (
     CommitVersionRequest,
     CommitVersionResponse,
     ComputeProbabilitiesRequest,
+    ComputeProjectionRequest,
     EstimateSetResponse,
     EvidenceExtractResponse,
     ForecastAuditResponse,
@@ -28,6 +29,7 @@ from api.forecast.schemas import (
     ForecastReviewResponse,
     ForecastSummary,
     ManualResearchPackPromptResponse,
+    ProjectionSetResponse,
     ResearchPackDefaultsResponse,
     ResearchPackRequest,
     ResearchPackRerunRequest,
@@ -179,6 +181,24 @@ def review_forecast(
                     action=request.action,
                     status=forecast.status,
                     approved_framing_version=forecast.approved_framing_version,
+                )
+            if request.action == ReviewAction.APPROVE_PROJECTION_PUBLICATION:
+                if request.projection_set_id is None:
+                    raise ForecastConflict(
+                        "approval_required",
+                        "projection_set_id is required for approve_projection_publication.",
+                    )
+                forecast = orchestrator.approve_projection_set(
+                    forecast_id,
+                    projection_set_id=request.projection_set_id,
+                    comment=request.comment,
+                )
+                return ForecastReviewResponse(
+                    forecast_id=forecast.forecast_id,
+                    action=request.action,
+                    status=forecast.status,
+                    approved_framing_version=forecast.approved_framing_version,
+                    projection_set_id=request.projection_set_id,
                 )
             if request.action in {
                 ReviewAction.APPROVE_PRIVATE_DATA_USE,
@@ -475,6 +495,85 @@ def get_current_estimate_set(
         raise HTTPException(status_code=404, detail="Estimate set not found.") from error
 
 
+@router.post("/{forecast_id}/projections/compute", response_model=ProjectionSetResponse)
+def compute_projection(
+    forecast_id: UUID,
+    orchestrator: ForecastDependency,
+    idempotency_key: IdempotencyKeyHeader = None,
+    request: ComputeProjectionRequest | None = None,
+) -> ProjectionSetResponse:
+    try:
+        body = request or ComputeProjectionRequest()
+        return _run_idempotent(
+            orchestrator,
+            scope="forecast:projections_compute",
+            resource_id=str(forecast_id),
+            idempotency_key=_normalize_idempotency_key(idempotency_key),
+            payload=body.model_dump(mode="json"),
+            action=lambda: orchestrator.compute_projection(forecast_id, body),
+        )
+    except ForecastConflict as error:
+        raise forecast_http_error(error) from error
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Forecast not found.") from error
+
+
+@router.get("/{forecast_id}/projections/current", response_model=ProjectionSetResponse)
+def get_current_projection(
+    forecast_id: UUID,
+    orchestrator: ForecastDependency,
+) -> ProjectionSetResponse:
+    try:
+        return orchestrator.current_projection_set_response(forecast_id)
+    except ForecastConflict as error:
+        raise forecast_http_error(error) from error
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Projection set not found.") from error
+
+
+@router.post(
+    "/{forecast_id}/projections/{projection_set_id}/approve",
+    response_model=ForecastReviewResponse,
+)
+def approve_projection(
+    forecast_id: UUID,
+    projection_set_id: UUID,
+    orchestrator: ForecastDependency,
+    idempotency_key: IdempotencyKeyHeader = None,
+) -> ForecastReviewResponse:
+    request = ForecastReviewRequest(
+        action=ReviewAction.APPROVE_PROJECTION_PUBLICATION,
+        projection_set_id=projection_set_id,
+    )
+    try:
+        def action() -> ForecastReviewResponse:
+            forecast = orchestrator.approve_projection_set(
+                forecast_id,
+                projection_set_id=projection_set_id,
+                comment=None,
+            )
+            return ForecastReviewResponse(
+                forecast_id=forecast.forecast_id,
+                action=request.action,
+                status=forecast.status,
+                approved_framing_version=forecast.approved_framing_version,
+                projection_set_id=projection_set_id,
+            )
+
+        return _run_idempotent(
+            orchestrator,
+            scope="forecast:projection_approve",
+            resource_id=f"{forecast_id}:{projection_set_id}",
+            idempotency_key=_normalize_idempotency_key(idempotency_key),
+            payload=request.model_dump(mode="json"),
+            action=action,
+        )
+    except ForecastConflict as error:
+        raise forecast_http_error(error) from error
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Projection set not found.") from error
+
+
 @router.post("/{forecast_id}/versions/commit", response_model=CommitVersionResponse)
 def commit_version(
     forecast_id: UUID,
@@ -492,13 +591,20 @@ def commit_version(
             action=lambda: orchestrator.commit_version(
                 forecast_id,
                 estimate_set_id=request.estimate_set_id,
+                projection_set_id=request.projection_set_id,
                 expected_input_snapshot_hash=request.expected_input_snapshot_hash,
             ),
         )
     except ForecastConflict as error:
         raise forecast_http_error(error) from error
     except KeyError as error:
-        raise HTTPException(status_code=404, detail="Forecast not found.") from error
+        if request.projection_set_id is not None:
+            detail = "Projection set not found."
+        elif request.estimate_set_id is not None:
+            detail = "Estimate set not found."
+        else:
+            detail = "Forecast not found."
+        raise HTTPException(status_code=404, detail=detail) from error
 
 
 @router.post("/{forecast_id}/resolve", response_model=ResolveForecastResponse)
@@ -563,6 +669,10 @@ def _forecast_create_idempotency_payload(request: ForecastCreateRequest) -> dict
     payload = request.model_dump(mode="json")
     if payload.get("original_execution_prompt") is None:
         payload.pop("original_execution_prompt", None)
+    if payload.get("forecast_mode") == "discrete_outcome":
+        payload.pop("forecast_mode", None)
+    if payload.get("projection_dimensions") == []:
+        payload.pop("projection_dimensions", None)
     return payload
 
 

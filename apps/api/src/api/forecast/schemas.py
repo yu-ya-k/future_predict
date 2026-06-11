@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 FRAMING_ROUGH_QUESTION_MAX_LENGTH = 50_000
 
@@ -31,6 +31,11 @@ class ForecastStatus(StrEnum):
     DRAFT_READY = "draft_ready"
     COMMITTED = "committed"
     RESOLVED = "resolved"
+
+
+class ForecastMode(StrEnum):
+    DISCRETE_OUTCOME = "discrete_outcome"
+    SCENARIO_PROJECTION = "scenario_projection"
 
 
 class PackRole(StrEnum):
@@ -59,9 +64,46 @@ class ReviewAction(StrEnum):
     APPROVE_CLAIM_TARGET_LINKS = "approve_claim_target_links"
     APPROVE_PRIVATE_DATA_USE = "approve_private_data_use"
     APPROVE_PROBABILITY_PUBLICATION = "approve_probability_publication"
+    APPROVE_PROJECTION_PUBLICATION = "approve_projection_publication"
     OVERRIDE_PROBABILITY_WITH_REASON = "override_probability_with_reason"
     APPROVE_EXTERNAL_REPORT = "approve_external_report"
     APPROVE_TRUSTED_SOURCE = "approve_trusted_source"
+
+
+class ProjectionDimensionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    metric_id: str = Field(min_length=1, max_length=120)
+    label: str = Field(min_length=1, max_length=300)
+    unit: str = Field(min_length=1, max_length=80)
+    value_type: Literal["number", "currency", "percentage", "index"] = "number"
+    currency: str | None = Field(default=None, min_length=3, max_length=3)
+    nominal_or_real: Literal["nominal", "real"] | None = None
+    baseline_year: int = Field(ge=1900, le=2200)
+    baseline_value: float = Field(ge=0)
+    baseline_source_ids: list[UUID] = Field(
+        default_factory=lambda: list[UUID](),
+        max_length=20,
+    )
+    horizons: list[int] = Field(
+        default_factory=lambda: [2035],
+        min_length=1,
+        max_length=12,
+    )
+
+    _strip_metric_id = field_validator("metric_id", mode="before")(_strip)
+    _strip_label = field_validator("label", mode="before")(_strip)
+    _strip_unit = field_validator("unit", mode="before")(_strip)
+
+    @field_validator("horizons", mode="after")
+    @classmethod
+    def _validate_horizons(cls, value: list[int]) -> list[int]:
+        normalized = sorted(set(value))
+        if not normalized:
+            raise ValueError("At least one horizon is required")
+        if any(year < 1900 or year > 2200 for year in normalized):
+            raise ValueError("Horizon must be between 1900 and 2200")
+        return normalized
 
 
 class ForecastCreateRequest(BaseModel):
@@ -84,7 +126,12 @@ class ForecastCreateRequest(BaseModel):
     resolution_sources: list[str] = Field(default_factory=list, max_length=20)
     decision_context: str | None = Field(default=None, max_length=5000)
     confidentiality_class: ConfidentialityClass = ConfidentialityClass.PUBLIC
+    forecast_mode: ForecastMode = ForecastMode.DISCRETE_OUTCOME
     outcomes: list[str] = Field(default_factory=list, max_length=8)
+    projection_dimensions: list[ProjectionDimensionInput] = Field(
+        default_factory=lambda: list[ProjectionDimensionInput](),
+        max_length=12,
+    )
 
     _strip_question = field_validator("question", mode="before")(_strip)
     _strip_resolution_criteria = field_validator("resolution_criteria", mode="before")(
@@ -99,10 +146,25 @@ class ForecastCreateRequest(BaseModel):
     def _strip_outcomes(cls, value: list[str]) -> list[str]:
         return [label.strip() for label in value if label.strip()]
 
+    @model_validator(mode="after")
+    def _validate_mode_payload(self) -> ForecastCreateRequest:
+        if (
+            self.forecast_mode == ForecastMode.DISCRETE_OUTCOME
+            and self.projection_dimensions
+        ):
+            raise ValueError("forecast_mode_payload_mismatch")
+        if self.forecast_mode == ForecastMode.SCENARIO_PROJECTION:
+            if self.outcomes:
+                raise ValueError("forecast_mode_payload_mismatch")
+            if not self.projection_dimensions:
+                raise ValueError("projection_dimensions_required")
+        return self
+
 
 class ForecastCreateResponse(BaseModel):
     forecast_id: UUID
     status: ForecastStatus
+    forecast_mode: ForecastMode
     framing_version: int
     created_at: datetime
 
@@ -258,8 +320,99 @@ class ForecastOutcome(BaseModel):
     sort_order: int
 
 
+class ProjectionDimensionRecord(BaseModel):
+    dimension_id: UUID
+    forecast_id: UUID
+    framing_version: int
+    metric_id: str
+    label: str
+    unit: str
+    value_type: str
+    currency: str | None = None
+    nominal_or_real: str | None = None
+    baseline_year: int
+    baseline_value: float
+    baseline_source_ids: list[UUID]
+    horizons: list[int]
+    sort_order: int
+    frozen: bool = False
+
+
+class ProjectionScenarioRecord(BaseModel):
+    projection_scenario_id: UUID
+    projection_set_id: UUID
+    label: str
+    description: str
+    coverage_role: str
+    residual_flag: bool
+    probability: float
+    probability_logit: float
+    driver_vector: dict[str, Any]
+    narrative: str
+    validity_status: str
+
+
+class ProjectionMetricPointRecord(BaseModel):
+    metric_point_id: UUID
+    projection_set_id: UUID
+    projection_scenario_id: UUID
+    dimension_id: UUID
+    metric_id: str
+    horizon_year: int
+    p10: float
+    p50: float
+    p90: float
+    mean: float
+    distribution_family: str
+    distribution_params: dict[str, Any]
+    baseline_transform: str
+
+
+class ProjectionCompositeRecord(BaseModel):
+    composite_id: UUID
+    projection_set_id: UUID
+    dimension_id: UUID
+    metric_id: str
+    horizon_year: int
+    p10: float
+    p50: float
+    p90: float
+    mean: float
+    mixture_components: list[dict[str, Any]]
+
+
+class ProjectionSensitivityRecord(BaseModel):
+    sensitivity_id: UUID
+    projection_set_id: UUID
+    sensitivity_kind: str
+    target_ref: str
+    baseline_snapshot_hash: str
+    perturbed_input: dict[str, Any]
+    delta_p50: float
+    delta_p90: float
+    delta_probability: float
+    rank: int
+
+
+class ProjectionSetResponse(BaseModel):
+    projection_set_id: UUID
+    forecast_id: UUID
+    status: str
+    approved: bool = False
+    engine_version: str
+    input_snapshot_hash: str
+    engine_code_hash: str
+    random_seed: int
+    snapshot_artifact_path: str | None = None
+    scenarios: list[ProjectionScenarioRecord]
+    metric_points: list[ProjectionMetricPointRecord]
+    composites: list[ProjectionCompositeRecord]
+    sensitivities: list[ProjectionSensitivityRecord]
+
+
 class ForecastSummary(BaseModel):
     forecast_id: UUID
+    forecast_mode: ForecastMode = ForecastMode.DISCRETE_OUTCOME
     question: str
     status: ForecastStatus
     resolution_date: date | None
@@ -295,6 +448,10 @@ def _default_research_packs() -> list[ForecastCurrentResearchPack]:
     return []
 
 
+def _default_projection_dimensions() -> list[ProjectionDimensionRecord]:
+    return []
+
+
 class ForecastDetail(ForecastSummary):
     original_execution_prompt: str | None
     target_population: str | None
@@ -304,6 +461,10 @@ class ForecastDetail(ForecastSummary):
     decision_context: str | None
     confidentiality_class: str
     outcomes: list[ForecastOutcome]
+    projection_dimensions: list[ProjectionDimensionRecord] = Field(
+        default_factory=_default_projection_dimensions
+    )
+    current_projection_set: ProjectionSetResponse | None = None
     current_research_pack: ForecastCurrentResearchPack | None = None
     current_research_pack_status: str | None = None
     research_packs: list[ForecastCurrentResearchPack] = Field(
@@ -318,6 +479,7 @@ class ForecastReviewRequest(BaseModel):
     action: ReviewAction
     comment: str | None = Field(default=None, max_length=5000)
     estimate_set_id: UUID | None = None
+    projection_set_id: UUID | None = None
     version_id: UUID | None = None
     reviewer: str | None = Field(default=None, max_length=500)
     reviewer_auth_subject: str | None = Field(default=None, max_length=500)
@@ -331,6 +493,7 @@ class ForecastReviewResponse(BaseModel):
     status: ForecastStatus
     approved_framing_version: int | None = None
     estimate_set_id: UUID | None = None
+    projection_set_id: UUID | None = None
 
 
 class ResearchPackRequest(BaseModel):
@@ -479,6 +642,12 @@ class ComputeProbabilitiesRequest(BaseModel):
     engine_version: Literal["phase_a_v1", "phase_b_v1"] | None = None
 
 
+class ComputeProjectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    engine_version: Literal["phase_c_v1"] | None = None
+
+
 class ForecastDriverRecord(BaseModel):
     driver_id: UUID
     forecast_id: UUID
@@ -525,14 +694,23 @@ class ForecastTrustedSourceRecord(BaseModel):
 class CommitVersionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    estimate_set_id: UUID
+    estimate_set_id: UUID | None = None
+    projection_set_id: UUID | None = None
     expected_input_snapshot_hash: str
+
+    @model_validator(mode="after")
+    def _validate_exactly_one_set(self) -> CommitVersionRequest:
+        if (self.estimate_set_id is None) == (self.projection_set_id is None):
+            raise ValueError("Provide exactly one of estimate_set_id or projection_set_id")
+        return self
 
 
 class CommitVersionResponse(BaseModel):
     version_id: UUID
     forecast_id: UUID
-    estimate_set_id: UUID
+    version_kind: Literal["estimate", "projection"] = "estimate"
+    estimate_set_id: UUID | None = None
+    projection_set_id: UUID | None = None
     input_snapshot_hash: str
     snapshot_artifact_path: str
     committed_at: datetime
